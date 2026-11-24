@@ -31,6 +31,12 @@ Run each adapter in a new process with `VICTORY_GPU_TIMING` unset so the
 gated fixtures can observe asynchronous progress. The fixture measures
 correctness only.
 
+The direct-SRV work in #185 still binds a live mirrored heap. Its exact slot
+metadata identifies which ranges to refresh, while the selected native slots
+can be rewritten after collection. An asynchronous direct-SRV path needs
+fence ownership of both the native slots and the backing bytes. The separate
+#185 compatibility branch keeps direct-SRV submissions synchronous.
+
 ## Reproduction
 
 `CopyBufferRegion` and buffer-to-buffer `CopyResource` queue CPU copies through

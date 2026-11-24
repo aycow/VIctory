@@ -311,4 +311,25 @@ mod tests {
         t.finish(2, |()| {});
         assert_eq!(t.conflict(0x1000, 0x2000, true), None);
     }
+
+    #[test]
+    fn staged_texture_waits_for_its_last_reader() {
+        let t = Timeline::new();
+        let staging_a = 1;
+        let staging_b = 2;
+        let mut earlier = Touches::default();
+        earlier.staging.insert(staging_a);
+        let mut later = Touches::default();
+        later.staging.extend([staging_a, staging_b]);
+        t.push(3, earlier, ());
+        t.push(4, later, ());
+        assert_eq!(t.staging_conflict(staging_a), Some(4));
+        assert_eq!(t.staging_conflict(staging_b), Some(4));
+        assert_eq!(t.staging_conflict(3), None);
+        t.finish(3, |()| {});
+        assert_eq!(t.staging_conflict(staging_a), Some(4));
+        t.finish(4, |()| {});
+        assert_eq!(t.staging_conflict(staging_a), None);
+        assert_eq!(t.staging_conflict(staging_b), None);
+    }
 }

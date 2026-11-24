@@ -1665,6 +1665,7 @@ mod tests {
         let gate = gpu.test_queue_gate();
         gpu.execute(&[&first]);
         assert!(first.running());
+        // SAFETY: the queue gate holds native reads of the separate staging buffer.
         unsafe { data.write_bytes(119, bytes) };
         let release_gate = std::thread::spawn(move || {
             let reached = reached.recv_timeout(Duration::from_secs(5));

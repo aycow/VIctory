@@ -177,7 +177,9 @@ impl Staging {
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
+    /// since the last time (and is mapped at all). Calls `before_write` right
+    /// before overwriting the shared staging buffer so any earlier in-flight
+    /// GPU copy from it finishes first.
     pub(crate) fn refresh(&self, before_write: impl FnOnce()) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
