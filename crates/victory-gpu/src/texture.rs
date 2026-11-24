@@ -64,6 +64,24 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
+/// A checked CPU refresh of one native texture generation. The request,
+/// rather than a recording-time timestamp, owns its staging until retirement.
+pub(crate) struct RefreshRequest {
+    pub(crate) staging: Arc<Staging>,
+    pub(crate) copy: Arc<crate::resource::HostTexture>,
+}
+
+pub(crate) fn refresh_request(resource: This, texture: &ID3D12Resource) -> Option<RefreshRequest> {
+    let copy = crate::resource::host_copy(resource)?;
+    if copy.host_written.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    Some(RefreshRequest {
+        copy,
+        staging: staging(resource, texture)?,
+    })
+}
+
 /// Records a host copy or resolve write on `list` so `resource` becomes
 /// host-written only if and when `list` is actually submitted.
 pub(crate) fn defer_host_write(list: &HostList, resource: This) {
@@ -119,24 +137,34 @@ impl Staging {
     /// staging buffer received new contents that must be copied to the host
     /// texture (including initial upload).
     pub(crate) fn refresh(&self) -> bool {
+        self.refresh_with_snapshot(None).unwrap_or(false)
+    }
+
+    /// An unmapped backing is still pending, even though there is no copy
+    /// to record for this submission.
+    pub(crate) fn refresh_pending(&self, snapshot: &mut Vec<u8>) -> Option<bool> {
+        self.refresh_with_snapshot(Some(snapshot))
+    }
+
+    fn refresh_with_snapshot(&self, snapshot: Option<&mut Vec<u8>>) -> Option<bool> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let (read, dirty) = self.refresh_now();
+        let (read, dirty) = self.refresh_now(snapshot);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
         dirty
     }
 
-    /// Returns `(bytes_read, dirty)`.
-    fn refresh_now(&self) -> (usize, bool) {
+    /// Returns `(bytes_read, dirty)`. No dirty result means no mapped source.
+    fn refresh_now(&self, snapshot: Option<&mut Vec<u8>>) -> (usize, Option<bool>) {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                return (0, false);
+                return (0, Some(false));
             }
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
@@ -146,31 +174,42 @@ impl Staging {
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return (size, true);
+            return (size, Some(true));
         }
-        if !committed(self.memory, size) {
-            #[cfg(feature = "diagnostics")]
-            tracing::debug!(
-                memory = ?self.memory,
-                size,
-                desc = ?self.layout.desc,
-                "a sampled texture's memory is not committed"
-            );
-            return (0, false);
-        }
-        // SAFETY: committed memory of the texture's layout size.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        let tiled: &[u8] = if let Some(snapshot) = snapshot {
+            // A previously recorded heap use may outlive a title mapping.
+            // Hash only bytes read from a live range, without dereferencing
+            // a mapping that can disappear between VirtualQuery and read.
+            snapshot.resize(size, 0);
+            if !crate::host::read_into(self.memory, snapshot) {
+                return (0, None);
+            }
+            snapshot
+        } else {
+            if !committed(self.memory, size) {
+                #[cfg(feature = "diagnostics")]
+                tracing::debug!(
+                    memory = ?self.memory,
+                    size,
+                    desc = ?self.layout.desc,
+                    "a sampled texture's memory is not committed"
+                );
+                return (0, None);
+            }
+            // SAFETY: committed memory of the texture's layout size.
+            unsafe { std::slice::from_raw_parts(self.memory, size) }
+        };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
-            return (size, false);
+            return (size, Some(false));
         }
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
-        (size, true)
+        (size, Some(true))
     }
 
     /// Records `CopyTextureRegion` for every subresource from this staging

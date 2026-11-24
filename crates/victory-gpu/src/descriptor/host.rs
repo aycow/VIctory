@@ -40,9 +40,9 @@ pub(crate) struct HostHeap {
     /// Populated buffer, constant-buffer, and placed-texture slots (`< count`)
     /// tracked for bindless `ResourceDescriptorHeap[]` materialization.
     bindless: Mutex<Bindless>,
-    /// A recording thread is preparing the placed-texture slots (others
-    /// skip it rather than wait).
-    recording: std::sync::atomic::AtomicBool,
+    /// Odd while preparing texture slots. A stale submission snapshot may
+    /// retire requests only if this recording generation stayed even.
+    recording: AtomicU64,
     /// Placed-texture slots are waiting to be prepared at recording.
     record_hint: std::sync::atomic::AtomicBool,
     /// The placed-texture epoch, and the frame (plus one), recording last
@@ -111,6 +111,9 @@ struct Bindless {
     /// texture (held, so its address names it alone), the frame last uploaded,
     /// and whether it is a placed texture.
     uploaded: HashMap<usize, (ID3D12Resource, u64, bool)>,
+    /// Refreshes accepted by the frame scheduler which no submission has
+    /// yet delivered. Recording a list does not consume one.
+    pending_uploads: HashMap<usize, PendingUpload>,
     /// Uploaded textures by frame, oldest first, to look at again.
     recheck: VecDeque<(u64, RecheckTarget)>,
     /// A frame and the uploads of known textures done in it.
@@ -125,11 +128,16 @@ struct Bindless {
 }
 
 /// A bindless texture queued for periodic CPU-memory recheck.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum RecheckTarget {
     Placed(usize),
     /// `(slot_index, view_index, generation, resource_address)`.
     Ordinary(u32, u32, u32, usize),
+}
+
+struct PendingUpload {
+    request: Arc<crate::texture::RefreshRequest>,
+    targets: Vec<RecheckTarget>,
 }
 
 enum PendingTex {
@@ -473,7 +481,7 @@ impl HostHeap {
                 },
                 ..Bindless::default()
             }),
-            recording: std::sync::atomic::AtomicBool::new(false),
+            recording: AtomicU64::new(0),
             record_hint: std::sync::atomic::AtomicBool::new(false),
             record_looked: [AtomicU64::new(0), AtomicU64::new(0)],
             recheck_at: AtomicU64::new(u64::MAX),
@@ -1187,15 +1195,13 @@ impl HostHeap {
     }
 
     /// At draw/dispatch recording time: makes the placed-texture slots
-    /// changed since (or whose textures were evicted), and records on `list`
-    /// the upload of the textures they newly reach and of a few known ones
-    /// due a look ([`RECHECK_FRAMES`]), each moved to the shader resource
-    /// state. Buffer and constant-buffer views are materialized and refreshed
-    /// at submission from [`HostHeap::bindless_plan`].
+    /// changed since (or whose textures were evicted), and schedules refreshes
+    /// for new textures and known ones due a look ([`RECHECK_FRAMES`]). Move
+    /// the textures to the shader resource state on this list. Buffer and
+    /// constant-buffer views are prepared from [`HostHeap::bindless_plan`].
     ///
-    /// shortcut: a texture is moved to the shader resource state in the list
-    /// that uploads it and keeps that state after; one another list moves
-    /// (a copy into it, say) is read in that state through bindless slots.
+    /// A pending CPU refresh can be delivered by a different submitted
+    /// list. State changes recorded here describe this list's normal uses.
     pub(crate) fn prepare_bindless_record(&self, list: &crate::host::HostList) {
         if self.sampler {
             return;
@@ -1212,13 +1218,18 @@ impl HostHeap {
             return;
         }
         // One recording thread prepares at a time; the others go on.
-        if self.recording.swap(true, Ordering::Acquire) {
+        let revision = self.recording.load(Ordering::Acquire);
+        if revision & 1 != 0
+            || self.recording.compare_exchange(
+                revision, revision.wrapping_add(1), Ordering::Acquire, Ordering::Relaxed,
+            ).is_err()
+        {
             return;
         }
-        struct Done<'a>(&'a std::sync::atomic::AtomicBool);
+        struct Done<'a>(&'a AtomicU64);
         impl Drop for Done<'_> {
             fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
+                self.0.fetch_add(1, Ordering::Release);
             }
         }
         let _done = Done(&self.recording);
@@ -1342,15 +1353,13 @@ impl HostHeap {
             let Some(host_tex) = crate::resource::host_resource(texture) else {
                 continue;
             };
-            if crate::texture::title_written(host_tex)
-                && self.upload_due(
+            if crate::texture::title_written(host_tex) {
+                self.queue_texture_refresh(
                     texture,
                     host_tex,
                     frame,
                     RecheckTarget::Placed(texture as usize),
-                )
-            {
-                crate::texture::upload(list, texture, host_tex);
+                );
             }
             crate::list::ensure_state(list, texture, SHADER_RESOURCE);
         }
@@ -1358,15 +1367,13 @@ impl HostHeap {
             let Some(host_tex) = crate::resource::host_resource(texture) else {
                 continue;
             };
-            if crate::texture::title_written(host_tex)
-                && self.upload_due(
+            if crate::texture::title_written(host_tex) {
+                self.queue_texture_refresh(
                     texture,
                     host_tex,
                     frame,
                     RecheckTarget::Ordinary(slot, vi, generation, texture as usize),
-                )
-            {
-                crate::texture::upload(list, texture, host_tex);
+                );
             }
             crate::list::ensure_state(list, texture, SHADER_RESOURCE);
         }
@@ -1455,6 +1462,122 @@ impl HostHeap {
             return Ok(None);
         }
         Ok(Some(tex))
+    }
+
+    fn queue_texture_refresh(
+        &self,
+        texture: crate::object::This,
+        host: &ID3D12Resource,
+        frame: u64,
+        target: RecheckTarget,
+    ) {
+        use windows::core::Interface;
+        let identity = texture as usize;
+        let due = self.upload_due(texture, host, frame, target);
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(queued) = b.pending_uploads.get_mut(&identity)
+            && queued.request.copy.texture.as_raw() == host.as_raw()
+        {
+            if !queued.targets.contains(&target) {
+                queued.targets.push(target);
+            }
+            return;
+        }
+        if due && let Some(request) = crate::texture::refresh_request(texture, host) {
+            b.pending_uploads.insert(identity, PendingUpload {
+                request: Arc::new(request),
+                targets: vec![target],
+            });
+        }
+    }
+
+    /// Snapshots only tickets still reachable through a current title slot
+    /// and the same native texture. Check the raw record too, since the
+    /// title can overwrite descriptor memory without calling mirror().
+    pub(crate) fn pending_texture_refreshes(
+        &self,
+    ) -> Vec<(usize, Arc<crate::texture::RefreshRequest>)> {
+        use windows::core::Interface;
+        let (start, revision, candidates) = {
+            let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            if b.pending_uploads.is_empty() {
+                return Vec::new();
+            }
+            let mut placed_slots: HashMap<usize, Vec<(u32, u32, u32)>> = HashMap::new();
+            if b.pending_uploads.values().any(|pending| pending.targets.iter()
+                .any(|target| matches!(target, RecheckTarget::Placed(_))))
+            {
+                for (&slot, &(key, texture)) in &b.recorded {
+                    let pair = (key as u32, (key >> 32) as u32);
+                    if b.pending_uploads.contains_key(&texture)
+                        && b.placed_set.get(&slot) == Some(&pair)
+                    {
+                        placed_slots.entry(texture).or_default().push((slot, pair.0, pair.1));
+                    }
+                }
+            }
+            let candidates = b.pending_uploads.iter().map(|(&identity, pending)| {
+                let ordinary = pending.targets.iter().filter_map(|&target| match target {
+                    RecheckTarget::Ordinary(slot, vi, generation, _)
+                        if b.texture_set.get(&slot) == Some(&(vi, generation)) =>
+                    {
+                        Some((slot, vi, generation))
+                    }
+                    _ => None,
+                }).collect::<Vec<_>>();
+                (identity, pending.request.clone(), ordinary, placed_slots.remove(&identity))
+            }).collect::<Vec<_>>();
+            (b.title_start, self.recording.load(Ordering::Acquire), candidates)
+        };
+        let mut live = Vec::new();
+        for (identity, request, ordinary, placed) in candidates {
+            let placed_live = placed.as_ref()
+                .and_then(|_| crate::resource::hold_placed(identity as crate::object::This));
+            let slots = ordinary.into_iter().chain(placed.into_iter()
+                .filter(|_| placed_live.is_some()).flatten());
+            let matches = |(slot, vi, generation)| {
+                let mut record = [0u8; 12];
+                let address = start + u64::from(slot) * 32;
+                if !crate::host::read_into(address as *const u8, &mut record) {
+                    return false;
+                }
+                let word = |i: usize| u32::from_le_bytes(record[i * 4..i * 4 + 4].try_into().unwrap());
+                word(0) == VIEW_TAG && word(1) == vi && word(2) == generation
+                    && view_at(vi, generation).is_some()
+                    && self.kept.lock().unwrap_or_else(|e| e.into_inner())
+                        .get(slot as usize).and_then(Option::as_ref)
+                        .is_some_and(|native| native.as_raw() == request.copy.texture.as_raw())
+            };
+            if start != 0 && slots.into_iter().any(matches) {
+                live.push((identity, request));
+            } else if revision & 1 == 0 {
+                self.remove_pending_refresh(identity, &request, Some(revision));
+            }
+        }
+        live
+    }
+
+    /// A newer ticket may have replaced this address while a submission was
+    /// in flight. Only retire the request that was validated for that list.
+    pub(crate) fn remove_pending_refresh(
+        &self,
+        identity: usize,
+        request: &Arc<crate::texture::RefreshRequest>,
+        stale_revision: Option<u64>,
+    ) {
+        use windows::core::Interface;
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        if stale_revision.is_some_and(|revision| self.recording.load(Ordering::Acquire) != revision) {
+            return;
+        }
+        if b.pending_uploads.get(&identity).is_some_and(|queued| Arc::ptr_eq(&queued.request, request)) {
+            b.pending_uploads.remove(&identity);
+            if stale_revision.is_some() && b.uploaded.get(&identity).is_some_and(|entry|
+                entry.0.as_raw() == request.copy.texture.as_raw())
+            {
+                b.uploaded.remove(&identity);
+            }
+        }
     }
 
     /// Whether to upload bindless texture `texture` (reached through a slot)
@@ -3267,8 +3390,8 @@ void main() {
             host_heap.prepare_bindless_record(list);
             if expect_scheduled {
                 assert!(
-                    !list.first_use(tex_res as usize),
-                    "ordinary bindless texture SRV must schedule its upload on the list"
+                    host_heap.pending_texture_refreshes().iter().any(|(identity, _)| *identity == tex_res as usize),
+                    "ordinary bindless texture SRV must leave a live upload request"
                 );
             }
             list.defer_bindless(&host_heap, true);

@@ -426,6 +426,9 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// A submitted copy or resolve makes this host texture authoritative.
     TextureHostWrite(std::sync::Arc<crate::resource::HostTexture>),
+    /// The first direct use of this heap on the list can deliver its
+    /// outstanding CPU texture requests in submission order.
+    BindlessTextures(std::sync::Arc<crate::descriptor::host::HostHeap>),
     /// Brings a texture's staging buffer up to date and, when dirty, copies
     /// it into the host texture on the list's prelude: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
@@ -462,6 +465,18 @@ struct Deferred {
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
+
+struct TextureReceipt {
+    heap: std::sync::Arc<crate::descriptor::host::HostHeap>,
+    identity: usize,
+    request: std::sync::Arc<crate::texture::RefreshRequest>,
+    ready: bool,
+}
+
+type TextureUpload = (
+    std::sync::Arc<crate::texture::Staging>,
+    std::sync::Arc<crate::resource::HostTexture>,
+);
 
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
@@ -552,9 +567,9 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
-            let uploads = list.run_deferred(&mut batch);
+            let (uploads, reads) = list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude(&uploads) {
+            if let Some(prelude) = list.prelude(&uploads, &reads) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -580,15 +595,26 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                let signalled = self.queue.Signal(&self.fence, *submitted);
+                if !batch.texture_receipts.is_empty() && let Err(error) = &signalled {
+                    fail(format_args!(
+                        "could not signal texture-refresh submission ({error}){}",
+                        self.removal_data(runs)
+                    ));
+                }
+                let waited = signalled.and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                }
+                // A failed or unexpectedly early event wait cannot release
+                // the upload mappings while the queue can still read them.
+                if !batch.texture_receipts.is_empty() {
+                    while self.fence.GetCompletedValue() < *submitted {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -623,6 +649,11 @@ impl Host {
                 self.removal_data(runs),
                 last_notes(runs)
             ));
+        }
+        for receipt in batch.texture_receipts.into_values() {
+            if receipt.ready {
+                receipt.heap.remove_pending_refresh(receipt.identity, &receipt.request, None);
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -1003,10 +1034,8 @@ impl HostList {
     /// the textures' real states become those the list ends with.
     fn prelude(
         &self,
-        uploads: &[(
-            std::sync::Arc<crate::texture::Staging>,
-            std::sync::Arc<crate::resource::HostTexture>,
-        )],
+        uploads: &[TextureUpload],
+        bindless_reads: &[std::sync::Arc<crate::resource::HostTexture>],
     ) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
         let mut pre_barriers = Vec::new();
@@ -1021,7 +1050,7 @@ impl HostList {
             }
         }
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let post_barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+        let mut post_barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
@@ -1034,6 +1063,20 @@ impl HostList {
                 })
             })
             .collect();
+        // The request may have been discovered by another recording. Keep
+        // the list's recorded state assumptions when it names this texture.
+        // Otherwise the first use is the bindless SRV read.
+        const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0,
+        );
+        for copy in bindless_reads {
+            if !states.contains_key(&(std::sync::Arc::as_ptr(copy) as usize)) {
+                let before = copy.state.swap(READ.0 as u32, Ordering::Relaxed);
+                if before != READ.0 as u32 {
+                    post_barriers.push(transition(&copy.texture, D3D12_RESOURCE_STATES(before as i32), READ));
+                }
+            }
+        }
         if uploads.is_empty() && post_barriers.is_empty() {
             return None;
         }
@@ -1265,7 +1308,10 @@ impl HostList {
             .find(|(h, _)| std::sync::Arc::ptr_eq(h, heap))
         {
             Some((_, w)) => *w |= writes,
-            None => deferred.bindless.push((heap.clone(), writes)),
+            None => {
+                deferred.bindless.push((heap.clone(), writes));
+                deferred.copies.push(Step::BindlessTextures(heap.clone()));
+            }
         }
     }
 
@@ -1305,13 +1351,11 @@ impl HostList {
     fn run_deferred(
         &self,
         batch: &mut Batch,
-    ) -> Vec<(
-        std::sync::Arc<crate::texture::Staging>,
-        std::sync::Arc<crate::resource::HostTexture>,
-    )> {
+    ) -> (Vec<TextureUpload>, Vec<std::sync::Arc<crate::resource::HostTexture>>) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         let mut uploads = Vec::new();
+        let mut bindless_reads = Vec::new();
         let deferred = self.deferred();
         for (heap, writes) in &deferred.bindless {
             batch.bindless(heap, *writes);
@@ -1369,6 +1413,38 @@ impl HostList {
                     copy.host_written.store(true, Ordering::Relaxed);
                     continue;
                 }
+                Step::BindlessTextures(heap) => {
+                    for (identity, request) in heap.pending_texture_refreshes() {
+                        let copy = &request.copy;
+                        bindless_reads.push(copy.clone());
+                        let key = std::sync::Arc::as_ptr(&request) as usize;
+                        if batch.texture_receipts.get(&key).is_some_and(|receipt| receipt.ready) {
+                            continue;
+                        }
+                        let ready = if copy.host_written.load(Ordering::Relaxed) {
+                            true
+                        } else if batch.texture_due(&request.staging) {
+                            match request.staging.refresh_pending(&mut batch.texture_snapshot) {
+                                Some(dirty) => {
+                                    if dirty {
+                                        uploads.push((request.staging.clone(), copy.clone()));
+                                    }
+                                    true
+                                }
+                                None => false,
+                            }
+                        } else {
+                            false
+                        };
+                        batch.texture_receipts.insert(key, TextureReceipt {
+                            heap: heap.clone(),
+                            identity,
+                            request,
+                            ready,
+                        });
+                    }
+                    continue;
+                }
                 Step::Texture(staging, copy) => {
                     if !copy.host_written.load(Ordering::Relaxed)
                         && batch.texture_due(staging)
@@ -1382,7 +1458,7 @@ impl HostList {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
-        uploads
+        (uploads, bindless_reads)
     }
 }
 
@@ -1399,6 +1475,11 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Accepted requests stay pinned through the fence and are delivered
+    /// at most once per submission, even across several lists.
+    texture_receipts: std::collections::HashMap<usize, TextureReceipt>,
+    /// Reused when pending textures lack a write-watched backing.
+    texture_snapshot: Vec<u8>,
     /// View heaps the submission's draws index directly, and whether their
     /// shaders may write memory.
     bindless: Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, bool)>,
