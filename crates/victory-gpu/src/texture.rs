@@ -65,6 +65,23 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
+/// Cached upload buffer sizes and retained CPU read capacities, in bytes.
+/// Omit a busy sample instead of waiting on texture work for diagnostics.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cached_staging_bytes() -> Option<(u64, usize)> {
+    let map = STAGING.try_lock().ok()?;
+    let mut upload = 0;
+    let mut read = 0;
+    if let Some(map) = map.as_ref() {
+        for staging in map.values() {
+            let last = staging.last.try_lock().ok()?;
+            upload += staging.size;
+            read += last.read.capacity();
+        }
+    }
+    Some((upload, read))
+}
+
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);

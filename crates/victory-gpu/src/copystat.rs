@@ -166,6 +166,19 @@ pub(crate) fn log(frames: f64) {
             "process memory"
         );
     }
+    let snapshots = crate::shadow::idle_snapshot_bytes();
+    let textures = crate::texture::cached_staging_bytes();
+    if let (Some(idle_snapshot_bytes), Some((texture_upload_bytes, texture_read_capacity_bytes))) =
+        (snapshots, textures)
+    {
+        tracing::info!(
+            idle_snapshot_bytes,
+            texture_upload_bytes,
+            texture_read_capacity_bytes,
+            "retained copy memory"
+        );
+    }
+
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
