@@ -2753,12 +2753,13 @@ mod submissions {
         );
         let heap_ref = heap(title_heap);
         let host_heap = heap_ref.host().unwrap();
-        // Lease every dynamic slot (65,536) on `list`.
-        let first = host_heap.dynamic(1 << 16).unwrap();
-        assert_eq!(host_heap.dynamic(1), None);
-
+        // Lease every dynamic slot on `list`, in 2^16 runs (a heap has 2^16
+        // or 2^18 of them, depending on what the host takes).
         let list = host.new_list().unwrap();
-        list.keep_dynamic(heap_ref.id(), first, 1 << 16);
+        while let Some(first) = host_heap.dynamic(1 << 16) {
+            list.keep_dynamic(heap_ref.id(), first, 1 << 16);
+        }
+        assert_eq!(host_heap.dynamic(1), None);
         list.close();
 
         // Hold the host queue behind a private fence armed atomically inside
