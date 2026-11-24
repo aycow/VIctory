@@ -213,9 +213,17 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        #[cfg(feature = "diagnostics")]
+        let hash_start = crate::copystat::texture_hash_timing().then(std::time::Instant::now);
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+        {
+            use crate::copystat::{C, add};
+            if let Some(start) = hash_start {
+                add(C::TexHashUs, start.elapsed().as_micros() as u64);
+            }
+            add(C::TexHashed, size as u64);
+        }
         if last.hash == Some(hash) {
             return size;
         }
