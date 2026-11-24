@@ -4,6 +4,8 @@
 
 use std::ffi::c_void;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use victory_gpu::flush_gpu_census;
 use victory_gpu::device;
 use victory_gpu::object::{HRESULT, Iid, Object};
 

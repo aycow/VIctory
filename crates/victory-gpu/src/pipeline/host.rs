@@ -275,6 +275,8 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) census: Option<Arc<crate::census::Pipeline>>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -449,6 +451,8 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                #[cfg(feature = "diagnostics")]
+                census: None,
                 slots: 0,
                 inputs: Vec::new(),
             });
@@ -481,6 +485,8 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                #[cfg(feature = "diagnostics")]
+                census: None,
                 slots: 0,
                 inputs: Vec::new(),
             });
@@ -551,6 +557,8 @@ impl HostPipeline {
             root,
             stages: bound,
             name: format!("{shaders:?}"),
+            #[cfg(feature = "diagnostics")]
+            census: None,
             slots: g.slots(),
             inputs: g.elements(),
         })
