@@ -227,7 +227,10 @@ fn unsubmitted_first_recording_does_not_consume_a_bindless_texture_upload() {
     let (output, mapped) = host.shared_buffer(BYTES).unwrap();
     let explicit_retry = std::env::var_os("VICTORY_BINDLESS_TEST_REARM").is_some();
     let mut failures = Vec::new();
-    for (placed, discard) in [(false, true), (true, true), (false, false), (true, false)] {
+    let cases = [false, true]
+        .into_iter()
+        .flat_map(|placed| ["discard", "reverse", "reset"].map(|order| (placed, order)));
+    for (placed, order) in cases {
         // Use a separate heap per case so the record-time cache cannot hide
         // the first bindless use. Seed the destination through the uploader
         // independently to give the stale case deterministic valid data.
@@ -250,7 +253,19 @@ fn unsubmitted_first_recording_does_not_consume_a_bindless_texture_upload() {
         native_heap.prepare_bindless_record(&first);
         first.defer_bindless(&native_heap, false);
         first.close();
-        let first = (!discard).then_some(first);
+        let first = match order {
+            "discard" => {
+                drop(first);
+                None
+            }
+            "reset" => {
+                first.reset();
+                first.close();
+                host.execute(&[&first]);
+                None
+            }
+            _ => Some(first),
+        };
 
         let consumer = host.new_list().unwrap();
         native_heap.prepare_bindless_record(&consumer);
@@ -269,10 +284,10 @@ fn unsubmitted_first_recording_does_not_consume_a_bindless_texture_upload() {
         // SAFETY: submission is fenced before reading the output mapping.
         let got = unsafe { mapped.cast::<u32>().read() };
         eprintln!(
-            "{name} placed={placed} discard={discard}: expected={INPUT_NEW:#x} observed={got:#x}"
+            "{name} placed={placed} order={order}: expected={INPUT_NEW:#x} observed={got:#x}"
         );
         if got != INPUT_NEW {
-            failures.push((placed, discard, got));
+            failures.push((placed, order, got));
         }
         if let Some(first) = first {
             host.execute(&[&first]);
@@ -287,6 +302,161 @@ fn unsubmitted_first_recording_does_not_consume_a_bindless_texture_upload() {
         failures.is_empty(),
         "first bindless use read the previous texture contents: {failures:?}"
     );
+}
+
+#[test]
+#[ignore = "requires DXC, Agility SDK 1.620.x and a selected adapter"]
+fn bindless_rebind_retires_the_upload_for_the_old_native_texture() {
+    let (device, name) = device();
+    let info = device.cast::<ID3D12InfoQueue>().unwrap();
+    let host = install_bindless_test_device(device);
+    let (root, pipeline) = pipeline(host);
+    let (output, mapped) = host.shared_buffer(BYTES).unwrap();
+    let backings: [_; 4] = std::array::from_fn(|_| resource::Memory::zeroed(BYTES, BYTES).unwrap());
+    for placed in [false, true] {
+        let index = 2 * usize::from(placed);
+        let old_memory = &backings[index];
+        let new_memory = &backings[index + 1];
+        let (title_heap, handle) = make_shader_heap(8);
+        let native_heap = heap(title_heap).host_arc().unwrap();
+        // SAFETY: the mapped test textures are not used by the GPU yet.
+        unsafe {
+            (old_memory.address() as *mut u32).write(INPUT_OLD);
+            (new_memory.address() as *mut u32).write(INPUT_GPU);
+        }
+        let (old, _old_lease) = make_texture(old_memory.address(), handle, placed);
+        let old_native = resource::host_resource(old).unwrap();
+        let seed = host.new_list().unwrap();
+        crate::texture::upload(&seed, old, old_native);
+        crate::list::ensure_state(&seed, old, READ_STATE);
+        seed.close();
+        host.execute(&[&seed]);
+        // SAFETY: the seed submission has finished using the old backing.
+        unsafe { (old_memory.address() as *mut u32).write(INPUT_NEW) };
+
+        let consumer = host.new_list().unwrap();
+        native_heap.prepare_bindless_record(&consumer);
+        consumer.defer_bindless(&native_heap, false);
+        sample(&consumer, &native_heap.heap, &root, &pipeline, &output);
+        consumer.close();
+
+        let (new, _new_lease) = make_texture(new_memory.address(), handle, placed);
+        let replaced = host.new_list().unwrap();
+        native_heap.prepare_bindless_record(&replaced);
+        replaced.defer_bindless(&native_heap, false);
+        replaced.close();
+        drop(replaced);
+        host.execute(&[&consumer]);
+        // SAFETY: the consumer's readback has completed.
+        let observed = unsafe { mapped.cast::<u32>().read() };
+        assert_eq!(
+            observed, INPUT_GPU,
+            "the re-bound slot uses the new native copy"
+        );
+        assert!(native_heap.pending_texture_refreshes().is_empty());
+
+        let read = host.new_list().unwrap();
+        crate::list::ensure_state(&read, old, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (back, _) = crate::capture::read_back(&host.device, &read.list, old_native).unwrap();
+        read.close();
+        host.execute(&[&read]);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the readback belongs to a fenced texture copy.
+        let old_pixel = unsafe {
+            back.Map(0, None, Some(&mut data)).unwrap();
+            let word = data.cast::<u32>().read();
+            back.Unmap(0, Some(&D3D12_RANGE::default()));
+            word
+        };
+        assert_eq!(
+            old_pixel, INPUT_OLD,
+            "the retired request did not upload the old texture"
+        );
+        eprintln!("{name} placed={placed} rebind: new={observed:#x} old={old_pixel:#x}");
+        if !placed {
+            for texture in [old, new] {
+                slot::<extern "system" fn(This) -> u32>(texture, 0x10)(texture);
+            }
+        }
+        slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+    }
+    check_debug(&info);
+}
+
+#[test]
+#[ignore = "requires DXC, Agility SDK 1.620.x and a selected adapter"]
+fn bindless_alias_delivers_one_pending_upload_per_submission() {
+    let (device, name) = device();
+    let info = device.cast::<ID3D12InfoQueue>().unwrap();
+    let host = install_bindless_test_device(device);
+    let (root, pipeline) = pipeline(host);
+    let (output, mapped) = host.shared_buffer(BYTES).unwrap();
+    let backings: [_; 2] = std::array::from_fn(|_| resource::Memory::zeroed(BYTES, BYTES).unwrap());
+    for (placed, memory) in [false, true].into_iter().zip(&backings) {
+        let (title_heap, handle) = make_shader_heap(8);
+        let native_heap = heap(title_heap).host_arc().unwrap();
+        let address = memory.address() as usize;
+        // SAFETY: this owned texture backing has no overlapping GPU execution.
+        unsafe { (address as *mut u32).write(INPUT_OLD) };
+        let first_slot = handle + 32;
+        let (texture, _held) = make_texture(address as u64, first_slot, placed);
+        let seed = host.new_list().unwrap();
+        crate::texture::upload(&seed, texture, resource::host_resource(texture).unwrap());
+        crate::list::ensure_state(&seed, texture, READ_STATE);
+        seed.close();
+        host.execute(&[&seed]);
+        // SAFETY: the seed upload is complete.
+        unsafe { (address as *mut u32).write(INPUT_NEW) };
+        let discovery = host.new_list().unwrap();
+        native_heap.prepare_bindless_record(&discovery);
+        discovery.close();
+        drop(discovery);
+
+        let _alias_lease = if placed {
+            let (alias, lease) = make_texture(address as u64, handle, true);
+            assert_eq!(
+                texture, alias,
+                "both slots name the same live placed texture"
+            );
+            lease
+        } else {
+            create_srv(std::ptr::null(), texture, std::ptr::null(), handle);
+            None
+        };
+        // SAFETY: both slots belong to the live descriptor heap. Clear the
+        // discovery slot through title memory without mirroring the write.
+        unsafe { (first_slot as *mut u8).write_bytes(0, 32) };
+        let consumer = host.new_list().unwrap();
+        native_heap.prepare_bindless_record(&consumer);
+        consumer.defer_bindless(&native_heap, false);
+        sample(&consumer, &native_heap.heap, &root, &pipeline, &output);
+        consumer.close();
+
+        let tail = host.new_list().unwrap();
+        // SAFETY: the backing lives through submission. This CPU write
+        // cannot change the bytes already staged for the earlier list.
+        tail.defer(move || unsafe { (address as *mut u32).write(INPUT_GPU) });
+        tail.defer_bindless(&native_heap, false);
+        tail.close();
+        host.execute(&[&consumer, &tail]);
+        // SAFETY: both lists are fenced, and the backing remains mapped.
+        let (observed, latest_cpu) =
+            unsafe { (mapped.cast::<u32>().read(), (address as *const u32).read()) };
+        assert_eq!(latest_cpu, INPUT_GPU);
+        assert_eq!(
+            observed, INPUT_NEW,
+            "a later list must not change the staged upload"
+        );
+        assert!(native_heap.pending_texture_refreshes().is_empty());
+        eprintln!(
+            "{name} placed={placed} alias: first_sample={observed:#x} later_cpu={latest_cpu:#x}"
+        );
+        if !placed {
+            slot::<extern "system" fn(This) -> u32>(texture, 0x10)(texture);
+        }
+        slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+    }
+    check_debug(&info);
 }
 
 #[test]

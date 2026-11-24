@@ -52,6 +52,63 @@ whether to copy. The producer comparison on this branch is
 
 The full matrices used AMD Radeon Graphics, NVIDIA RTX 5070 Laptop, and WARP with full GPU-based validation.
 
+## Submission-owned refresh
+
+The candidate uses the same #413 record-time discovery and #230 submission
+prelude. Once accepted by the existing scheduler, a pending request holds
+its native texture and staging. The first submitted heap user with a
+current compatible SRV can deliver it. The slot's title view generation
+and retained native resource must match. Discarding or resetting an earlier
+recording leaves the request available. Rebinding to a different native
+texture retires the stale request, and a submitted GPU producer retains
+priority over a pending CPU upload. The queue fence retires delivered
+requests and releases their submission pins through the existing wait.
+
+Run these four tests on the candidate using the setup above. Leave the
+fixture's historical retry override unset.
+
+```powershell
+Remove-Item Env:VICTORY_BINDLESS_TEST_REARM -ErrorAction SilentlyContinue
+$test = 'descriptor::host::tests::texture_record_tests::'
+$cases = @(
+  'unsubmitted_first_recording_does_not_consume_a_bindless_texture_upload',
+  'a_bound_bindless_upload_preserves_an_earlier_submitted_gpu_producer',
+  'bindless_rebind_retires_the_upload_for_the_old_native_texture',
+  'bindless_alias_delivers_one_pending_upload_per_submission'
+)
+foreach ($adapter in @('amd', 'nvidia', 'warp')) {
+  $env:VICTORY_BINDLESS_TEST_ADAPTER = $adapter
+  foreach ($case in $cases) {
+    cargo test --locked -p victory-gpu --features diagnostics --lib "$test$case" -- --exact --ignored --nocapture --test-threads=1
+    if ($LASTEXITCODE -ne 0) { throw "$adapter failed $case" }
+  }
+}
+```
+
+| Native test | Ordinary and placed cases across three adapters | Expected readback |
+|---|---:|---|
+| Discarded, reversed, or reset first recording | 18 | CPU update `0x87654321` |
+| Native GPU producer, both recording orders | 12 | GPU update `0xfeed1234` |
+| Rebind to a different native texture | 6 | New slot `0xfeed1234`, old native texture `0x12345678` |
+| Move the SRV to a second slot of the same native texture, raw-clear the first slot, and defer a later CPU write in the batch | 6 | First native sample `0x87654321`, later CPU bytes `0xfeed1234` |
+
+All 42 cases passed on AMD Radeon Graphics, GeForce RTX 5070 Laptop GPU,
+and WARP. The fixture explicitly checks full GPU-based validation and scans
+the D3D12 message queue for errors and corruption. The earlier stale-data
+control had no D3D12 errors, so the values are a separate correctness check.
+
+The candidate depends on #413 `6a0c5e9` and #230 `8d81f61` through their
+original merge commits in this branch. The focused change can be reviewed
+with those authors on top of #230's ordering boundary. It uses existing
+record-time discovery and assumes callers synchronize title descriptor
+writes with submission. It covers SRVs of one current native texture per
+resource, including multiple live slots. New raw-only bindings without a
+recording to discover them, compatible aliases between distinct native
+objects, placed UAVs, and multiple CPU snapshots for a single texture
+within one native list remain separate cases. This matrix uses original
+synthetic HLSL and texture bytes. CPU overhead and in-game impact have no
+measurements here.
+
 ## Integration boundary
 
 #230 records changed texture copies in the submission prelude, with
