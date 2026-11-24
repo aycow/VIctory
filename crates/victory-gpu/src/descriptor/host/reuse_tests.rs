@@ -28,7 +28,7 @@ const FIRST: u32 = 0x1458_acef;
 const SECOND: u32 = 0xfec1_4921;
 const SPAN: u32 = 2048;
 
-fn device(validate: bool) -> (ID3D12Device, String) {
+pub(crate) fn device(validate: bool) -> (ID3D12Device, String) {
     let sdk = std::env::var("VICTORY_TABLE_TEST_AGILITY").expect("Agility SDK 1.620.x x64 path");
     let sdk = std::ffi::CString::new(format!("{}\\", sdk.trim_end_matches(['/', '\\']))).unwrap();
     let vendor = std::env::var("VICTORY_TABLE_TEST_ADAPTER").expect("amd, nvidia or warp");
@@ -332,14 +332,6 @@ fn reset_holds_descriptor_ranges_until_native_fence() {
     listing.keep_dynamic_range(local);
     listing.keep(&heap.heap);
 
-    // Signal on unwind before the list destructor can wait for completion.
-    struct Gate(ID3D12Fence);
-    impl Drop for Gate {
-        fn drop(&mut self) {
-            // SAFETY: the fence is ours and stays alive until signalled.
-            unsafe { self.0.Signal(1).unwrap() };
-        }
-    }
     // SAFETY: resources, heap and pipeline are live through the fence.
     unsafe {
         listing.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
@@ -374,7 +366,7 @@ fn reset_holds_descriptor_ranges_until_native_fence() {
         )]);
         listing.list.CopyBufferRegion(&readback, 0, &output, 0, 8);
         listing.close();
-        let gate = Gate(host.test_queue_gate());
+        let gate = host.test_queue_gate();
         host.execute(&[&listing]);
         assert!(listing.running());
         listing.reset();
@@ -614,7 +606,7 @@ fn capped_pool_texture_table_reuse() {
     }
 }
 
-fn assert_validated(info: &ID3D12InfoQueue) {
+pub(crate) fn assert_validated(info: &ID3D12InfoQueue) {
     // SAFETY: fetch each validation message into its aligned buffer.
     unsafe {
         for i in 0..info.GetNumStoredMessages() {

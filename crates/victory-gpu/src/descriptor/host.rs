@@ -1009,4 +1009,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod reuse_tests;
+pub(crate) mod reuse_tests;

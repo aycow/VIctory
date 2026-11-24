@@ -255,6 +255,17 @@ pub(crate) fn test_install_device(device: ID3D12Device) -> &'static Host {
     made().unwrap()
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) struct TestQueueGate(ID3D12Fence);
+
+#[cfg(all(test, feature = "diagnostics"))]
+impl Drop for TestQueueGate {
+    fn drop(&mut self) {
+        // SAFETY: the fixture owns the live fence and its unsignalled value.
+        unsafe { self.0.Signal(1).unwrap() };
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -563,7 +574,10 @@ impl Pending {
                         }
                     }
                     Step::Refresh(_, address, len) => touches.reads.push((*address, address + len)),
-                    Step::Texture(staging) => touches.reads.push(staging.range()),
+                    Step::Texture(staging) => {
+                        touches.reads.push(staging.range());
+                        touches.staging.insert(std::sync::Arc::as_ptr(staging) as usize);
+                    }
                     _ => {}
                 }
             }
@@ -600,12 +614,12 @@ thread_local! {
 
 impl Host {
     #[cfg(all(test, feature = "diagnostics"))]
-    pub(crate) fn test_queue_gate(&self) -> ID3D12Fence {
+    pub(crate) fn test_queue_gate(&self) -> TestQueueGate {
         // SAFETY: a private fence and a live queue, signalled by the fixture.
         unsafe {
             let gate = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
             self.queue.Wait(&gate, 1).unwrap();
-            gate
+            TestQueueGate(gate)
         }
     }
 
@@ -1694,7 +1708,7 @@ impl HostList {
                     if batch.texture_due(staging) {
                         let (from, to) = staging.range();
                         batch.settle(from, to - from, false);
-                        staging.refresh();
+                        staging.refresh(|| batch.settle_staging(staging));
                     }
                     continue;
                 }
@@ -1723,6 +1737,14 @@ struct Batch<'a> {
 }
 
 impl Batch<'_> {
+    fn settle_staging(&self, staging: &crate::texture::Staging) {
+        if let Some(host) = self.host
+            && let Some(value) = host.timeline.staging_conflict(std::ptr::from_ref(staging) as usize)
+        {
+            host.settle(value);
+        }
+    }
+
     /// Before a step reads (or, with `writing`, writes) title memory
     /// `[address, address + len)`: earlier submissions whose GPU work
     /// writes (or reads) it are finished first.

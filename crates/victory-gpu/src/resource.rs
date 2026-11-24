@@ -1585,6 +1585,97 @@ mod tests {
         assert_eq!(t, u64::MAX, "no second subresource");
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    #[ignore = "requires a named D3D12 adapter and Agility SDK 1.620.x"]
+    fn changed_texture_upload_waits_for_older_gpu_reader() {
+        use crate::descriptor::host::reuse_tests::{assert_validated, device};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+
+        assert!(std::env::var_os("VICTORY_GPU_TIMING").is_none());
+        let (device, name) = device(true);
+        let messages = device.cast::<ID3D12InfoQueue>().unwrap();
+        let gpu = crate::host::test_install_device(device);
+        let null = std::ptr::null();
+        let mut image = null;
+        let desc = texture(4, 4, 28, 1);
+        let layout = texture_layout(&desc).unwrap();
+        let bytes = layout.planes[0].layout.size as usize;
+        const COPY_SOURCE: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                COPY_DEST,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut image,
+            ),
+            S_OK
+        );
+        let data = resource(image).data();
+        let native = host_resource(image).unwrap();
+        let first = gpu.new_list().unwrap();
+        let second = gpu.new_list().unwrap();
+        let (reached_sender, reached) = mpsc::sync_channel(1);
+        second.defer_host((0, 0), move || reached_sender.send(()).unwrap());
+        let record = |list: &crate::host::HostList| {
+            crate::texture::upload(list, image, native);
+            crate::list::ensure_state(list, image, COPY_SOURCE);
+            crate::capture::read_back(&gpu.device, &list.list, native).unwrap().0
+        };
+        let first_result = record(&first);
+        let second_result = record(&second);
+        let (passed_sender, passed) = mpsc::sync_channel(1);
+        second.defer_host((0, 0), move || {
+            let _ = passed_sender.send(());
+        });
+        first.close();
+        second.close();
+
+        // SAFETY: the guest owns the allocated texture bytes. The GPU reads
+        // the separate native staging allocation.
+        unsafe { data.write_bytes(37, bytes) };
+        let gate = gpu.test_queue_gate();
+        gpu.execute(&[&first]);
+        assert!(first.running());
+        unsafe { data.write_bytes(119, bytes) };
+        let release_gate = std::thread::spawn(move || {
+            let reached = reached.recv_timeout(Duration::from_secs(5));
+            let premature = reached.is_ok() && passed.recv_timeout(Duration::from_millis(200)).is_ok();
+            drop(gate);
+            reached.expect("second submission reached staging preparation");
+            premature
+        });
+        gpu.execute(&[&second]);
+        let premature = release_gate.join().unwrap();
+        gpu.drain();
+        assert!(!premature, "overwrote the older submission's staging buffer");
+        let pixel = |buffer: &ID3D12Resource| {
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: copy-back completed. The first pixel has four bytes.
+            unsafe {
+                buffer.Map(0, None, Some(&mut mapped)).unwrap();
+                let rgba = mapped.cast::<[u8; 4]>().read();
+                buffer.Unmap(0, Some(&D3D12_RANGE::default()));
+                rgba
+            }
+        };
+        assert_eq!(
+            (pixel(&first_result), pixel(&second_result)),
+            ([37; 4], [119; 4])
+        );
+        assert_validated(&messages);
+        assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+        println!("{name}: first and second texture uploads kept distinct contents");
+    }
+
     /// A 4x4 texture filled from a title buffer through our list and queue,
     /// then read back from the host GPU.
     #[cfg(windows)]

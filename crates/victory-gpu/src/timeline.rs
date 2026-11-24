@@ -48,6 +48,8 @@ pub(crate) struct Touches {
     pub(crate) labels: Vec<(usize, usize)>,
     /// What it reads (host copies and textures brought up to date for it).
     pub(crate) reads: Vec<(usize, usize)>,
+    /// Shared texture upload buffers that the GPU may still read.
+    pub(crate) staging: std::collections::HashSet<usize>,
 }
 
 struct Entry<W> {
@@ -58,6 +60,7 @@ struct Entry<W> {
     labels: Ranges,
     shaders: Vec<(usize, usize, usize)>,
     reads: Ranges,
+    staging: std::collections::HashSet<usize>,
     /// Title fence signals the title queued after it.
     signals: Vec<Signal>,
     /// Taken while it is being finished.
@@ -91,6 +94,7 @@ impl<W> Timeline<W> {
             shaders,
             labels,
             reads,
+            staging,
         } = touches;
         let writes = shaders
             .iter()
@@ -102,6 +106,7 @@ impl<W> Timeline<W> {
             labels: Ranges::new(labels),
             shaders,
             reads: Ranges::new(reads),
+            staging,
             signals: Vec::new(),
             work: Some(work),
         });
@@ -141,6 +146,15 @@ impl<W> Timeline<W> {
             .iter()
             .rev()
             .find(|e| e.writes.overlaps(from, to) || writing && e.reads.overlaps(from, to))
+            .map(|e| e.value)
+    }
+
+    /// The most recent submission still reading this host staging allocation.
+    pub(crate) fn staging_conflict(&self, staging: usize) -> Option<u64> {
+        self.entries()
+            .iter()
+            .rev()
+            .find(|e| e.staging.contains(&staging))
             .map(|e| e.value)
     }
 
@@ -278,6 +292,7 @@ mod tests {
             shaders,
             labels,
             reads,
+            ..Touches::default()
         };
         t.push(
             1,
