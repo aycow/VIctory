@@ -290,6 +290,7 @@ fn occupancy(heap: &HostHeap) -> usize {
         .count()
 }
 
+#[cfg(feature = "diagnostics")]
 #[test]
 #[ignore = "requires a named D3D12 adapter, DXC and Agility SDK 1.620.x"]
 fn reset_holds_descriptor_ranges_until_native_fence() {
