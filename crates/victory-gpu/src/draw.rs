@@ -1250,6 +1250,10 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "draw/gfx10_window_tests.rs"]
+mod gfx10_window_tests;
+
 /// A view in a few words (diagnostics builds).
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {
