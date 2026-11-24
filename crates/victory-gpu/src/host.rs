@@ -430,6 +430,146 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn inline_copy_reads_and_restores_a_uav_source() {
+        use windows::core::s;
+        if std::env::var_os("VICTORY_1405_NATIVE_COPY").is_none() {
+            return;
+        }
+        if in_child("inline_copy_reads_and_restores_a_uav_source") {
+            return;
+        }
+        assert!(std::env::var_os("VICTORY_D3D12_GBV").is_none());
+        let mut layer: Option<ID3D12Debug1> = None;
+        // SAFETY: Set full validation before the first device is created.
+        unsafe {
+            D3D12GetDebugInterface(&mut layer).unwrap();
+            let layer = layer.unwrap();
+            layer.EnableDebugLayer();
+            layer.SetEnableGPUBasedValidation(true);
+        }
+        let host = host().expect("explicit D3D12 adapter");
+        let messages: ID3D12InfoQueue = host.device.cast().unwrap();
+        // SAFETY: The host device is live and the adapter descriptor is owned.
+        let adapter = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            factory
+                .EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
+                .unwrap()
+                .GetDesc1()
+                .unwrap()
+        };
+        let name = String::from_utf16_lossy(&adapter.Description);
+        eprintln!("full GBV/device states on {}", name.trim_end_matches('\0'));
+        const SOURCE: &str = r#"
+            ByteAddressBuffer alias : register(t0);
+            RWByteAddressBuffer parent : register(u0);
+            [RootSignature("UAV(u0)")]
+            [numthreads(1,1,1)]
+            void produce() { parent.Store(0, 43); }
+            [RootSignature("SRV(t0), UAV(u0)")]
+            [numthreads(1,1,1)]
+            void consume() { parent.Store(4, alias.Load(0) + 1); }
+        "#;
+        let pipeline = |entry| {
+            let bytes = compile(SOURCE, entry, s!("cs_5_1"));
+            // SAFETY: The compiled bytecode and signature outlive creation.
+            unsafe {
+                let root: ID3D12RootSignature =
+                    host.device.CreateRootSignature(0, &bytes).unwrap();
+                let pso: ID3D12PipelineState = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bytes.as_ptr().cast(),
+                            BytecodeLength: bytes.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            }
+        };
+        let producer = pipeline(s!("produce"));
+        let consumer = pipeline(s!("consume"));
+        let previous_states = [false, true];
+        for alias_already_read in previous_states {
+            let (parent, parent_data) = host.shared_buffer(8).unwrap();
+            let (alias, alias_data) = host.shared_buffer(4).unwrap();
+            let list = host.new_list().unwrap();
+            if alias_already_read {
+                list.buffer_state(&alias, BUFFER_READ);
+            }
+            list.begin_command();
+            list.buffer_state(&parent, BUFFER_WRITE);
+            // SAFETY: An open list with valid live writable resources.
+            unsafe {
+                parent_data.cast::<u32>().write(11);
+                parent_data.cast::<u32>().add(1).write(0);
+                alias_data.cast::<u32>().write(0);
+                list.list.SetComputeRootSignature(&producer.0);
+                list.list.SetPipelineState(&producer.1);
+                list.list.SetComputeRootUnorderedAccessView(0, parent.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.begin_command();
+            // A prior reflected table puts parent into UAV state for this
+            // dispatch, before the separate aligned SRV table is visited.
+            list.buffer_state(&parent, BUFFER_WRITE);
+            if std::env::var_os("VICTORY_1405_OLD_COPY_STATE").is_some() {
+                list.buffer_state(&parent, BUFFER_READ);
+                list.buffer_state(&alias, BUFFER_COPY_DEST);
+                // SAFETY: Live and in bounds. This intentionally leaves the
+                // source UAV state intact to check the validation control.
+                unsafe { list.list.CopyBufferRegion(&alias, 0, &parent, 0, 4) };
+            } else {
+                list.copy_buffer(&alias, &parent, 0, 4);
+            }
+            list.buffer_state(&alias, BUFFER_READ);
+            // SAFETY: The alias and parent are separate native buffers.
+            unsafe {
+                list.list.SetComputeRootSignature(&consumer.0);
+                list.list.SetPipelineState(&consumer.1);
+                list.list.SetComputeRootShaderResourceView(0, alias.GetGPUVirtualAddress());
+                list.list.SetComputeRootUnorderedAccessView(1, parent.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut faults = Vec::new();
+            // SAFETY: The submission is complete. The buffers and the debug
+            // layer's own message storage remain live during inspection.
+            unsafe {
+                for i in 0..messages.GetNumStoredMessages() {
+                    let mut size = 0;
+                    messages.GetMessage(i, None, &mut size).unwrap();
+                    let mut bytes = vec![0u64; size.div_ceil(8)];
+                    let message = bytes.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    messages.GetMessage(i, Some(message), &mut size).unwrap();
+                    if (*message).Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                        let text = std::slice::from_raw_parts(
+                            (*message).pDescription,
+                            (*message).DescriptionByteLength,
+                        );
+                        faults.push(format!(
+                            "id {}: {}",
+                            (*message).ID.0,
+                            String::from_utf8_lossy(text).trim_end_matches('\0'),
+                        ));
+                    }
+                }
+                messages.ClearStoredMessages();
+                assert!(faults.is_empty(), "{}", faults.join("\n"));
+                let copied = alias_data.cast::<u32>().read();
+                let written = parent_data.cast::<u32>().add(1).read();
+                eprintln!("alias already read={alias_already_read}: copied {copied}, wrote {written}");
+                assert_eq!((copied, written), (43, 44));
+            }
+        }
+    }
+
     /// A buffer a shader writes and draws read as vertices, as the world's
     /// 174 MB heap is (#199, #264): the argument clamp writes it and
     /// indirect and plain draws read it, in two lists submitted together.
