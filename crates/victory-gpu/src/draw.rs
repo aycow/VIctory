@@ -8,6 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
@@ -22,6 +23,7 @@ use windows::core::Interface;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+use crate::shadow::Shadow;
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -629,8 +631,8 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+        if let Some((view, shadow)) = host.mirror(index, handle, true) {
+            readable(list, u, &view, shadow.as_ref());
         }
     }
 
@@ -717,7 +719,9 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        let index = first + u.table_offset_dwords / 8;
+                        let shadow = host.buffer_shadow(index);
+                        readable(list, u, &view, shadow.as_ref());
                     }
                 }
                 made.push((slot, first * 32));
@@ -750,9 +754,9 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        let shadow = host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u, &view, shadow.as_ref());
                         }
                     }
                     None => {
@@ -1102,16 +1106,22 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+fn readable(
+    list: &HostList,
+    u: &UsedResource,
+    view: &View,
+    shadow: Option<&Arc<Shadow>>,
+) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+    if let Some(shadow) = shadow
+        && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
         && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
+        && shadow.left(address) > 0
     {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
