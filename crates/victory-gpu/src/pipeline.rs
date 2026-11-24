@@ -63,6 +63,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(all(windows, feature = "diagnostics"))]
+    dependency_used: OnceLock<Vec<victory_shader::UsedResource>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -88,6 +90,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                dependency_used: OnceLock::new(),
             })
         })
         .clone()
@@ -131,8 +135,13 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
+    Ok(Translated { host, used: used_resources(container)? })
+}
+
+#[cfg(windows)]
+fn used_resources(container: &[u8]) -> Result<Vec<victory_shader::UsedResource>, String> {
+    use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
@@ -148,7 +157,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    Ok(used)
 }
 
 #[repr(C)]
@@ -252,6 +261,43 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
+}
+
+
+/// Log-safe pipeline identity and the runtime's known refusal reason.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn dependency_pipeline(this: This) -> (String, String, Option<String>) {
+    if this.is_null() {
+        return (String::new(), String::new(), Some("no pipeline set".into()));
+    }
+    let p = pipeline(this);
+    (
+        p.host.dependency_key().to_owned(),
+        format!("{:?}", p.shaders),
+        skipped_shader(p)
+            .map(|hash| format!("skipped shader {hash}"))
+            .or_else(|| make::missing(&p.host)),
+    )
+}
+
+/// Static UAV declarations may be known even when lowering failed.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn dependency_uavs(
+    this: This,
+    mut visit: impl FnMut(&'static str, &victory_shader::UsedResource),
+) {
+    if this.is_null() {
+        return;
+    }
+    for shader in &pipeline(this).shaders {
+        let used = shader.translated.get().and_then(Option::as_ref).map_or_else(
+            || shader.dependency_used.get_or_init(|| used_resources(&shader.container).unwrap_or_default()),
+            |t| &t.used,
+        );
+        for u in used.iter().filter(|u| u.kind == victory_shader::ResourceType::Uav) {
+            visit(shader.stage, u);
+        }
+    }
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
