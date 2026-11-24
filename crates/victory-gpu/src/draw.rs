@@ -74,17 +74,11 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
-    }
+    /// Keep each shared range until this list can no longer be submitted.
+    shared_tables:
+        std::collections::HashMap<usize, std::sync::Arc<crate::descriptor::host::SharedTable>>,
+    /// Dynamic list-local tables (including their CBV descriptors).
+    dynamic: Vec<crate::descriptor::host::DynamicRange>,
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -674,6 +668,25 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            if !entries.iter().any(|u| u.kind == ResourceType::Cbv)
+                && let Some(shared) = heap
+                    .with_texture_table(table, n, |views| {
+                        let shared = host.shared_textures(n, views)?;
+                        for u in &entries {
+                            let offset = u.table_offset_dwords / 8;
+                            if let Ok(i) = views.binary_search_by_key(&offset, |view| view.slot) {
+                                readable(list, u, views[i].view);
+                            }
+                        }
+                        Some(shared)
+                    })
+                    .flatten()
+            {
+                made.push((slot, shared.first() * 32));
+                let identity = std::sync::Arc::as_ptr(&shared) as usize;
+                self.shared_tables.entry(identity).or_insert(shared);
+                continue;
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -695,12 +708,12 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(range) = host.reserve_dynamic(n) else {
                 continue;
             };
+            let first = range.first;
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.dynamic.push(range);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {

@@ -96,6 +96,55 @@ impl Heap {
         Some(h)
     }
 
+    /// Resolve all slots in an eligible table before publishing a native
+    /// snapshot. Keep the view generations stable while recording the
+    /// list's normal texture preparation.
+    #[cfg(windows)]
+    pub(crate) fn with_texture_table<R>(
+        &self,
+        table: u64,
+        count: u32,
+        f: impl FnOnce(&[TextureView<'_>]) -> R,
+    ) -> Option<R> {
+        if self.desc.kind != VIEWS_KIND || count == 0 || count > host::DYNAMIC {
+            return None;
+        }
+        let offset = table.checked_sub(self.start)?;
+        if !offset.is_multiple_of(32) {
+            return None;
+        }
+        let last = table.checked_add(u64::from(count - 1) * 32)?;
+        self.index(last)?;
+
+        let registry = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries = Vec::new();
+        for k in 0..count {
+            let at = table + u64::from(k) * 32;
+            // SAFETY: the entire immutable snapshot span is in the title heap.
+            let [tag, id, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+            if [tag, id, generation] == [0, 0, 0] {
+                continue;
+            }
+            let (view, current) = registry.list.get(id as usize)?;
+            if tag != VIEW_TAG || *current != generation {
+                return None;
+            }
+            let resource = match view {
+                View::Shader(resource, _) | View::Unordered(resource, 0, _) => *resource,
+                _ => return None,
+            };
+            let resource = crate::resource::host_resource(resource as This)?;
+            let record = u64::from(generation) << 32 | u64::from(id);
+            entries.push(TextureView {
+                slot: k,
+                record,
+                view,
+                resource,
+            });
+        }
+        (!entries.is_empty()).then(|| f(&entries))
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
@@ -142,19 +191,6 @@ fn mirror(handle: u64) {
                 host.mirror(index, handle, false);
             }
         }
-    }
-}
-
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
-#[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
     }
 }
 
@@ -290,6 +326,15 @@ pub(crate) enum View {
     /// access, the resource description, then the view's (the plain one
     /// followed by the memory address and console fields).
     Placed(bool, [u32; 14], [u32; 16]),
+}
+
+/// A texture view resolved while its title view generation is live.
+#[cfg(windows)]
+pub(crate) struct TextureView<'a> {
+    pub(crate) slot: u32,
+    record: u64,
+    pub(crate) view: &'a View,
+    resource: &'a windows::Win32::Graphics::Direct3D12::ID3D12Resource,
 }
 
 impl View {
@@ -702,6 +747,33 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_table_eligibility_excludes_constant_buffers() {
+        let mut h = std::ptr::null();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 4,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let placement = Placement {
+            address: 0,
+            size: 0,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        let s = heap(h).start;
+        create_cbv(std::ptr::null(), &[0x1000, 1, 256, 0], s + 32);
+        fn reject(_: &[TextureView<'_>]) {
+            panic!("ineligible table was passed to the cache");
+        }
+        assert_eq!(heap(h).with_texture_table(s, 4, reject), None::<()>);
+        assert_eq!(heap(h).with_texture_table(s + 1, 1, reject), None);
+        assert_eq!(heap(h).with_texture_table(s + 96, 2, reject), None);
+        assert_eq!(heap(h).with_texture_table(s + 64, 2, reject), None);
+        assert_eq!(release(h), 0);
     }
 
     #[test]
