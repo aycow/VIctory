@@ -87,8 +87,15 @@ impl<W> Timeline<W> {
     /// A submission that signals `value` (higher than any before it), the
     /// title memory its GPU work touches, and its work once it ran.
     pub(crate) fn push(&self, value: u64, touches: Touches, work: W) {
-        let Touches { shaders, labels, reads } = touches;
-        let writes = shaders.iter().map(|&(_, a, b)| (a, b)).chain(labels.iter().copied());
+        let Touches {
+            shaders,
+            labels,
+            reads,
+        } = touches;
+        let writes = shaders
+            .iter()
+            .map(|&(_, a, b)| (a, b))
+            .chain(labels.iter().copied());
         self.entries().push_back(Entry {
             value,
             writes: Ranges::new(writes.collect()),
@@ -274,7 +281,11 @@ mod tests {
         };
         t.push(
             1,
-            touches(vec![(1, 0x1000, 0x2000)], vec![(0x9000, 0x9004)], vec![(0x5000, 0x6000)]),
+            touches(
+                vec![(1, 0x1000, 0x2000)],
+                vec![(0x9000, 0x9004)],
+                vec![(0x5000, 0x6000)],
+            ),
             (),
         );
         t.push(2, touches(vec![(1, 0x1800, 0x1900)], vec![], vec![]), ());
@@ -293,8 +304,14 @@ mod tests {
         let clean = |_: usize, _: usize| false;
         let dirty_at = |at: usize| move |a: usize, b: usize| (a..b).contains(&at);
         assert_eq!(t.refresh_conflict(1, 0x1000, 0x2000, clean), None);
-        assert_eq!(t.refresh_conflict(1, 0x1000, 0x2000, dirty_at(0x1100)), Some(1));
-        assert_eq!(t.refresh_conflict(1, 0x1000, 0x2000, dirty_at(0x1880)), Some(2));
+        assert_eq!(
+            t.refresh_conflict(1, 0x1000, 0x2000, dirty_at(0x1100)),
+            Some(1)
+        );
+        assert_eq!(
+            t.refresh_conflict(1, 0x1000, 0x2000, dirty_at(0x1880)),
+            Some(2)
+        );
         assert_eq!(t.refresh_conflict(2, 0x1000, 0x1010, clean), Some(1));
         assert_eq!(t.refresh_conflict(1, 0x8000, 0x9001, clean), Some(1));
         t.finish(2, |()| {});

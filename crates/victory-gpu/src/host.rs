@@ -661,8 +661,14 @@ impl Host {
     /// A command allocator nothing runs from: a spare, or a new one.
     fn fresh_allocator(&self) -> Option<ID3D12CommandAllocator> {
         let spare = pool(&SPARE_ALLOCATORS).pop();
-        // SAFETY: plain object creation.
-        spare.or_else(|| unsafe { self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.ok())
+        spare.or_else(|| {
+            // SAFETY: plain object creation.
+            let made = unsafe {
+                self.device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            };
+            made.ok()
+        })
     }
 
     /// A closed prelude list and its allocator, nothing running from them.
@@ -1229,11 +1235,7 @@ impl HostList {
     pub(crate) fn running(&self) -> bool {
         let last = self.last.load(Ordering::Acquire);
         last > self.fresh_after.load(Ordering::Acquire)
-            && made().is_some_and(|h| {
-                h.timeline
-                    .span()
-                    .is_some_and(|(oldest, _)| oldest <= last)
-            })
+            && made().is_some_and(|h| h.timeline.span().is_some_and(|(oldest, _)| oldest <= last))
     }
 
     /// Opens the list for recording again. D3D12 lets a list be reset as
@@ -1250,7 +1252,9 @@ impl HostList {
             if let Some(host) = running {
                 let (Some(fresh), Some(prelude)) = (host.fresh_allocator(), host.fresh_prelude())
                 else {
-                    fail(format_args!("no fresh host command allocator for a running list"));
+                    fail(format_args!(
+                        "no fresh host command allocator for a running list"
+                    ));
                 };
                 let mut old_prelude = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
                 let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
@@ -1270,7 +1274,10 @@ impl HostList {
                     .store(self.last.load(Ordering::Acquire), Ordering::Release);
             } else {
                 *self.deferred() = Deferred::default();
-                self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                self.states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
                 let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
                 (scratch.current, scratch.used) = (0, 0);
                 // SAFETY: nothing running uses the allocator.
@@ -1280,7 +1287,10 @@ impl HostList {
             }
             allocator.clone()
         };
-        self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.pipelines
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // SAFETY: a closed list (D3D12 allows resetting one that still
@@ -1690,11 +1700,19 @@ impl Batch<'_> {
     /// through the same copy is waited for only if the title wrote a page
     /// of the overlap since the copy took it (the world's big heap is both
     /// refreshed and written by shaders in most submissions).
-    fn settle_refresh(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+    fn settle_refresh(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
         let Some(host) = self.host else { return };
         let copy = std::sync::Arc::as_ptr(shadow) as usize;
         let to = address.saturating_add(len);
-        if let Some(value) = host.timeline.refresh_conflict(copy, address, to, |a, b| shadow.stale(a, b)) {
+        if let Some(value) = host
+            .timeline
+            .refresh_conflict(copy, address, to, |a, b| shadow.stale(a, b))
+        {
             host.settle(value);
         }
     }
@@ -2536,7 +2554,12 @@ mod submissions {
         host.execute(&[&list]);
         host.drain();
         // SAFETY: our words; the finishing thread is done with them.
-        let (a, b) = unsafe { (std::ptr::read_volatile(&*first), std::ptr::read_volatile(&*second)) };
+        let (a, b) = unsafe {
+            (
+                std::ptr::read_volatile(&*first),
+                std::ptr::read_volatile(&*second),
+            )
+        };
         assert_eq!((a, b), (7, 9));
         assert!(!list.running());
     }
