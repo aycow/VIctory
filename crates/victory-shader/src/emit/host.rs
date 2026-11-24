@@ -831,6 +831,26 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_inner(root, pso, d, false).map(|(pixels, _)| pixels)
+    }
+
+    pub fn draw_with_stats(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+    ) -> Result<(Vec<[f32; 4]>, D3D12_QUERY_DATA_PIPELINE_STATISTICS), String> {
+        let (pixels, stats) = self.draw_inner(root, pso, d, true)?;
+        Ok((pixels, stats.expect("pipeline statistics requested")))
+    }
+
+    fn draw_inner(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        count: bool,
+    ) -> Result<(Vec<[f32; 4]>, Option<D3D12_QUERY_DATA_PIPELINE_STATISTICS>), String> {
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1045,6 +1065,7 @@ impl Host {
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.ClearRenderTargetView(rtv, &[0.; 4], None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
                 Height: h as f32,
@@ -1067,11 +1088,38 @@ impl Host {
                     }]),
                 );
             }
+            let stats = if count {
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
+                        Count: 1,
+                        NodeMask: 0,
+                    },
+                    &mut heap,
+                )
+                .map_err(err)?;
+                let heap = heap.ok_or("no pipeline statistics heap")?;
+                let readback = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buf_desc(size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>() as u64),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                )?;
+                list.BeginQuery(&heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+                Some((heap, readback))
+            } else {
+                None
+            };
             if d.mesh_groups > 0 {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
                 list.DrawInstanced(3, 1, 0, 0);
+            }
+            if let Some((heap, readback)) = &stats {
+                list.EndQuery(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+                list.ResolveQueryData(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 1, readback, 0);
             }
             list.ResourceBarrier(&[transition(
                 &target,
@@ -1137,7 +1185,16 @@ impl Host {
             }
             readback.Unmap(0, None);
             drop(keep);
-            Ok(out)
+            let stats = if let Some((_, buffer)) = stats {
+                let mut data = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut data)).map_err(err)?;
+                let stats = data.cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>().read();
+                buffer.Unmap(0, None);
+                Some(stats)
+            } else {
+                None
+            };
+            Ok((out, stats))
         }
     }
 }
