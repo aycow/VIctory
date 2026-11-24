@@ -747,3 +747,6 @@ mod tests {
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
 }
+
+#[cfg(test)]
+mod cfg_size_probe;
