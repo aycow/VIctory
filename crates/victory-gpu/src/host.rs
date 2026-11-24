@@ -471,7 +471,7 @@ enum Step {
 /// Dynamic descriptor table slots leased by a recording; released when the
 /// recording drops (after its async submission completes if reset while
 /// running).
-struct DynamicLease(usize, u32, u32);
+struct DynamicLease(u64, u32, u32);
 
 impl Drop for DynamicLease {
     fn drop(&mut self) {
@@ -711,6 +711,22 @@ impl Host {
     /// Runs closed lists. Their submission joins the timeline, finished
     /// once the GPU has run it.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.execute_inner(
+            runs,
+            #[cfg(test)]
+            None,
+        );
+    }
+
+    /// Test helper: arms `gate` on the host queue atomically inside the
+    /// submission lock right before `ExecuteCommandLists` so other parallel
+    /// tests cannot deadlock behind `gate` while holding `submitted`.
+    #[cfg(test)]
+    fn execute_gated(&self, runs: &[&HostList], gate: &ID3D12Fence) {
+        self.execute_inner(runs, Some(gate));
+    }
+
+    fn execute_inner(&self, runs: &[&HostList], #[cfg(test)] gate: Option<&ID3D12Fence>) {
         self.finisher.call_once(|| {
             let spawned = std::thread::Builder::new()
                 .name("victory-gpu-finisher".into())
@@ -777,6 +793,12 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists, not running (waited for above); our fence.
             let signalled = unsafe {
+                #[cfg(test)]
+                if i == 0
+                    && let Some(gate) = gate
+                {
+                    let _ = self.queue.Wait(gate, 1);
+                }
                 self.queue.ExecuteCommandLists(group);
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -1566,11 +1588,11 @@ impl HostList {
         }
     }
 
-    /// Keeps dynamic descriptor slots `[first, first + n)` on title `heap`
-    /// leased until this recording's submission finishes (or the list resets
-    /// while idle).
-    pub(crate) fn keep_dynamic(&self, heap: usize, first: u32, n: u32) {
-        self.deferred().dynamic.push(DynamicLease(heap, first, n));
+    /// Keeps dynamic descriptor slots `[first, first + n)` on title heap
+    /// `heap_id` leased until this recording's submission finishes (or the
+    /// list resets while idle).
+    pub(crate) fn keep_dynamic(&self, heap_id: u64, first: u32, n: u32) {
+        self.deferred().dynamic.push(DynamicLease(heap_id, first, n));
     }
 
     /// Whether this is the first time since the reset that the list asks
@@ -2575,21 +2597,59 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
 #[cfg(test)]
 mod submissions {
+    use std::sync::Mutex;
+
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FENCE_FLAG_NONE, ID3D12Fence};
+
     use crate::queue::Written;
+
+    /// Serializes tests that temporarily gate the shared host queue so two
+    /// gates never overlap.
+    static GATE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Private fence armed via `Host::execute_gated`; always signalled on drop
+    /// so even a test panic cannot leave the shared host queue stalled.
+    struct Gate(ID3D12Fence);
+
+    impl Gate {
+        fn new(host: &super::Host) -> Self {
+            // SAFETY: private fence on the live host device.
+            let fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
+            Gate(fence)
+        }
+
+        fn release(&self) {
+            // SAFETY: our private fence.
+            unsafe {
+                let _ = self.0.Signal(1);
+            }
+        }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
 
     #[test]
     fn a_list_reset_while_it_runs_records_into_fresh_memory() {
         let Some(host) = super::host() else { return }; // no host GPU here
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let list = host.new_list().unwrap();
         let (first, second) = (Box::new(0u64), Box::new(0u64));
         list.defer_write((&raw const *first).cast_mut().cast(), Written::Value(7), 8);
         list.close();
-        host.execute(&[&list]);
+        let gate = Gate::new(host);
+        host.execute_gated(&[&list], &gate.0);
+        // Gate guarantees the first submission is still in flight when reset runs.
+        assert!(list.running());
         // Recorded again at once, as titles do: the running submission
         // keeps what it uses, including its bottom-of-pipe write.
         list.reset();
         list.defer_write((&raw const *second).cast_mut().cast(), Written::Value(9), 8);
         list.close();
+        gate.release();
         host.execute(&[&list]);
         host.drain();
         // SAFETY: our words; the finishing thread is done with them.
@@ -2626,6 +2686,7 @@ mod submissions {
     #[test]
     fn a_step_reading_what_an_earlier_submission_writes_waits_for_it() {
         let Some(host) = super::host() else { return };
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (first, second) = (host.new_list().unwrap(), host.new_list().unwrap());
         let word = Box::new(0u64);
         let at = (&raw const *word).cast_mut().cast::<u8>();
@@ -2636,8 +2697,20 @@ mod submissions {
         let copy = Box::new(0u64);
         second.defer_fill((&raw const *copy).cast_mut().cast(), at, 8);
         second.close();
-        host.execute(&[&first]);
+        let gate = Gate::new(host);
+        host.execute_gated(&[&first], &gate.0);
+        // Signal the gate from another thread so `second` genuinely waits in
+        // `settle` without ever deadlocking parallel host tests.
+        let gate_fence = gate.0.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            // SAFETY: our private fence.
+            unsafe {
+                let _ = gate_fence.Signal(1);
+            }
+        });
         host.execute(&[&second]);
+        releaser.join().unwrap();
         // SAFETY: our word, copied while the second was submitted.
         assert_eq!(unsafe { std::ptr::read_volatile(&*copy) }, 0x1234_5678_9abc);
         second.reset();
@@ -2648,9 +2721,9 @@ mod submissions {
     fn dynamic_descriptor_leases_stay_held_until_async_submission_finishes() {
         use crate::descriptor::{HeapDesc, create_heap, heap};
         use crate::object::{S_OK, This, guid, slot};
-        use windows::Win32::Graphics::Direct3D12::{D3D12_FENCE_FLAG_NONE, ID3D12Fence};
 
         let Some(host) = super::host() else { return };
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         #[repr(C)]
         struct ExtendedHeapDesc {
             words: [u32; 4], // kind=0 (views), count=8, flags=1 (shader visible), nodes=0
@@ -2678,24 +2751,20 @@ mod submissions {
             ),
             S_OK
         );
-        let host_heap = heap(title_heap).host().unwrap();
+        let heap_ref = heap(title_heap);
+        let host_heap = heap_ref.host().unwrap();
         // Lease every dynamic slot (65,536) on `list`.
         let first = host_heap.dynamic(1 << 16).unwrap();
         assert_eq!(host_heap.dynamic(1), None);
 
         let list = host.new_list().unwrap();
-        list.keep_dynamic(title_heap as usize, first, 1 << 16);
+        list.keep_dynamic(heap_ref.id(), first, 1 << 16);
         list.close();
 
-        // Hold the host queue behind a private fence so the submission stays
-        // in flight across `list.reset()`.
-        // SAFETY: private fence on the live host device and queue.
-        let gate: ID3D12Fence = unsafe {
-            let f: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-            host.queue.Wait(&f, 1).unwrap();
-            f
-        };
-        host.execute(&[&list]);
+        // Hold the host queue behind a private fence armed atomically inside
+        // `execute_gated` so parallel tests cannot deadlock before `release()`.
+        let gate = Gate::new(host);
+        host.execute_gated(&[&list], &gate.0);
         list.reset();
         // Reset while in flight must NOT free the leased dynamic range yet.
         assert_eq!(
@@ -2703,8 +2772,7 @@ mod submissions {
             None,
             "dynamic descriptor slots must remain leased until the async fence completes"
         );
-        // SAFETY: release our queue gate so the submission completes.
-        unsafe { gate.Signal(1).unwrap() };
+        gate.release();
         host.drain();
         let after = host_heap.dynamic(1);
         assert!(

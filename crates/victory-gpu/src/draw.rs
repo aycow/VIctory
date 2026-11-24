@@ -722,7 +722,7 @@ impl State {
                 continue;
             };
             self.fresh_tables.insert(key, first);
-            list.keep_dynamic(std::ptr::from_ref(heap) as usize, first, n);
+            list.keep_dynamic(heap.id(), first, n);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
