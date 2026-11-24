@@ -1815,6 +1815,13 @@ impl Batch<'_> {
     fn flush(&mut self) {
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
+            // A CPU fill changes the native shadow this earlier submission
+            // may still read. Check the actual merged refresh span here.
+            if let Some(host) = self.host
+                && let Some(value) = host.timeline.read_conflict(from, to)
+            {
+                host.settle(value);
+            }
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
@@ -2724,6 +2731,56 @@ mod submissions {
         assert_eq!(unsafe { std::ptr::read_volatile(&*copy) }, 0x1234_5678_9abc);
         second.reset();
         first.reset();
+    }
+
+    #[test]
+    fn a_pending_gpu_read_keeps_its_shadow_bytes() {
+        let host = super::host().expect("D3D12 device for the queue-gated test");
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut title = Box::new([11u32]);
+        let address = title.as_mut_ptr() as u64;
+        crate::shadow::register(address as usize, address, 4);
+        let shadow = crate::shadow::find(address, 4).unwrap();
+        let (output, mapped) = host.shared_buffer(256).unwrap();
+        let first = host.new_list().unwrap();
+        shadow.refresh(&first, address, 4);
+        // SAFETY: the shared buffers stay alive through both submissions,
+        // and the 4-byte native copy is inside each resource.
+        unsafe { first.list.CopyBufferRegion(&output, 0, &shadow.buffer, 0, 4) };
+        first.close();
+
+        let gate = Gate::new(host);
+        host.execute_gated(&[&first], &gate.0);
+        assert!(first.running());
+        title[0] = 29;
+        let later = host.new_list().unwrap();
+        let (later_output, later_mapped) = host.shared_buffer(256).unwrap();
+        shadow.refresh(&later, address, 4);
+        // SAFETY: the same bounded copy into this submission's own output.
+        unsafe { later.list.CopyBufferRegion(&later_output, 0, &shadow.buffer, 0, 4) };
+        later.close();
+
+        // Release the gate on another thread so the same test
+        // can validate both code paths, including waiting for the first
+        // read's native fence rather than overwriting it.
+        let (done, prepared) = std::sync::mpsc::channel();
+        let release_fence = gate.0.clone();
+        let releaser = std::thread::spawn(move || {
+            let _ = prepared.recv_timeout(std::time::Duration::from_millis(250));
+            // SAFETY: the test owns this private gate and releases it even
+            // when preparation correctly waits on the earlier submission.
+            unsafe { release_fence.Signal(1).unwrap() };
+        });
+        host.execute(&[&later]);
+        let _ = done.send(());
+        releaser.join().unwrap();
+        host.drain();
+        // SAFETY: the native fence covering the output write completed.
+        let first_read = unsafe { mapped.cast::<u32>().read_volatile() };
+        crate::shadow::unregister(address as usize, address);
+        assert_eq!(first_read, 11, "later CPU refresh changed the queued read");
+        // SAFETY: the same drain waited for the later output.
+        assert_eq!(unsafe { later_mapped.cast::<u32>().read_volatile() }, 29);
     }
 
     #[test]

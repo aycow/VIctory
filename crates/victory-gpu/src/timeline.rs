@@ -149,6 +149,18 @@ impl<W> Timeline<W> {
             .map(|e| e.value)
     }
 
+    /// The newest unfinished submission reading the affected backing bytes.
+    pub(crate) fn read_conflict(&self, from: usize, to: usize) -> Option<u64> {
+        if from >= to {
+            return None;
+        }
+        self.entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.reads.overlaps(from, to))
+            .map(|entry| entry.value)
+    }
+
     /// The most recent submission still reading this host staging allocation.
     pub(crate) fn staging_conflict(&self, staging: usize) -> Option<u64> {
         self.entries()
