@@ -200,6 +200,13 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        create_with_device(device, debug)
+    }
+}
+
+fn create_with_device(device: ID3D12Device, debug: bool) -> windows::core::Result<Host> {
+    // SAFETY: plain D3D12 object creation on a live device.
+    unsafe {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -240,6 +247,12 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
         })
     }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn test_install_device(device: ID3D12Device) -> &'static Host {
+    assert!(HOST.set(Some(create_with_device(device, false).unwrap())).is_ok());
+    made().unwrap()
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -478,6 +491,13 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Descriptor slots named by the recording, retired with this recording
+    /// if the list resets before its last submission completes.
+    shared_tables: std::collections::HashMap<
+        usize,
+        std::sync::Arc<crate::descriptor::host::SharedTable>,
+    >,
+    dynamic_ranges: Vec<crate::descriptor::host::DynamicRange>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -579,6 +599,16 @@ thread_local! {
 }
 
 impl Host {
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn test_queue_gate(&self) -> ID3D12Fence {
+        // SAFETY: a private fence and a live queue, signalled by the fixture.
+        unsafe {
+            let gate = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            self.queue.Wait(&gate, 1).unwrap();
+            gate
+        }
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
@@ -1543,6 +1573,15 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    pub(crate) fn keep_shared_table(&self, table: std::sync::Arc<crate::descriptor::host::SharedTable>) {
+        let identity = std::sync::Arc::as_ptr(&table) as usize;
+        self.deferred().shared_tables.entry(identity).or_insert(table);
+    }
+
+    pub(crate) fn keep_dynamic_range(&self, range: crate::descriptor::host::DynamicRange) {
+        self.deferred().dynamic_ranges.push(range);
     }
 
     /// Whether this is the first time since the reset that the list asks

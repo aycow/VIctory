@@ -290,6 +290,116 @@ fn occupancy(heap: &HostHeap) -> usize {
         .count()
 }
 
+#[test]
+#[ignore = "requires a named D3D12 adapter, DXC and Agility SDK 1.620.x"]
+fn reset_holds_descriptor_ranges_until_native_fence() {
+    assert!(std::env::var_os("VICTORY_GPU_TIMING").is_none());
+    let (device, name) = device(true);
+    let messages = device.cast::<ID3D12InfoQueue>().unwrap();
+    let host = crate::host::test_install_device(device.clone());
+    let fixture = Fixture::new(device.clone());
+    let heap = HostHeap::new_on(&device, false, 1).unwrap();
+    let output = resource(
+        &device,
+        D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        &buf(8, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+    );
+    let readback = resource(
+        &device,
+        D3D12_HEAP_TYPE_READBACK,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        &buf(8, D3D12_RESOURCE_FLAG_NONE),
+    );
+    let view = View::Shader(0, None);
+    let views = [TextureView {
+        slot: 0,
+        record: 1 << 32,
+        view: &view,
+        resource: &fixture.textures[0],
+    }];
+    let shared = heap.shared_textures(DYNAMIC / 2, &views).unwrap();
+    let local = heap.reserve_dynamic(DYNAMIC / 2).unwrap();
+    assert!(make_texture(
+        &device,
+        &fixture.textures[1],
+        &view,
+        heap.cpu(local.first)
+    ));
+    let slots = [shared.first(), local.first];
+    let listing = host.new_list().unwrap();
+    listing.keep_shared_table(shared);
+    listing.keep_dynamic_range(local);
+    listing.keep(&heap.heap);
+
+    // Signal on unwind before the list destructor can wait for completion.
+    struct Gate(ID3D12Fence);
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            // SAFETY: the fence is ours and stays alive until signalled.
+            unsafe { self.0.Signal(1).unwrap() };
+        }
+    }
+    // SAFETY: resources, heap and pipeline are live through the fence.
+    unsafe {
+        listing.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+        listing.list.SetComputeRootSignature(&fixture.root);
+        listing.list.SetPipelineState(&fixture.pso);
+        listing
+            .list
+            .SetComputeRootUnorderedAccessView(1, output.GetGPUVirtualAddress());
+        for (i, slot) in slots.into_iter().enumerate() {
+            let args = [slot, i as u32];
+            listing
+                .list
+                .SetComputeRoot32BitConstants(0, 2, args.as_ptr().cast(), 0);
+            listing.list.Dispatch(1, 1, 1);
+            if i == 0 {
+                let barrier = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: ManuallyDrop::new(None),
+                        }),
+                    },
+                    ..Default::default()
+                };
+                listing.list.ResourceBarrier(&[barrier]);
+            }
+        }
+        listing.list.ResourceBarrier(&[crate::host::transition(
+            &output,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        listing.list.CopyBufferRegion(&readback, 0, &output, 0, 8);
+        listing.close();
+        let gate = Gate(host.test_queue_gate());
+        host.execute(&[&listing]);
+        assert!(listing.running());
+        listing.reset();
+        let held = occupancy(&heap);
+        let reallocated_early = heap.reserve_dynamic(1).is_some();
+        listing.close();
+        drop(gate);
+        host.drain();
+        assert_eq!(
+            held, DYNAMIC as usize,
+            "old recording's slots retired early"
+        );
+        assert!(!reallocated_early, "pool recycled a still-referenced slot");
+        assert_eq!(occupancy(&heap), 0);
+        let mut data = std::ptr::null_mut();
+        readback.Map(0, None, Some(&mut data)).unwrap();
+        assert_eq!(data.cast::<[u32; 2]>().read(), [FIRST, SECOND]);
+        readback.Unmap(0, Some(&D3D12_RANGE::default()));
+    }
+    assert_validated(&messages);
+    println!(
+        "{name}: blocked reset kept all {DYNAMIC} slots, fence retired them, and both GPU outputs matched"
+    );
+}
+
 fn heap_replacement(fixture: &Fixture) {
     let view = View::Shader(0, None);
     let views = [TextureView {
@@ -500,24 +610,28 @@ fn capped_pool_texture_table_reuse() {
     }
     if let Some(info) = info {
         heap_replacement(&fixture);
-        // SAFETY: fetch each validation message into its aligned buffer.
-        unsafe {
-            for i in 0..info.GetNumStoredMessages() {
-                let mut bytes = 0;
-                info.GetMessage(i, None, &mut bytes).unwrap();
-                let mut storage = vec![0u64; bytes.div_ceil(8)];
-                let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
-                info.GetMessage(i, Some(message), &mut bytes).unwrap();
-                let message = &*message;
-                assert!(
-                    message.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0,
-                    "{}",
-                    String::from_utf8_lossy(std::slice::from_raw_parts(
-                        message.pDescription,
-                        message.DescriptionByteLength,
-                    ))
-                );
-            }
+        assert_validated(&info);
+    }
+}
+
+fn assert_validated(info: &ID3D12InfoQueue) {
+    // SAFETY: fetch each validation message into its aligned buffer.
+    unsafe {
+        for i in 0..info.GetNumStoredMessages() {
+            let mut bytes = 0;
+            info.GetMessage(i, None, &mut bytes).unwrap();
+            let mut storage = vec![0u64; bytes.div_ceil(8)];
+            let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            info.GetMessage(i, Some(message), &mut bytes).unwrap();
+            let message = &*message;
+            assert!(
+                message.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0,
+                "{}",
+                String::from_utf8_lossy(std::slice::from_raw_parts(
+                    message.pDescription,
+                    message.DescriptionByteLength,
+                ))
+            );
         }
     }
 }

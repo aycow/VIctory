@@ -74,11 +74,6 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// Keep each shared range until this list can no longer be submitted.
-    shared_tables:
-        std::collections::HashMap<usize, std::sync::Arc<crate::descriptor::host::SharedTable>>,
-    /// Dynamic list-local tables (including their CBV descriptors).
-    dynamic: Vec<crate::descriptor::host::DynamicRange>,
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -683,8 +678,7 @@ impl State {
                     .flatten()
             {
                 made.push((slot, shared.first() * 32));
-                let identity = std::sync::Arc::as_ptr(&shared) as usize;
-                self.shared_tables.entry(identity).or_insert(shared);
+                list.keep_shared_table(shared);
                 continue;
             }
             // The table and what its entries hold (record words).
@@ -713,7 +707,7 @@ impl State {
             };
             let first = range.first;
             self.fresh_tables.insert(key, first);
-            self.dynamic.push(range);
+            list.keep_dynamic_range(range);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
