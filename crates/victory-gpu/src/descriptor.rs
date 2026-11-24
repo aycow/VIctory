@@ -10,6 +10,8 @@
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod demand;
 #[cfg(windows)]
 pub(crate) mod host;
 
@@ -718,7 +720,7 @@ mod tests {
     #[repr(C)]
     struct Extended(HeapDesc, Placement);
 
-    fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
+    pub(super) fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }

@@ -300,12 +300,14 @@ fn heap_replacement(fixture: &Fixture) {
     }];
     let original = HostHeap::new_on(&fixture.device, false, 1).unwrap();
     let original_pool = Arc::downgrade(&original.dynamic);
-    let original_table = original.shared_textures(SPAN, &views).unwrap();
+    let (original_table, reused) = original.shared_textures(SPAN, &views).unwrap();
+    assert!(!reused);
     let list_local = original.reserve_dynamic(SPAN).unwrap();
     drop(original);
 
     let replacement = HostHeap::new_on(&fixture.device, false, 1).unwrap();
-    let replacement_table = replacement.shared_textures(SPAN, &views).unwrap();
+    let (replacement_table, reused) = replacement.shared_textures(SPAN, &views).unwrap();
+    assert!(!reused);
     assert_eq!(original_table.first(), replacement_table.first());
     assert!(!Arc::ptr_eq(&original_table, &replacement_table));
     assert_ne!(
@@ -379,7 +381,8 @@ fn run(fixture: &Fixture, shared: bool, lists: usize, distinct: bool) -> ResultR
             }];
             let started = Instant::now();
             let slot = if shared {
-                heap.shared_textures(SPAN, &views).map(|lease| {
+                heap.shared_textures(SPAN, &views).map(|(lease, reused)| {
+                    assert_eq!(reused, !distinct && index != 0 && !rewritten);
                     let first = lease.first();
                     leases.push(lease);
                     first

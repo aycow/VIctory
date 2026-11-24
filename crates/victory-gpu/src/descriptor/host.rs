@@ -31,6 +31,8 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
     dynamic: Arc<DynamicSlots>,
+    #[cfg(feature = "diagnostics")]
+    demand_id: std::sync::OnceLock<u64>,
 }
 
 /// View records and the resolved resources they name must both match. The
@@ -191,6 +193,8 @@ impl HostHeap {
                 next: Mutex::new((0, vec![false; DYNAMIC as usize])),
                 shared: Mutex::new(HashMap::new()),
             }),
+            #[cfg(feature = "diagnostics")]
+            demand_id: std::sync::OnceLock::new(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -318,13 +322,19 @@ impl HostHeap {
         })
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn demand_id(&self) -> u64 {
+        *self.demand_id.get_or_init(super::demand::identity)
+    }
+
     /// Share a fully resolved texture table while at least one list owns it.
     /// Buffer, CBV and placed views require list-local storage or preparation.
+    /// The flag indicates reuse of an existing range.
     pub(crate) fn shared_textures(
         &self,
         count: u32,
         views: &[TextureView<'_>],
-    ) -> Option<Arc<SharedTable>> {
+    ) -> Option<(Arc<SharedTable>, bool)> {
         let key = TableKey {
             count,
             views: views
@@ -338,7 +348,7 @@ impl HostHeap {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(table) = tables.get(&key).and_then(Weak::upgrade) {
-            return Some(table);
+            return Some((table, true));
         }
         let range = self.reserve_dynamic(count)?;
         let first = range.first;
@@ -364,7 +374,7 @@ impl HostHeap {
             _resources: resources,
         });
         tables.insert(key, Arc::downgrade(&table));
-        Some(table)
+        Some((table, false))
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the

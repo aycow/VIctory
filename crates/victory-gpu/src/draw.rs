@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
+#[cfg(feature = "diagnostics")]
+use crate::descriptor::demand::{self, Outcome, Request};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -79,6 +81,8 @@ pub(crate) struct State {
         std::collections::HashMap<usize, std::sync::Arc<crate::descriptor::host::SharedTable>>,
     /// Dynamic list-local tables (including their CBV descriptors).
     dynamic: Vec<crate::descriptor::host::DynamicRange>,
+    #[cfg(feature = "diagnostics")]
+    demand_list: Option<u64>,
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -668,9 +672,19 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            if !entries.iter().any(|u| u.kind == ResourceType::Cbv)
-                && let Some(shared) = heap
+            let cbv = entries.iter().any(|u| u.kind == ResourceType::Cbv);
+            #[cfg(feature = "diagnostics")]
+            let mut demand = demand::enabled().then(|| {
+                let list = *self.demand_list.get_or_insert_with(demand::identity);
+                Request::new(heap, host.demand_id(), list, table, n, cbv)
+            });
+            if !cbv
+                && let Some((shared, _reused)) = heap
                     .with_texture_table(table, n, |views| {
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(request) = &mut demand {
+                            request.resolved_textures();
+                        }
                         let shared = host.shared_textures(n, views)?;
                         for u in &entries {
                             let offset = u.table_offset_dwords / 8;
@@ -685,6 +699,11 @@ impl State {
                 made.push((slot, shared.first() * 32));
                 let identity = std::sync::Arc::as_ptr(&shared) as usize;
                 self.shared_tables.entry(identity).or_insert(shared);
+                #[cfg(feature = "diagnostics")]
+                Request::record(
+                    demand,
+                    if _reused { Outcome::SharedReuse } else { Outcome::SharedNew },
+                );
                 continue;
             }
             // The table and what its entries hold (record words).
@@ -706,9 +725,13 @@ impl State {
                     }
                 }
                 made.push((slot, first * 32));
+                #[cfg(feature = "diagnostics")]
+                Request::record(demand, Outcome::LocalReuse);
                 continue;
             }
             let Some(range) = host.reserve_dynamic(n) else {
+                #[cfg(feature = "diagnostics")]
+                Request::record(demand, Outcome::NoRange);
                 continue;
             };
             let first = range.first;
@@ -743,6 +766,8 @@ impl State {
                 }
             }
             made.push((slot, first * 32));
+            #[cfg(feature = "diagnostics")]
+            Request::record(demand, Outcome::LocalNew);
         }
         made
     }
