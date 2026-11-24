@@ -468,6 +468,17 @@ enum Step {
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
+/// Dynamic descriptor table slots leased by a recording; released when the
+/// recording drops (after its async submission completes if reset while
+/// running).
+struct DynamicLease(usize, u32, u32);
+
+impl Drop for DynamicLease {
+    fn drop(&mut self) {
+        crate::descriptor::release_dynamic(self.0, self.1, self.2);
+    }
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -480,6 +491,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Dynamic descriptor ranges leased by this recording, retired with it
+    /// if the list resets before its submission finishes.
+    dynamic: Vec<DynamicLease>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -545,7 +559,12 @@ impl Pending {
                         }
                     }
                     Step::Refresh(_, address, len) => touches.reads.push((*address, address + len)),
-                    Step::Texture(staging) => touches.reads.push(staging.range()),
+                    Step::Texture(staging) => {
+                        touches.reads.push(staging.range());
+                        touches
+                            .staging
+                            .insert(std::sync::Arc::as_ptr(staging) as usize);
+                    }
                     _ => {}
                 }
             }
@@ -1547,6 +1566,13 @@ impl HostList {
         }
     }
 
+    /// Keeps dynamic descriptor slots `[first, first + n)` on title `heap`
+    /// leased until this recording's submission finishes (or the list resets
+    /// while idle).
+    pub(crate) fn keep_dynamic(&self, heap: usize, first: u32, n: u32) {
+        self.deferred().dynamic.push(DynamicLease(heap, first, n));
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -1657,7 +1683,7 @@ impl HostList {
                     if batch.texture_due(staging) {
                         let (from, to) = staging.range();
                         batch.settle(from, to - from, false);
-                        staging.refresh();
+                        staging.refresh(|| batch.settle_staging(staging));
                     }
                     continue;
                 }
@@ -1686,6 +1712,19 @@ struct Batch<'a> {
 }
 
 impl Batch<'_> {
+    /// Before detiling new bytes into a shared texture staging buffer: wait
+    /// for any in-flight submission whose GPU copy still reads that staging
+    /// buffer.
+    fn settle_staging(&self, staging: &crate::texture::Staging) {
+        if let Some(host) = self.host
+            && let Some(value) = host
+                .timeline
+                .staging_conflict(std::ptr::from_ref(staging) as usize)
+        {
+            host.settle(value);
+        }
+    }
+
     /// Before a step reads (or, with `writing`, writes) title memory
     /// `[address, address + len)`: earlier submissions whose GPU work
     /// writes (or reads) it are finished first.
@@ -2603,5 +2642,79 @@ mod submissions {
         assert_eq!(unsafe { std::ptr::read_volatile(&*copy) }, 0x1234_5678_9abc);
         second.reset();
         first.reset();
+    }
+
+    #[test]
+    fn dynamic_descriptor_leases_stay_held_until_async_submission_finishes() {
+        use crate::descriptor::{HeapDesc, create_heap, heap};
+        use crate::object::{S_OK, This, guid, slot};
+        use windows::Win32::Graphics::Direct3D12::{D3D12_FENCE_FLAG_NONE, ID3D12Fence};
+
+        let Some(host) = super::host() else { return };
+        #[repr(C)]
+        struct ExtendedHeapDesc {
+            words: [u32; 4], // kind=0 (views), count=8, flags=1 (shader visible), nodes=0
+            addr: u64,
+            size: u64,
+        }
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let ext = ExtendedHeapDesc {
+            words: [0, 8, 1, 0],
+            addr: 0,
+            size: 0,
+        };
+        let mut title_heap: This = std::ptr::null();
+        assert_eq!(
+            create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&ext).cast::<HeapDesc>(),
+                &heap_iid,
+                &mut title_heap
+            ),
+            S_OK
+        );
+        let host_heap = heap(title_heap).host().unwrap();
+        // Lease every dynamic slot (65,536) on `list`.
+        let first = host_heap.dynamic(1 << 16).unwrap();
+        assert_eq!(host_heap.dynamic(1), None);
+
+        let list = host.new_list().unwrap();
+        list.keep_dynamic(title_heap as usize, first, 1 << 16);
+        list.close();
+
+        // Hold the host queue behind a private fence so the submission stays
+        // in flight across `list.reset()`.
+        // SAFETY: private fence on the live host device and queue.
+        let gate: ID3D12Fence = unsafe {
+            let f: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            host.queue.Wait(&f, 1).unwrap();
+            f
+        };
+        host.execute(&[&list]);
+        list.reset();
+        // Reset while in flight must NOT free the leased dynamic range yet.
+        assert_eq!(
+            host_heap.dynamic(1),
+            None,
+            "dynamic descriptor slots must remain leased until the async fence completes"
+        );
+        // SAFETY: release our queue gate so the submission completes.
+        unsafe { gate.Signal(1).unwrap() };
+        host.drain();
+        let after = host_heap.dynamic(1);
+        assert!(
+            after.is_some(),
+            "dynamic descriptor slots must be released once the submission finishes"
+        );
+        host_heap.release(after.unwrap(), 1);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap),
+            0
+        );
     }
 }

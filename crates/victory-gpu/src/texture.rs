@@ -177,18 +177,20 @@ impl Staging {
     }
 
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
+    /// since the last time (and is mapped at all). Calls `before_write` right
+    /// before overwriting the shared staging buffer so any earlier in-flight
+    /// GPU copy from it finishes first.
+    pub(crate) fn refresh(&self, before_write: impl FnOnce()) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
-        let read = self.refresh_now();
+        let read = self.refresh_now(before_write);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
     /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    fn refresh_now(&self, before_write: impl FnOnce()) -> usize {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -202,6 +204,7 @@ impl Staging {
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
             crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+            before_write();
             self.detile(&last.read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -225,8 +228,13 @@ impl Staging {
         if last.hash == Some(hash) {
             return size;
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
+        // Snapshot changed bytes before a possible fence wait. Cache the
+        // hash of the bytes that actually become the next upload.
+        last.read.resize(size, 0);
+        crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
+        last.hash = Some(blake3::hash(&last.read));
+        before_write();
+        self.detile(&last.read);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
