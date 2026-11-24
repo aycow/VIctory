@@ -42,10 +42,22 @@ pub(crate) static TEXTURE_UPLOAD: Gauge = Gauge {
     bytes: AtomicU64::new(0),
     peak: AtomicU64::new(0),
 };
-pub(crate) static TEXTURE_READ: Gauge = Gauge {
+static TEXTURE_READ: Gauge = Gauge {
     bytes: AtomicU64::new(0),
     peak: AtomicU64::new(0),
 };
+
+/// Records the capacity of the process-wide CPU detile buffer under its lock.
+pub(crate) fn set_texture_read_capacity(bytes: u64) {
+    if enabled() {
+        TEXTURE_READ.peak.fetch_max(bytes, Relaxed);
+        TEXTURE_READ.bytes.store(bytes, Relaxed);
+    }
+}
+
+pub(crate) fn texture_read_capacity() -> (u64, u64) {
+    TEXTURE_READ.sample()
+}
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -173,7 +185,7 @@ fn sample(elapsed_s: u64, adapter: Option<&IDXGIAdapter3>) {
     let (list_scratch_bytes, list_scratch_peak) = SCRATCH.sample();
     let (list_upload_bytes, list_upload_peak) = UPLOAD.sample();
     let (texture_upload_bytes, texture_upload_peak) = TEXTURE_UPLOAD.sample();
-    let (texture_read_bytes, texture_read_peak) = TEXTURE_READ.sample();
+    let (texture_read_bytes, texture_read_peak) = texture_read_capacity();
     let (native_textures, native_texture_bytes, native_used_bytes, _, _, _) =
         crate::resource::texture_counts();
     let shadow_ranges = crate::shadow::cached_shadow_ranges();
