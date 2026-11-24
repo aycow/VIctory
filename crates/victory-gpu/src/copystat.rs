@@ -74,13 +74,13 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
 /// A process-wide memory snapshot for the diagnostics line. PrivateUsage
 /// is the process commit charge; WorkingSetSize is the resident physical set.
 #[derive(Clone, Copy)]
-struct ProcessMemory {
-    page_faults: u64,
-    private_usage: u64,
-    working_set: u64,
+pub(crate) struct ProcessMemory {
+    pub(crate) page_faults: u64,
+    pub(crate) private_usage: u64,
+    pub(crate) working_set: u64,
 }
 
-fn process_memory() -> Option<ProcessMemory> {
+pub(crate) fn process_memory() -> Option<ProcessMemory> {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
     };

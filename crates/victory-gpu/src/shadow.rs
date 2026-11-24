@@ -42,9 +42,37 @@ pub(crate) struct Shadow {
     pending: Mutex<Vec<(usize, usize)>>,
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+    before: Mutex<Option<Snapshot>>,
+    #[cfg(feature = "diagnostics")]
+    _capacity: crate::memstat::Charge,
 }
 
+struct Snapshot {
+    start: usize,
+    bytes: Vec<u8>,
+    #[cfg(feature = "diagnostics")]
+    active_capacity: crate::memstat::Charge,
+}
+
+impl Snapshot {
+    fn new(start: usize, bytes: Vec<u8>) -> Self {
+        Self {
+            start,
+            #[cfg(feature = "diagnostics")]
+            active_capacity: crate::memstat::Charge::new(
+                &crate::memstat::SNAPSHOT,
+                bytes.capacity() as u64,
+            ),
+            bytes,
+        }
+    }
+
+    fn recycle(self) {
+        #[cfg(feature = "diagnostics")]
+        drop(self.active_capacity);
+        give_back(self.bytes);
+    }
+}
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
@@ -125,6 +153,8 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            #[cfg(feature = "diagnostics")]
+            _capacity: crate::memstat::Charge::new(&crate::memstat::SHADOW, len),
         }
     }
 
@@ -165,26 +195,29 @@ impl Shadow {
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
+            Some(snapshot) => (
+                snapshot.start.min(from),
+                (snapshot.start + snapshot.bytes.len()).max(to),
+            ),
             None => (from, to),
         };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
+        if let Some(snapshot) = &*before
+            && (snapshot.start, snapshot.start + snapshot.bytes.len()) == (start, end)
         {
             return;
         }
         // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
+        let mut grown = Snapshot::new(start, pooled(end - start));
         match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
+            Some(old) => {
+                grown.bytes.extend_from_slice(host(start, old.start));
+                grown.bytes.extend_from_slice(&old.bytes);
+                grown.bytes.extend_from_slice(host(old.start + old.bytes.len(), end));
+                old.recycle();
             }
-            None => grown.extend_from_slice(host(start, end)),
+            None => grown.bytes.extend_from_slice(host(start, end)),
         }
-        *before = Some((start, grown));
+        *before = Some(grown);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -199,12 +232,12 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
+        if let Some(before) = &*snapshot
+            && before.start <= from
+            && to <= before.start + before.bytes.len()
             && from < to
         {
-            let before = &before[from - taken..to - taken];
+            let before = &before.bytes[from - before.start..to - before.start];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -259,9 +292,9 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
+            && let Some(snapshot) = snapshot.take()
         {
-            give_back(bytes);
+            snapshot.recycle();
         }
         written
     }

@@ -122,7 +122,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 pub(crate) fn host() -> Option<&'static Host> {
     static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
-        Ok(host) => Some(host),
+        Ok(host) => {
+            #[cfg(feature = "diagnostics")]
+            crate::memstat::start(&host.device);
+            Some(host)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
@@ -358,6 +362,8 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
 #[derive(Default)]
 struct Scratch {
     chunks: Vec<(ID3D12Resource, usize, u64)>,
+    #[cfg(feature = "diagnostics")]
+    capacity: crate::memstat::Charge,
     current: usize,
     used: u64,
 }
@@ -397,6 +403,8 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    #[cfg(feature = "diagnostics")]
+    upload_capacity: crate::memstat::Charge,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -1072,7 +1080,10 @@ impl HostList {
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
+        let mut deferred = self.deferred();
+        deferred.uploads.push(buffer.clone());
+        #[cfg(feature = "diagnostics")]
+        deferred.upload_capacity.add(&crate::memstat::UPLOAD, size);
         Some((buffer, data))
     }
 
@@ -1087,7 +1098,10 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().uploads.push(buffer);
+            let mut deferred = self.deferred();
+            deferred.uploads.push(buffer);
+            #[cfg(feature = "diagnostics")]
+            deferred.upload_capacity.add(&crate::memstat::UPLOAD, len);
             return Some((gpu, data));
         }
         if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
@@ -1099,6 +1113,8 @@ impl HostList {
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             s.chunks.push((buffer, data as usize, gpu));
+            #[cfg(feature = "diagnostics")]
+            s.capacity.add(&crate::memstat::SCRATCH, SCRATCH_CHUNK);
             s.used = 0;
         }
         let (_, data, gpu) = s.chunks[s.current];
