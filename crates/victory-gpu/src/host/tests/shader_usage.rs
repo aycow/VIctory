@@ -77,6 +77,7 @@ fn shader(
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        stride_table: false,
         heap_buffer_srvs,
     }
 }

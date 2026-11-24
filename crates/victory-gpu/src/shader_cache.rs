@@ -221,6 +221,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             }
         }
     }
+    word(&mut out, u32::from(s.stride_table));
     out
 }
 
@@ -293,6 +294,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         }
         _ => return None,
     };
+    let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -302,6 +304,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         heap_buffer_srvs,
+        stride_table,
     })
 }
 
@@ -329,6 +332,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             heap_buffer_srvs: HeapBufferSrvUsage::Exact(vec![4, 19]),
+            stride_table: true,
         }
     }
 
