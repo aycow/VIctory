@@ -8,10 +8,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::{StrideView, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub stride_views: Vec<StrideView>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
 }
@@ -181,6 +182,7 @@ struct Lower<'a> {
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
+    stride_views: Vec<StrideView>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -587,6 +589,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
+            stride_views: Vec::new(),
             descriptors: x
                 .res
                 .descriptors
@@ -1110,6 +1113,30 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if !self.stride_views.is_empty() {
+            let conflict = self
+                .handles
+                .keys()
+                .filter_map(|(_, load, first, sampler, _)| {
+                    let address = self.scalar.get(load)?;
+                    let param = self.x.native.layout.get(address.param)?;
+                    let dword = address.offset / 4 + u32::from(*first);
+                    (!*sampler
+                        && param.root == RootType::Table
+                        && self.stride_views.iter().any(|view| {
+                            view.slot == param.slot
+                                && (address.dynamic.is_some() || view.table_offset_dwords == dword)
+                        }))
+                    .then_some(self.x.p.blocks[load.0].insts[load.1].machine.offset)
+                })
+                .min();
+            if let Some(offset) = conflict {
+                return Err(unsupported(
+                    offset,
+                    "an aliased structured buffer also used through its original descriptor",
+                ));
+            }
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -1119,6 +1146,7 @@ impl<'a> Lower<'a> {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            stride_views: self.stride_views,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3218,7 +3246,6 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -3271,6 +3298,9 @@ impl<'a> Lower<'a> {
                 ((kind | u, 0x409), Some(kind))
             }
             Fields::Buffer { idxen, format, .. } => {
+                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
                 let stride = used.map_or(0, |u| u.stride);
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
@@ -3278,12 +3308,18 @@ impl<'a> Lower<'a> {
                     (10 | u, 0x409)
                 } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
                     (12 | u, stride)
+                } else if *idxen && format.is_none() && stride == 0 {
+                    // The original descriptor is structured. Querying it with
+                    // a raw handle fails descriptor validation even if the
+                    // reconstructed field is unused by the native program.
+                    let (_, _, records) = self.runtime_buffer_metadata(&src, uav)?;
+                    self.write_descriptor_words(inst, code, count, first, &[(2, records)]);
+                    return Ok(());
+                } else if *idxen && format.is_none() {
+                    return Err("a structured buffer of unsupported stride");
                 } else {
                     (11 | u, 0)
                 };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
-                }
                 (props, None)
             }
             _ => return Err("a scalar memory read as data"),
@@ -3340,6 +3376,19 @@ impl<'a> Lower<'a> {
             }
             None => vec![(2, field(self, 0))],
         };
+        self.write_descriptor_words(inst, code, count, first, &words);
+        Ok(())
+    }
+
+    fn write_descriptor_words(
+        &mut self,
+        inst: &Inst,
+        code: u8,
+        count: u32,
+        first: u8,
+        words: &[(u32, V)],
+    ) {
+        const OTHER: Why = "a descriptor's address or format read as data";
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
@@ -3351,7 +3400,6 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        Ok(())
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -3665,6 +3713,101 @@ impl<'a> Lower<'a> {
                 Ok(self.s.heap_handle(self.cur, phi, sampler, props))
             }
         }
+    }
+
+    /// Read immutable alias metadata for an exact table entry.
+    fn runtime_buffer_metadata(&mut self, src: &Source, uav: bool) -> Result<(V, V, V), Why> {
+        const UNKNOWN: Why = "a structured buffer of unknown stride";
+        let Source::Loaded { load, first } = src else {
+            return Err(UNKNOWN);
+        };
+        let a = self.scalar.get(load).ok_or(UNKNOWN)?;
+        let param = self.x.native.layout.get(a.param).ok_or(UNKNOWN)?;
+        if self.x.native.stage != HwStage::Cs
+            || param.root != RootType::Table
+            || a.dynamic.is_some()
+            || !a.offset.is_multiple_of(4)
+        {
+            return Err(UNKNOWN);
+        }
+        let dword = a.offset / 4 + u32::from(*first);
+        let kind = if uav {
+            ResourceType::Uav
+        } else {
+            ResourceType::Srv
+        };
+        if !dword.is_multiple_of(8)
+            || !self.x.native.used.iter().any(|u| {
+                u.root == RootType::Table
+                    && u.user_data == param.user_data
+                    && u.slot == param.slot
+                    && u.table_offset_dwords == dword
+                    && u.kind == kind
+                    && u.stride == 0
+            })
+        {
+            return Err(UNKNOWN);
+        }
+        let view = StrideView {
+            slot: param.slot,
+            table_offset_dwords: dword,
+            uav,
+        };
+        let row = match self.stride_views.iter().position(|seen| *seen == view) {
+            Some(row) => row,
+            None => {
+                let row = self.stride_views.len();
+                self.stride_views.push(view);
+                row
+            }
+        };
+        let c = self.cur;
+        let table = self.s.stride_table_handle();
+        let addr = self.s.m.i32(row as u32 * 16);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(7);
+        let align = self.s.m.i32(4);
+        let res = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, addr, iu, mask, align],
+        );
+        let slot = self.s.m.extract(c, res, 0);
+        let stride = self.s.m.extract(c, res, 1);
+        let records = self.s.m.extract(c, res, 2);
+        Ok((self.as_int(slot), self.as_int(stride), self.as_int(records)))
+    }
+
+    /// Guard the flattened byte address by both element count and access
+    /// width. The host checks that the descriptor fits in u32 bytes, so an
+    /// in-bounds address cannot wrap.
+    fn runtime_buffer(
+        &mut self,
+        src: &Source,
+        index: V,
+        offset: u16,
+        count: u32,
+        uav: bool,
+    ) -> Result<(V, V, V), Why> {
+        if !offset.is_multiple_of(4) {
+            return Err("a structured buffer of unknown stride and unaligned offset");
+        }
+        let (slot, stride, records) = self.runtime_buffer_metadata(src, uav)?;
+        let c = self.cur;
+        let end = self.s.m.i32(u32::from(offset) + 4 * count);
+        let within_record = self.s.m.cmp(c, pred::IULE, end, stride);
+        let within_view = self.s.m.cmp(c, pred::IULT, index, records);
+        let valid = self.s.m.bin(c, Bin::And, within_record, within_view);
+        let offset = self.s.m.i32(u32::from(offset));
+        let byte = self.s.m.bin(c, Bin::Mul, index, stride);
+        let byte = self.s.m.bin(c, Bin::Add, byte, offset);
+        let h = self
+            .s
+            .heap_handle(c, slot, false, (11 | if uav { 0x1000 } else { 0 }, 0));
+        Ok((h, byte, valid))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -6283,10 +6426,11 @@ impl<'a> Lower<'a> {
             let o = vaddr(self, u8::from(*idxen))?;
             off = self.s.m.bin(c, Bin::Add, off, o);
         }
-        if !matches!(
+        let scalar_offset = !matches!(
             soffset,
             Operand::Scalar { code: NULL, .. } | Operand::Const(128)
-        ) {
+        );
+        if scalar_offset {
             let so = self.operand(inst, soffset)?;
             off = self.s.m.bin(c, Bin::Add, off, so);
         }
@@ -6331,17 +6475,40 @@ impl<'a> Lower<'a> {
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
+        let stride = used.map_or(0, |u| u.stride);
+        let runtime = if let Some(index) = index
+            && !typed
+            && format.is_none()
+            && stride == 0
+        {
+            if *offen || scalar_offset || base != 0 || extra.is_some() {
+                return Err("a structured buffer of unknown stride and computed byte offset");
+            }
+            Some(self.runtime_buffer(src, index, *offset, count, uav)?)
+        } else {
+            None
+        };
+        let access_guard = match (guard, runtime) {
+            (Some(g), Some((_, _, valid))) => Some(self.s.m.bin(c, Bin::And, g, valid)),
+            (_, Some((_, _, valid))) => Some(valid),
+            (_, None) => guard,
+        };
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
+                    if stride >= 4 && stride.is_multiple_of(4) {
+                        (
+                            self.handle(site, src, false, (12 | u, stride))?,
+                            [index, off, iu],
+                        )
+                    } else if let Some((h, byte, _)) = runtime {
+                        (h, [byte, iu, iu])
+                    } else {
+                        return Err("a structured buffer of unsupported stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
@@ -6353,7 +6520,13 @@ impl<'a> Lower<'a> {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let at = self.begin_guarded(guard);
+            let outside = if runtime.is_some() {
+                let zero = self.s.m.i32(0);
+                guard.map_or(zero, |g| self.s.m.select(c, g, zero, old))
+            } else {
+                old
+            };
+            let at = self.begin_guarded(access_guard);
             let i32t = self.s.t.i32;
             let r = if op == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -6375,7 +6548,7 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
-            let r = self.end_guarded(at, &[(r, old)])[0];
+            let r = self.end_guarded(at, &[(r, outside)])[0];
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
             }
@@ -6420,11 +6593,15 @@ impl<'a> Lower<'a> {
                 match index {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
+                        if stride >= 4 && stride.is_multiple_of(4) {
+                            args.push(self.handle(site, src, false, (12 | u, stride))?);
+                            args.extend([index, off]);
+                        } else if let Some((h, byte, _)) = runtime {
+                            args.push(h);
+                            args.extend([byte, iu]);
+                        } else {
+                            return Err("a structured buffer of unsupported stride");
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
@@ -6439,7 +6616,7 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(access_guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);
@@ -6455,6 +6632,33 @@ impl<'a> Lower<'a> {
             };
             for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
+        if let Some((h, byte, _)) = runtime {
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let mask = self.s.m.i8((1u8 << count) - 1);
+            let align = self.s.m.i32(4);
+            let zero = self.s.m.i32(0);
+            let at = self.begin_guarded(access_guard);
+            let r = self.s.op(
+                self.cur,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, byte, iu, mask, align],
+            );
+            let values: Vec<_> = (0..count)
+                .map(|k| {
+                    let v = self.s.m.extract(self.cur, r, k);
+                    (self.as_int(v), zero)
+                })
+                .collect();
+            for (k, v) in self.end_guarded(at, &values).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), v, guard);
             }
             return Ok(());
         }
@@ -6481,18 +6685,19 @@ impl<'a> Lower<'a> {
             match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
+                    if stride >= 4 && stride.is_multiple_of(4) {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, index, off, mask, align],
+                        )
+                    } else {
+                        return Err("a structured buffer of unsupported stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;

@@ -103,11 +103,42 @@ impl Heap {
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
     }
+
+    #[cfg(windows)]
+    pub(crate) fn exact_slot(&self, handle: u64) -> bool {
+        self.index(handle).is_some_and(|_| {
+            (handle - self.start).is_multiple_of(u64::from(increment(self.desc.kind).unwrap()))
+        })
+    }
 }
 
 const VIEWS_KIND: u32 = 0;
 const SAMPLERS: u32 = 1;
 const SHADER_VISIBLE: u32 = 1;
+
+#[cfg(all(test, windows, feature = "diagnostics"))]
+pub(crate) fn test_heap(sampler: bool) -> (This, u64) {
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let desc = Extended(
+        HeapDesc {
+            kind: u32::from(sampler),
+            count: 8,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        },
+        Placement {
+            address: 0,
+            size: 0,
+        },
+    );
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_heap(std::ptr::null(), &desc.0, &HEAP_IIDS[0], &mut out),
+        object::S_OK
+    );
+    (out, heap(out).start)
+}
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.

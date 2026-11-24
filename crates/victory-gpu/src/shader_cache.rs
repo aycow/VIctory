@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, Target, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, StrideView, Target, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -141,7 +141,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -220,6 +220,16 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.stride_views.len() as u32);
+    for view in &s.stride_views {
+        for v in [
+            u32::from(view.slot),
+            view.table_offset_dwords,
+            u32::from(view.uav),
+        ] {
+            word(&mut out, v);
+        }
+    }
     out
 }
 
@@ -276,6 +286,15 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let n = r.word()? as usize;
+    let mut stride_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        stride_views.push(StrideView {
+            slot: u8::try_from(r.word()?).ok()?,
+            table_offset_dwords: r.word()?,
+            uav: r.word()? != 0,
+        });
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -284,6 +303,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        stride_views,
     })
 }
 
@@ -310,6 +330,11 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            stride_views: vec![StrideView {
+                slot: 1,
+                table_offset_dwords: 8,
+                uav: true,
+            }],
         }
     }
 
@@ -378,6 +403,11 @@ mod tests {
     fn entries_round_trip_and_reject_damage() {
         let bytes = encode(&shader());
         assert_eq!(decode(&bytes), Some(shader()));
+        for old in [b"VSH1", b"VSH2"] {
+            let mut legacy = bytes.clone();
+            legacy[..old.len()].copy_from_slice(old);
+            assert_eq!(decode(&legacy), None);
+        }
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);

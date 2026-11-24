@@ -101,7 +101,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -160,6 +160,18 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// True when the shader reads the runtime stride table (`t0` in
+    /// [`STRIDE_SPACE`]).
+    pub stride_views: Vec<StrideView>,
+}
+
+/// Descriptor-table entries with an unknown native stride. The host binds a
+/// raw alias index, byte stride and record count for each entry, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrideView {
+    pub slot: u8,
+    pub table_offset_dwords: u32,
+    pub uav: bool,
 }
 
 impl HostShader {
@@ -388,6 +400,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        stride_views: l.stride_views,
     })
 }
 
@@ -583,6 +596,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            stride_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -593,6 +607,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                stride_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -833,5 +848,150 @@ mod tests {
             0xBF81_0000, // s_endpgm
         ];
         assert!(emit_for(&compute(&words, true), NVIDIA).is_ok());
+    }
+
+    #[test]
+    fn structured_buffer_unknown_stride_uses_runtime_stride_table() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0xE030_2004,
+            0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen offset:4
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0xE070_2008,
+            0x8003_0200, // buffer_store_dword v2, v0, s[12:15], 0 idxen offset:8
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E06_028A, // v_mov_b32 v3, 10
+            0xE0C8_2000,
+            0x8003_0300, // buffer_atomic_add v3, v0, s[12:15], 0 idxen
+            0xE0C8_2000,
+            0x8003_0300, // buffer_atomic_add v3, v0, s[12:15], 0 idxen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                crate::UsedResource {
+                    kind: crate::ResourceType::Srv,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                crate::UsedResource {
+                    kind: crate::ResourceType::Uav,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            target: super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
+        })
+        .unwrap();
+        assert_eq!(l.stride_views.len(), 2);
+        let mut dxil = l.dxil;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        #[cfg(windows)]
+        if let Ok(host) = super::host::Host::new(false) {
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                stride_views: l.stride_views,
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let srv_data: Vec<u32> = (100..112).collect();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![
+                            (0, super::host::Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (
+                                1,
+                                super::host::Root::View {
+                                    srv: true,
+                                    data: vec![0, 12, 4, 0, 1, 12, 5, 0],
+                                },
+                            ),
+                        ],
+                        views: &[
+                            super::host::View::Buffer {
+                                data: &srv_data,
+                                stride: super::host::Stride::Raw,
+                            },
+                            super::host::View::RawUav(64),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(out[0][5], 107);
+            assert_eq!(out[0][6], 20);
+        }
     }
 }
