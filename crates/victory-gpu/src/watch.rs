@@ -142,21 +142,17 @@ pub(crate) fn allocation(address: usize) -> Option<Allocation> {
     if PASS.with(|depth| depth.get()) == 0 {
         return query_allocation(address);
     }
-    let revision = MAPPING_REVISION.load(Ordering::Acquire);
-    {
-        let cache = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((_, &found)) = cache.range(..=address).next_back()
-            && address < found.end
-        {
-            return Some(Allocation { revision, ..found });
-        }
-    }
-    let found = query_allocation(address)?;
     let mut cache = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
-    // Not if the mapping changed while the system was asked.
-    if found.revision == MAPPING_REVISION.load(Ordering::Acquire) {
-        cache.insert(found.start, found);
+    if let Some((_, &found)) = cache.range(..=address).next_back()
+        && address < found.end
+    {
+        let revision = MAPPING_REVISION.load(Ordering::Acquire);
+        return Some(Allocation { revision, ..found });
     }
+    // Asked while the cache is held: a mapping change reported meanwhile
+    // waits in `forget_allocations` and then removes what this inserts.
+    let found = query_allocation(address)?;
+    cache.insert(found.start, found);
     Some(found)
 }
 
