@@ -179,11 +179,45 @@ fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
             return Err(e);
         }
         let blob = result.GetResult()?;
-        Ok(
+        let mut bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-                .to_vec(),
-        )
+                .to_vec();
+        sign_dxc_bytecode(library, &mut bytes)?;
+        Ok(bytes)
     }
+}
+
+/// Older DXC DLLs can compile successfully without finding the signing DLL.
+/// The resulting container has a zero digest and native D3D12 rejects it.
+fn sign_dxc_bytecode(
+    compiler: windows::Win32::Foundation::HMODULE,
+    bytes: &mut [u8],
+) -> windows::core::Result<()> {
+    use std::os::windows::ffi::OsStringExt;
+    use victory_shader::emit::validator::Validator;
+    use windows::Win32::Foundation::E_FAIL;
+    use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+
+    if bytes.get(4..20).is_some_and(|digest| digest.iter().any(|&b| b != 0)) {
+        return Ok(());
+    }
+
+    let explicit = std::env::var_os("VICTORY_DXIL").map(std::path::PathBuf::from);
+    let beside_compiler = || {
+        let mut path = vec![0; 32_768];
+        // SAFETY: the compiler module is loaded and the buffer is ours.
+        let len = unsafe { GetModuleFileNameW(Some(compiler), &mut path) } as usize;
+        if len == 0 || len >= path.len() {
+            return None;
+        }
+        let compiler = std::path::PathBuf::from(std::ffi::OsString::from_wide(&path[..len]));
+        let validator = compiler.with_file_name("dxil.dll");
+        validator.is_file().then_some(validator)
+    };
+    let path = explicit.or_else(beside_compiler).or_else(Validator::default_path);
+    Validator::load(path.as_deref())
+        .and_then(|mut validator| validator.validate(bytes))
+        .map_err(|error| windows::core::Error::new(E_FAIL, format!("cannot sign DXC shader: {error}")))
 }
 
 struct Clamp {
