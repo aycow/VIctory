@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -40,6 +40,10 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// For a copy of just a view's bytes ([`aligned`]): the buffer's copy it
+    /// was cut from, and whether shaders have written its bytes there
+    /// (found by that copy's copy-back).
+    cut_from: Option<(Arc<Shadow>, AtomicBool)>,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -97,10 +101,19 @@ impl Shadow {
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
-    /// and keeps the copy alive until the list is reset.
+    /// and keeps the copy alive until the list is reset. Cut to the copy.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        let len = len.min(self.start + self.len - address);
-        list.defer_refresh(self, address as usize, len as usize);
+        let from = address.max(self.start);
+        let len = inside(
+            from,
+            len.saturating_sub(from - address),
+            self.start,
+            self.len,
+        );
+        if len == 0 {
+            return;
+        }
+        list.defer_refresh(self, from as usize, len as usize);
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -114,7 +127,56 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             before: Mutex::default(),
+            cut_from: None,
         }
+    }
+
+    /// After a submission, for a piece of this copy at title address `base`
+    /// whose bytes its shaders changed (`host` against `old`): marks the
+    /// copies of views' bytes cut from this copy that the changed bytes
+    /// reach (see [`Shadow::fed_from`]). The mark stays: the title keeps
+    /// producing such data on the GPU frame after frame.
+    fn feed(&self, base: u64, host: &[u8], old: &[u8]) {
+        let end = base + host.len() as u64;
+        let first = base.saturating_sub(ALIGNED_LONGEST.load(Ordering::Relaxed));
+        let copies: Vec<Arc<Shadow>> = ALIGNED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range((first, 0, 0)..(end, 0, 0))
+            .filter(|((start, len, from), _)| {
+                start + len > base && std::ptr::eq(*from as *const Shadow, self)
+            })
+            .filter_map(|(_, copy)| copy.upgrade())
+            .collect();
+        for copy in copies {
+            let Some((from, fed)) = &copy.cut_from else {
+                continue;
+            };
+            if !std::ptr::eq(Arc::as_ptr(from), self) || fed.load(Ordering::Relaxed) {
+                continue;
+            }
+            let at = (copy.start.max(base) - base) as usize;
+            let to = ((copy.start + copy.len).min(end) - base) as usize;
+            if host[at..to] != old[at..to] {
+                fed.store(true, Ordering::Relaxed);
+                tracing::debug!(
+                    start = format_args!("{:#x}", copy.start),
+                    len = copy.len,
+                    "a view's own copy is written by shaders in its buffer's copy"
+                );
+            }
+        }
+    }
+
+    /// For a copy of just a view's bytes whose bytes shaders write in the
+    /// buffer's copy it was cut from: that copy. A read through the view
+    /// then copies from it on the GPU, inside the list, to see what the
+    /// submission's shaders wrote before it.
+    pub(crate) fn fed_from(&self) -> Option<&Arc<Shadow>> {
+        self.cut_from
+            .as_ref()
+            .filter(|(_, fed)| fed.load(Ordering::Relaxed))
+            .map(|(from, _)| from)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -181,7 +243,11 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                let differs = host != old;
+                if differs {
+                    self.feed((start + at) as u64, host, old);
+                }
+                if differs && crate::host::read_into((start + at) as *const u8, title) {
                     let changed = if title == old {
                         // No CPU changes in the sampled title piece. The
                         // GPU's bytes are already the merged result.
@@ -392,6 +458,90 @@ const WINDOW: u64 = 4 << 20;
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Copies of just one view's bytes, by (start, length, the buffer's copy they
+/// were cut from): for a view whose start is not on an element of its host
+/// copy (`aligned`). A copy follows the one it was cut from, so the same
+/// bytes cut from another (a title buffer released and registered again)
+/// get a copy of their own. The heap slot holds the copy; this map only
+/// finds it again, so it holds weak references and the copy goes when the
+/// slot is remade.
+static ALIGNED: Mutex<BTreeMap<(u64, u64, usize), std::sync::Weak<Shadow>>> =
+    Mutex::new(BTreeMap::new());
+
+/// The longest range `aligned` has made a copy of: how far before a piece
+/// of title memory such a copy can start and still reach into it.
+static ALIGNED_LONGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A copy of `[address, address + len)` that starts at `address` itself, so a
+/// structured view of it can have its elements where the title put them.
+///
+/// A title aligns a resource; the host copy of a buffer starts where the
+/// buffer does, so a view of memory the title placed inside another object
+/// (`View::Placed`) starts at an offset that need not be a multiple of the
+/// view's stride. This copy starts at the view, and the slot that made it
+/// keeps it alive.
+///
+/// Its own refresh copies the 64 KiB pages the title wrote since they were
+/// last copied, straight from title memory: a submission's copy-back runs
+/// before the next submission prepares (`Host::execute` waits for the GPU
+/// before copying back), so by then title memory holds what the GPU wrote in
+/// any copy, and what shaders wrote in this one has gone back there. Copying
+/// from the buffer's copy instead would copy the view's whole range again on
+/// every submission.
+pub(crate) fn aligned(address: u64, len: u64, from: &Arc<Shadow>) -> Option<Arc<Shadow>> {
+    if len == 0 {
+        return None;
+    }
+    let key = (address, len, Arc::as_ptr(from) as usize);
+    if let Some(copy) = aligned_existing(address, len, from) {
+        return Some(copy);
+    }
+    // Views hold hundreds of megabytes in the world; made as a buffer's copy
+    // is, so that shaders may write it (unordered access).
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(64))?;
+    crate::host::name(&buffer, || format!("aligned view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let copy = Arc::new(Shadow {
+        cut_from: Some((from.clone(), AtomicBool::new(false))),
+        ..Shadow::new(buffer, data, gpu, address, len)
+    });
+    {
+        let mut copies = ALIGNED.lock().unwrap_or_else(|e| e.into_inner());
+        // Another recorder may have published the same range while we allocated.
+        if let Some(existing) = copies.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Some(existing);
+        }
+        copies.insert(key, Arc::downgrade(&copy));
+    }
+    ALIGNED_LONGEST.fetch_max(len, Ordering::Relaxed);
+    tracing::debug!(
+        address = format_args!("{address:#x}"),
+        len,
+        "aligned view copy made"
+    );
+    Some(copy)
+}
+
+/// The copy `aligned` made of this range from `from`, if one is still alive.
+pub(crate) fn aligned_existing(address: u64, len: u64, from: &Arc<Shadow>) -> Option<Arc<Shadow>> {
+    ALIGNED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(address, len, Arc::as_ptr(from) as usize))
+        .and_then(std::sync::Weak::upgrade)
+}
+
+/// How many bytes of `[address, address + len)` lie inside the copy that
+/// starts at `start` of `size` bytes: what a refresh of that copy can bring up
+/// to date. `0` when the range is not inside it at all.
+fn inside(address: u64, len: u64, start: u64, size: u64) -> u64 {
+    let end = start.saturating_add(size);
+    let from = address.max(start);
+    let to = address.saturating_add(len).min(end);
+    to.saturating_sub(from)
+}
+
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
@@ -443,4 +593,175 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host copy of title memory `[address, address + len)`, as a buffer's
+    /// (none without a host GPU).
+    fn buffer_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
+        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some(Arc::new(Shadow::new(buffer, data, gpu, address, len)))
+    }
+
+    #[test]
+    fn concurrent_aligned_views_share_the_copy_refreshed_at_submission() {
+        if crate::host::host().is_none() {
+            return;
+        }
+
+        const THREADS: usize = 8;
+        let values = [[19u32; 14]; 8];
+        for value in &values {
+            let address = value.as_ptr() as u64;
+            let len = size_of_val(value) as u64;
+            let from = buffer_copy(address, len).expect("a buffer's copy");
+            let gate = std::sync::Barrier::new(THREADS);
+            let copies = std::thread::scope(|scope| {
+                let jobs: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        let gate = &gate;
+                        let from = &from;
+                        scope.spawn(move || {
+                            gate.wait();
+                            aligned(address, len, from).expect("aligned host buffer")
+                        })
+                    })
+                    .collect();
+                jobs.into_iter()
+                    .map(|job| job.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let refreshed = aligned_existing(address, len, &from).expect("cached copy");
+            refreshed.update(address as usize, len as usize);
+            for copy in copies {
+                assert!(Arc::ptr_eq(&copy, &refreshed), "slot retained a different copy");
+                // SAFETY: the mapped buffer has 56 bytes and refresh has completed.
+                let first = unsafe { copy.data.cast::<u32>().read_unaligned() };
+                assert_eq!(first, value[0]);
+            }
+        }
+    }
+
+    /// A refresh of the aligned copy brings up to date the bytes of the view
+    /// that lie inside it, cut at both ends, and nothing when the range is
+    /// outside it.
+    #[test]
+    fn a_refresh_covers_the_views_bytes_inside_its_copy() {
+        // The hit-detection view: 3136 bytes of 56-byte elements, 48 bytes
+        // into its buffer, in a copy that starts at the view.
+        assert_eq!(inside(0x3000_0030, 3136, 0x3000_0030, 3136), 3136);
+        // A view reaching past its copy is cut to it.
+        assert_eq!(inside(0x4000_0100, 900, 0x4000_0100, 0x100), 0x100);
+        // A view starting before its copy loses the part before it.
+        assert_eq!(inside(0x0ff8, 0x40, 0x1000, 0x1000), 0x38);
+        // Outside the copy at either end: nothing to refresh.
+        assert_eq!(inside(0x1000, 0x10, 0x2000, 0x100), 0);
+        assert_eq!(inside(0x20f0, 0x20, 0x1000, 0x100), 0);
+        // A size that would overflow does not.
+        assert_eq!(inside(u64::MAX - 8, 16, 0, 16), 0);
+    }
+
+    /// What a shader writes in a view's own copy, which starts off a page and
+    /// off its buffer's elements, goes back to title memory after the
+    /// submission, and a byte the title wrote meanwhile is kept.
+    #[test]
+    fn writes_in_a_views_own_copy_go_back_to_title_memory() {
+        // Title memory, reached only through this pointer.
+        let mut memory = vec![1u8; 4096];
+        let title = memory.as_mut_ptr();
+        // Four 56-byte elements, 48 bytes in.
+        let (address, len) = (title as usize + 48, 4 * 56);
+        let Some(from) = buffer_copy(title as u64, 4096) else {
+            return; // no host GPU
+        };
+        let copy = aligned(address as u64, len as u64, &from).expect("the view's copy");
+        // As the submission's refresh and write declaration leave it.
+        copy.copy(address, address + len);
+        copy.snapshot(address, len);
+        // The GPU writes the third element; the title writes the view's first
+        // byte while it runs.
+        // SAFETY: inside the copy's mapping and the title memory.
+        unsafe {
+            std::ptr::write_bytes(copy.data.add(112), 7, 56);
+            title.add(48).write(9);
+        }
+        assert!(copy.copy_back(address, len) > 0);
+        copy.finish_writes();
+        // SAFETY: the title memory, no longer written.
+        let after = unsafe { std::slice::from_raw_parts(title, 4096) };
+        assert!(after[160..216].iter().all(|&b| b == 7), "the GPU's element");
+        assert_eq!(after[48], 9, "the title's own write");
+        assert!(after[..48].iter().chain(&after[216..]).all(|&b| b == 1));
+        drop(memory);
+    }
+
+    /// A view's own copy is marked fed when the copy-back of the buffer's
+    /// copy it was cut from finds bytes shaders wrote in its range, and not
+    /// for writes next to it or in another copy.
+    #[test]
+    fn shader_writes_in_a_views_range_mark_its_copy_fed() {
+        let mut memory = vec![1u8; 4096];
+        let title = memory.as_mut_ptr() as usize;
+        let Some(from) = buffer_copy(title as u64, 4096) else {
+            return; // no host GPU
+        };
+        let other = buffer_copy(title as u64, 4096).expect("another copy");
+        // Four 56-byte elements, 48 bytes in; and the same range cut from
+        // the other copy, 4 bytes later (another key).
+        let own = aligned(title as u64 + 48, 224, &from).expect("the view's copy");
+        let elsewhere = aligned(title as u64 + 52, 224, &other).expect("another view's copy");
+        let submit = |at: usize, n: usize| {
+            from.copy(title, title + 4096);
+            from.snapshot(title, 4096);
+            // SAFETY: inside the copy's mapping.
+            unsafe { std::ptr::write_bytes(from.data.add(at), 7, n) };
+            from.copy_back(title, 4096);
+            from.finish_writes();
+        };
+        // Shaders write right after the view's range: nothing marked.
+        submit(48 + 224, 16);
+        assert!(own.fed_from().is_none());
+        // They write its third element.
+        submit(48 + 112, 56);
+        assert!(own.fed_from().is_some_and(|f| Arc::ptr_eq(f, &from)));
+        // A view cut from another copy is not marked by this one.
+        assert!(elsewhere.fed_from().is_none());
+        drop(memory);
+    }
+
+    /// The same bytes cut from two copies of the same title memory (a buffer
+    /// released and registered again) get two copies, each following the
+    /// one it was cut from (#1405 review).
+    #[test]
+    fn the_same_bytes_cut_from_two_copies_follow_each_their_own() {
+        let mut memory = vec![1u8; 4096];
+        let title = memory.as_mut_ptr() as usize;
+        let Some(old) = buffer_copy(title as u64, 4096) else {
+            return; // no host GPU
+        };
+        let new = buffer_copy(title as u64, 4096).expect("another copy");
+        let (at, len) = (title as u64 + 48, 224);
+        let from_old = aligned(at, len, &old).expect("a copy cut from the old one");
+        let from_new = aligned(at, len, &new).expect("a copy cut from the new one");
+        assert!(!Arc::ptr_eq(&from_old, &from_new));
+        assert!(Arc::ptr_eq(
+            &aligned(at, len, &new).expect("found again"),
+            &from_new
+        ));
+        // Shaders write the view's bytes in the new copy only.
+        new.copy(title, title + 4096);
+        new.snapshot(title, 4096);
+        // SAFETY: inside the copy's mapping.
+        unsafe { std::ptr::write_bytes(new.data.add(48), 7, 56) };
+        new.copy_back(title, 4096);
+        new.finish_writes();
+        assert!(from_new.fed_from().is_some_and(|f| Arc::ptr_eq(f, &new)));
+        assert!(from_old.fed_from().is_none());
+        drop(memory);
+    }
 }

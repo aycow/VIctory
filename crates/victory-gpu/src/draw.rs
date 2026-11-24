@@ -150,6 +150,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -441,6 +442,8 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // After `bind`: a shader may have written the buffer before.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -459,6 +462,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -486,6 +490,7 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        list.begin_command();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -699,8 +704,8 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+        if let Some((view, copy)) = host.mirror(index, handle, true) {
+            readable(list, u, &view, copy.as_ref());
         }
     }
 
@@ -787,7 +792,8 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        let copy = host.copy_at(first + u.table_offset_dwords / 8);
+                        readable(list, u, &view, copy.as_ref());
                     }
                 }
                 made.push((slot, first * 32));
@@ -820,9 +826,9 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        let copy = host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u, &view, copy.as_ref());
                         }
                     }
                     None => {
@@ -1098,7 +1104,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1110,19 +1115,13 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::execute(
+            list,
+            &signature,
+            max,
+            (&args.buffer, args.offset(arguments)),
+            counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
+        );
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1171,21 +1170,57 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
-/// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+/// copied, textures moved to the state they need. `copy` is the copy of
+/// title buffer memory the view's slot is of (`HostHeap::copy_at`).
+fn readable(
+    list: &HostList,
+    u: &UsedResource,
+    view: &View,
+    copy: Option<&std::sync::Arc<crate::shadow::Shadow>>,
+) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+    // Both go through the copy the slot is of, not one looked up again from
+    // the view's range: that can be another, overlapping title buffer's,
+    // and a view off its buffer copy's elements has a copy of just its
+    // bytes. That one is a host copy like any other, so its own refresh
+    // brings it up to date from title memory (which the last submission's
+    // copy-back already wrote), and what shaders write in it goes back from
+    // it.
+    // Brought up to date from title memory when the submission is prepared,
+    // such a copy would not see what this submission's shaders wrote in its
+    // range in the buffer's copy before the read. Where they do write there
+    // (`Shadow::fed_from`, found by that copy's copy-back), a shader view
+    // reads what a view on an element of the same bytes reads instead: the
+    // buffer's copy, copied in on the GPU right before the read.
+    // shortcut: unordered views with their own copy still write it apart,
+    // so within a submission other views of those bytes do not see their
+    // writes until the copy-back.
+    if let Some(copy) = copy
+        && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
         && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
     {
-        shadow.refresh(list, address, len);
-        if u.kind == ResourceType::Uav {
-            shadow.gpu_writes(list, address, len);
+        let fed = (u.kind == ResourceType::Srv)
+            .then(|| copy.fed_from())
+            .flatten();
+        if let Some(from) = fed {
+            from.refresh(list, address, len);
+            // The view's copy holds its whole range, so `len` bytes fit it.
+            let len = len.min(from.left(address));
+            list.copy_buffer(&copy.buffer, &from.buffer, from.offset(address), len);
+            list.buffer_state(&copy.buffer, crate::host::BUFFER_READ);
+        } else {
+            copy.refresh(list, address, len);
+            if u.kind == ResourceType::Uav {
+                copy.gpu_writes(list, address, len);
+                list.buffer_state(&copy.buffer, crate::host::BUFFER_WRITE);
+            } else {
+                list.buffer_state(&copy.buffer, crate::host::BUFFER_READ);
+            }
         }
     }
     match (view, u.kind) {
