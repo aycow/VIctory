@@ -559,7 +559,28 @@ impl State {
             once!("a root UAV without a bound view heap: the draw is dropped");
             return false;
         };
-        let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+        let binding = address.and_then(|address| {
+            let Some(shadow) = crate::shadow::find(address, 1) else {
+                once!(
+                    address = format_args!("{address:#x}"),
+                    "a root UAV outside the title's buffers is not written"
+                );
+                return None;
+            };
+            let offset = shadow.offset(address);
+            if !offset.is_multiple_of(16) {
+                // Raw views start on 16 bytes; one from the aligned
+                // start would shift every access.
+                once!(
+                    address = format_args!("{address:#x}"),
+                    "a root UAV not on 16 bytes is not written"
+                );
+                return None;
+            }
+            // The native raw UAV covers whole dwords only.
+            let len = shadow.left(address).min(ROOT_UAV_BYTES) & !3;
+            (len != 0).then_some((address, shadow, offset, len))
+        });
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
         let index = match self.root_uav_slots.get(&key) {
             Some(&index) => index,
@@ -569,41 +590,17 @@ impl State {
                 };
                 self.dynamic.push((key.0, index, 1));
                 self.root_uav_slots.insert(key, index);
-                match &shadow {
-                    Some((a, s)) => {
-                        // SAFETY: a live buffer.
-                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                        let offset = s.gpu(*a) - base;
-                        if offset.is_multiple_of(16) {
-                            let len = s.left(*a).min(ROOT_UAV_BYTES);
-                            host.raw_uav_at(index, &s.buffer, offset, len);
-                        } else {
-                            // Raw views start on 16 bytes; one from the
-                            // aligned start would shift every access.
-                            once!(
-                                address = format_args!("{a:#x}"),
-                                "a root UAV not on 16 bytes is not written"
-                            );
-                            host.null_raw_uav_at(index);
-                        }
-                    }
-                    None => {
-                        if let Some(a) = address {
-                            once!(
-                                address = format_args!("{a:#x}"),
-                                "a root UAV outside the title's buffers is not written"
-                            );
-                        }
-                        host.null_raw_uav_at(index);
-                    }
+                if let Some((_, shadow, offset, len)) = &binding {
+                    host.raw_uav_at(index, &shadow.buffer, *offset, *len);
+                } else {
+                    host.null_raw_uav_at(index);
                 }
                 index
             }
         };
-        if let Some((a, s)) = &shadow {
-            let len = s.left(*a).min(ROOT_UAV_BYTES);
-            s.refresh(list, *a, len);
-            s.gpu_writes(list, *a, len);
+        if let Some((address, shadow, _, len)) = binding {
+            shadow.refresh(list, address, len);
+            shadow.gpu_writes(list, address, len);
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
@@ -1317,3 +1314,6 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod spilled_uav_tests;

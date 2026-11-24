@@ -1,0 +1,7 @@
+# Spilled root UAV binding fixture
+
+The fixture builds an original GFX10 compute program on exact #1175 (`bfe5d2d`) and exercises its translated production root UAV bind path. It checks a valid short view, backing bounds, and the existing 1 MiB view boundary. It also places a CPU write and a later shadow refresh after binding an unaligned root address. The native null descriptor cannot write, so its declared range must leave the later refresh eligible.
+
+On Windows, build with `cargo test -p victory-gpu --features diagnostics --lib spilled_root_uav_bounds_and_null_binding_are_observable --no-run`. Place Agility SDK 1.620.2's x64 DLLs in `D3D12` alongside the test executable. Set `VICTORY_D3D12_DEBUG=1` and `VICTORY_TEST_SPILLED_UAV_ADAPTER` to `amd`, `nvidia` or `warp`. Set `VICTORY_DXIL` to the Windows SDK x64 `dxil.dll` if required. Run the executable from its directory with `spilled_root_uav_bounds_and_null_binding_are_observable --ignored --nocapture`.
+
+On AMD, the exact baseline retained `17` in the shadow after the title changed the word to `77`. The correction schedules a shadow refresh and GPU-write tracking only for the bytes covered by a valid native UAV. The corrected test passed on AMD Radeon Graphics, NVIDIA RTX 5070 Laptop GPU, and WARP with full GPU-based validation. The existing view extent cap is unchanged. The fixture does not establish how the two missing title producers bind or which bytes they should write.
