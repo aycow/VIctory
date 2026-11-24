@@ -116,8 +116,12 @@ fn process_memory() -> Option<ProcessMemory> {
 pub(crate) fn log(frames: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let memory = process_memory();
-    let faults = memory.map_or(0, |m| m.page_faults);
-    let faults = faults.saturating_sub(FAULTS.swap(faults, Relaxed));
+    // Keep the previous successful sample when the OS query fails; otherwise
+    // the next successful read would count all lifetime faults as one interval.
+    let faults = memory.map_or(0, |m| {
+        let previous = FAULTS.swap(m.page_faults, Relaxed);
+        m.page_faults.saturating_sub(previous)
+    });
     let c: Vec<f64> = COUNT
         .iter()
         .map(|a| a.swap(0, Relaxed) as f64 / frames)
