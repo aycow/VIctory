@@ -747,6 +747,15 @@ impl State {
         made
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_compute_tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+    ) -> Vec<(u8, u32)> {
+        self.tables(list, used, true)
+    }
+
     /// The first draws, at debug level: what they bind and read
     /// (diagnostics builds).
     #[cfg(feature = "diagnostics")]
