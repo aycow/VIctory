@@ -37,6 +37,12 @@ foreach ($adapter in 'amd', 'nvidia', 'warp') {
 
 Set VICTORY_CENSUS_TEST_MULTI_INDIRECT=1 for the three-record probe or VICTORY_CENSUS_TEST_ZERO_INDIRECT=1 for a zero GPU count. Clear both timing switches for an unprofiled control. The regular census unit test checks exact median, maximum and sum, work counts, and the accounting for untimed and counted calls.
 
+In the asynchronous #595 composition, a repeated recording in one title
+submission resolves its timestamps into the same query page on each
+execution. The census counts each execution and omits its ambiguous GPU
+spans. A distinct recording in the same submission retains its own
+timestamp attribution. The reset and replay fixture checks both paths.
+
 ## Matched title measurements
 
 Use a title copy you are authorized to run and share diagnostics from. Hold the adapter, driver, title build, save, inputs, PR stack, loop settings and cache warm-up fixed. Collect the same opening-cutscene frame range, and label partial windows or device removal. Each census window records its start and end present-call counts.

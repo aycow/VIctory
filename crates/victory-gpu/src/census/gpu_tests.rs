@@ -635,17 +635,53 @@ fn reset_and_resubmit_preserves_pending_census_generations() {
     host.drain();
     let mut totals = with_totals(std::mem::take);
     let a = totals.execution.remove(&(first, "compute")).unwrap();
-    let b = totals.execution.remove(&(second, "compute")).unwrap();
+    let b = totals
+        .execution
+        .remove(&(second.clone(), "compute"))
+        .unwrap();
     assert!(totals.execution.is_empty());
     assert_eq!((a.calls, a.total_items, a.timings.ns.len()), (1, 4, 1));
     assert_eq!((b.calls, b.total_items, b.timings.ns.len()), (4, 48, 4));
     assert!(a.timings.total_ns < hold.as_nanos());
     assert!(b.timings.total_ns < hold.as_nanos());
     assert_eq!(host.submission_count(), 3, "census added an execution");
-    let warnings = validation_messages(&info);
-    assert!(warnings.is_empty(), "{warnings:#?}");
     eprintln!(
         "{name}: held native fence, GPU spans {:?} and {:?}",
         a.timings.ns, b.timings.ns
+    );
+
+    // Two executions of the same closed recording resolve into the same
+    // query page. A different recording in that batch has its own page.
+    let peer = host.new_list().unwrap();
+    let peer_id = pipeline_id("synthetic unique peer recording", "cs");
+    record(&peer, &peer_id, 0, &[3]);
+    host.execute(&[&list, &peer, &list]);
+    host.drain();
+    let mut totals = with_totals(std::mem::take);
+    let repeated = totals.execution.remove(&(second, "compute")).unwrap();
+    let unique = totals.execution.remove(&(peer_id, "compute")).unwrap();
+    assert!(totals.execution.is_empty());
+    assert_eq!(
+        (
+            repeated.calls,
+            repeated.total_items,
+            repeated.timings.ns.len()
+        ),
+        (4, 48, 0),
+    );
+    assert_eq!(
+        (unique.calls, unique.total_items, unique.timings.ns.len()),
+        (1, 3, 1),
+    );
+    assert_eq!(
+        host.submission_count(),
+        5,
+        "the queue needs two executions for the repeat and none for census",
+    );
+    let warnings = validation_messages(&info);
+    assert!(warnings.is_empty(), "{warnings:#?}");
+    eprintln!(
+        "{name}: shared query page reported {} calls and no spans; separate recording reported one span",
+        repeated.calls
     );
 }
