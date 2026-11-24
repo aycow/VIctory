@@ -959,10 +959,10 @@ fn native_copy_control_with_explicit_known_states() {
 fn copyback_merges_cpu_changes_after_the_snapshot() {
     let Some(gpu) = test_gpu() else { return };
     let writer = Shader::new(gpu.host, s!("write_word"));
-    for (cpu_first, cpu_second, expected_first, changed) in [
-        (11, 27, 500, true),
-        (0x0100_000b, 99, 0x0100_01f4, true),
-        (500, 99, 500, false),
+    for (cpu_first, cpu_second, expected_first, copied) in [
+        (11, 27, 500, 2),
+        (0x0100_000b, 99, 0x0100_01f4, 2),
+        (500, 99, 500, 0),
     ] {
         let buffer = TitleBuffer::new(&[11, 27]);
         let shadow = shadow::find(buffer.address, buffer.len).unwrap();
@@ -978,7 +978,7 @@ fn copyback_merges_cpu_changes_after_the_snapshot() {
         commands.close();
         gpu.execute(&[&commands]);
 
-        assert_eq!(shadow.copy_back(start, len), if changed { len } else { 0 });
+        assert_eq!(shadow.copy_back(start, len), copied);
         shadow.finish_writes();
         assert_eq!(buffer.words(), [expected_first, cpu_second]);
     }

@@ -24,6 +24,8 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod copyback;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -173,8 +175,8 @@ impl Shadow {
             const PIECE: usize = 64 << 10;
             const _: () = assert!(PIECE == PAGE);
             let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
-            let mut runs: Vec<(usize, usize)> = Vec::new();
+            let mut inspected = Vec::new();
+            let mut runs = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -183,36 +185,11 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    runs.clear();
-                    for (i, ((t, h), o)) in
-                        title.iter_mut().zip(host.iter_mut()).zip(old).enumerate()
-                    {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            match runs.last_mut() {
-                                Some((_, end)) if *end == i => *end = i + 1,
-                                _ => runs.push((i, i + 1)),
-                            }
-                        }
-                        *h = *t;
-                    }
-                    // Only the runs the GPU changed go back: the title's
-                    // threads may write the other bytes meanwhile, and
-                    // writing the whole piece would put back what they had
-                    // before.
-                    for &(s, e) in &runs {
-                        crate::watch::writing(start + at + s, e - s);
-                        crate::host::write_mapped(
-                            (start + at + s) as *mut u8,
-                            title[s..].as_ptr(),
-                            e - s,
-                        );
-                        written += e - s;
-                    }
-                    synced.push((start + at) / PAGE);
+                if host != old {
+                    let (bytes, complete) =
+                        copyback::piece(start + at, host, old, title, &mut runs);
+                    written += bytes;
+                    inspected.push(((start + at) / PAGE, complete));
                 }
                 at += n;
             }
@@ -220,30 +197,36 @@ impl Shadow {
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
+            let observation = if first < last
+                && !inspected.is_empty()
                 && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
             {
+                crate::watch::writes(first * PAGE, last * PAGE, true).map(|(now, _)| now)
+            } else {
+                None
+            };
+            if observation.is_some() {
                 // The asking also cleared any title write made after we read
                 // a page; a page still equal to title memory now had none,
                 // the others stay stale for the next refresh to copy.
-                let current: Vec<usize> = synced
-                    .into_iter()
-                    .filter(|p| (first..last).contains(p))
-                    .filter(|&p| {
-                        // SAFETY: a whole page inside the mapping.
-                        let host = unsafe {
-                            std::slice::from_raw_parts(self.data.add(p * PAGE - start), PAGE)
-                        };
-                        crate::host::read_into((p * PAGE) as *const u8, &mut title)
-                            && title[..] == *host
-                    })
-                    .collect();
+                for (page, complete) in &mut inspected {
+                    if !*complete || !(first..last).contains(page) {
+                        *complete = false;
+                        continue;
+                    }
+                    // SAFETY: a whole page inside the mapping.
+                    let host = unsafe {
+                        std::slice::from_raw_parts(self.data.add(*page * PAGE - start), PAGE)
+                    };
+                    *complete = crate::host::read_into((*page * PAGE) as *const u8, &mut title)
+                        && title[..] == *host;
+                }
+            }
+            if !inspected.is_empty() {
                 let base = start / PAGE;
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in current {
-                    copied[page - base] = now;
+                for (page, complete) in inspected {
+                    copied[page - base] = if complete { observation.unwrap_or(0) } else { 0 };
                 }
             }
         }
@@ -472,7 +455,8 @@ mod copy_back_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree, VirtualProtect,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
     const PAGES: usize = 64;
@@ -512,7 +496,6 @@ mod copy_back_tests {
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         let s = Shadow::new(buffer, data, gpu, base as u64, (PAGES * PAGE) as u64);
         assert_eq!(s.update(base, PAGES * PAGE), PAGES * PAGE);
-        s.queue_write(base, PAGES * PAGE);
         s.snapshot(base, PAGES * PAGE);
         for p in 0..PAGES {
             // SAFETY: inside the copy.
@@ -530,7 +513,12 @@ mod copy_back_tests {
     #[ignore = "native Windows CPU copyback comparison"]
     fn copyback_dense_sparse_and_fragmented() {
         let bytes = PAGES * PAGE;
-        for (pattern, stride) in [("dense", 1), ("sparse", PAGE), ("fragmented", 32)] {
+        for (pattern, stride, partial) in [
+            ("dense", 1, false),
+            ("sparse", PAGE, false),
+            ("fragmented", 32, false),
+            ("partial", 4096, true),
+        ] {
             let mut times = Vec::new();
             for run in 0..7 {
                 let title = Title::new();
@@ -539,15 +527,35 @@ mod copy_back_tests {
                     // SAFETY: the test owns the mapped bytes and models completed GPU writes.
                     unsafe { shadow.data.add(i).write(1) };
                 }
+                if partial {
+                    for page in (0..PAGES).step_by(4) {
+                        // SAFETY: this OS page belongs to the enclosing title allocation.
+                        let ok = unsafe {
+                            VirtualFree(
+                                (title.0 + page * PAGE + 4096) as *mut _,
+                                4096,
+                                MEM_DECOMMIT,
+                            )
+                        };
+                        assert_ne!(ok, 0);
+                    }
+                }
                 let began = std::time::Instant::now();
-                shadow.copy_back(title.0, bytes);
+                let copied = shadow.copy_back(title.0, bytes);
                 let elapsed = began.elapsed();
                 if run > 1 {
                     times.push(elapsed);
                 }
                 for i in (0..bytes).step_by(stride) {
+                    if partial && (i / PAGE).is_multiple_of(4) && i % PAGE == 4096 {
+                        continue;
+                    }
                     assert_eq!(peek(title.0 + i), 1);
                 }
+                assert_eq!(
+                    copied,
+                    bytes.div_ceil(stride) - if partial { PAGES / 4 } else { 0 }
+                );
                 if stride > 1 {
                     assert!((0..PAGES).all(|page| peek(title.0 + page * PAGE + 1) == 0));
                 }
@@ -559,6 +567,34 @@ mod copy_back_tests {
                 times[2]
             );
         }
+    }
+
+    #[test]
+    fn copyback_preserves_valid_writes_around_a_hole_or_read_only_page() {
+        let title = Title::new();
+        let base = title.0;
+        let Some(s) = submitted(base) else {
+            return;
+        };
+        let mut old = 0;
+        for offset in [4095, 4096, 8191, 8192, 12287, 12288] {
+            // SAFETY: the fixture owns the native buffer and models completed GPU writes.
+            unsafe { s.data.add(offset).write(9) };
+        }
+        // SAFETY: these two whole OS pages belong to the test reservation.
+        unsafe {
+            assert_ne!(VirtualFree((base + 4096) as *mut _, 4096, MEM_DECOMMIT), 0);
+            assert_ne!(
+                VirtualProtect((base + 8192) as *const _, 4096, PAGE_READONLY, &mut old),
+                0
+            );
+        }
+        assert_eq!(s.copy_back(base, PAGE), 3);
+        assert_eq!(peek(base), 1);
+        assert_eq!(peek(base + 4095), 9);
+        assert_eq!(peek(base + 8192), 0);
+        assert_eq!(peek(base + 12287), 0);
+        assert_eq!(peek(base + 12288), 9);
     }
 
     /// The title's threads keep writing words no shader writes, in every

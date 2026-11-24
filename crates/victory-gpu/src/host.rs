@@ -1776,7 +1776,7 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) -> usize {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let write = |at: usize, n: usize| {
@@ -1784,18 +1784,22 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) };
+        done
     };
-    if len == 0 || write(dst as usize, len) {
-        return;
+    if len == 0 {
+        return 0;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
-            });
-        }
+    let written = write(dst as usize, len);
+    if written == len || dst as usize % 4096 + len <= 4096 {
+        return written;
+    }
+    let mut total = written;
+    // Keep any recorded progress and retry the rest at OS page boundaries.
+    for_pieces(dst as usize + written, len - written, 4096, |at, n| {
+        total += write(at, n);
     });
+    total
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
