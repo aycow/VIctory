@@ -304,9 +304,17 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
 
 /// In [`Reg`] order, which is also index order.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
-    (0..REGS)
-        .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
-        .map(reg_at)
+    set.iter().enumerate().flat_map(|(word, &bits)| {
+        let mut remaining = bits;
+        std::iter::from_fn(move || {
+            if remaining == 0 {
+                return None;
+            }
+            let register = word * 64 + remaining.trailing_zeros() as usize;
+            remaining &= remaining - 1;
+            (register < REGS).then(|| reg_at(register))
+        })
+    })
 }
 
 /// `outs` is sorted by register, and holds every register live out.
@@ -1033,6 +1041,19 @@ mod tests {
     use super::*;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn iterates_sparse_live_registers_in_order() {
+        let mut set: RegSet = [0; REGS.div_ceil(64)];
+        for reg in [Reg::V(255), Reg::Scc, Reg::S(63), Reg::V(0), Reg::S(0)] {
+            insert(&mut set, reg);
+        }
+        assert_eq!(
+            members(&set).collect::<Vec<_>>(),
+            [Reg::S(0), Reg::S(63), Reg::Scc, Reg::V(0), Reg::V(255)]
+        );
+        assert_eq!(members(&[0; REGS.div_ceil(64)]).next(), None);
+    }
 
     fn build_words(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
