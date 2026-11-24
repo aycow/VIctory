@@ -300,6 +300,33 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// Whether the title may have written a page of `[from, to)` since the
+    /// copy last took it (always, for memory that is neither write-watched
+    /// nor guarded). Asks the write journal, which keeps the answer for the
+    /// refresh that follows.
+    pub(crate) fn stale(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return false;
+        }
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return true;
+        }
+        let Some((_, written)) = crate::watch::writes(from, to, true) else {
+            return true;
+        };
+        let base = start / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        (from / PAGE..=(to - 1) / PAGE).any(|page| {
+            let at = copied[page - base];
+            let write = written
+                .binary_search_by_key(&page, |&(p, _)| p)
+                .map_or(0, |i| written[i].1);
+            at == 0 || write > at
+        })
+    }
+
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {

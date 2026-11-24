@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::timeline::{Ranges, Timeline};
+use crate::timeline::{Timeline, Touches};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -475,30 +475,31 @@ impl Pending {
     /// A submission's, after its steps ran, with the title memory its GPU
     /// work writes (copied back, written at the bottom of the pipe) and
     /// reads (host copies and textures brought up to date for it).
-    fn of(runs: &[&HostList]) -> (Pending, Ranges, Ranges) {
+    fn of(runs: &[&HostList]) -> (Pending, Touches) {
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        let (mut writes, mut wrote, mut read) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut writes, mut touches) = (Vec::new(), Touches::default());
         // One list's lock at a time: a submission may name a list twice.
         for list in runs {
             let deferred = list.deferred();
             for step in &deferred.copies {
                 match step {
                     Step::GpuWrite(shadow, address, len) => {
-                        wrote.push((*address, address + len));
+                        let copy = std::sync::Arc::as_ptr(shadow) as usize;
+                        touches.shaders.push((copy, *address, address + len));
                         if !back.iter().any(|(s, a, l)| {
                             std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
                         }) {
                             back.push((shadow.clone(), *address, *len));
                         }
                     }
-                    Step::Refresh(_, address, len) => read.push((*address, address + len)),
-                    Step::Texture(staging) => read.push(staging.range()),
+                    Step::Refresh(_, address, len) => touches.reads.push((*address, address + len)),
+                    Step::Texture(staging) => touches.reads.push(staging.range()),
                     _ => {}
                 }
             }
             for &(at, what, bytes) in &deferred.writes {
                 writes.push((at, what, bytes));
-                wrote.push((at, at + bytes));
+                touches.labels.push((at, at + bytes));
             }
         }
         let pending = Pending {
@@ -507,7 +508,7 @@ impl Pending {
             writes,
             submitted: std::time::Instant::now(),
         };
-        (pending, Ranges::new(wrote), Ranges::new(read))
+        (pending, touches)
     }
 }
 
@@ -649,7 +650,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        let (pending, writes, reads) = Pending::of(runs);
+        let (pending, touches) = Pending::of(runs);
         let prepared = std::time::Instant::now();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         // Diagnostics: each list on its own, timed and waited for
@@ -709,7 +710,7 @@ impl Host {
         for list in runs {
             list.last.store(*submitted, Ordering::Release);
         }
-        self.timeline.push(*submitted, writes, reads, pending);
+        self.timeline.push(*submitted, touches, pending);
         #[cfg(feature = "diagnostics")]
         if groups.len() > 1 {
             self.settle(*submitted);
@@ -1477,8 +1478,9 @@ impl HostList {
                         add(C::RefreshBytes, *len as u64);
                     }
                     // Title memory an earlier submission's shaders write is
-                    // current only once that one is copied back.
-                    batch.settle(*address, *len, false);
+                    // current only once that one is copied back, if the
+                    // title wrote it since the copy took it.
+                    batch.settle_refresh(shadow, *address, *len);
                     batch.add(shadow, *address, *len);
                     continue;
                 }
@@ -1548,6 +1550,20 @@ impl Batch<'_> {
     fn settle(&self, address: usize, len: usize, writing: bool) {
         if let Some(host) = self.host {
             host.settle_range(address, len, writing);
+        }
+    }
+
+    /// Before a refresh of `[address, address + len)` of `shadow`: as
+    /// [`Batch::settle`], but a submission whose shaders write the range
+    /// through the same copy is waited for only if the title wrote a page
+    /// of the overlap since the copy took it (the world's big heap is both
+    /// refreshed and written by shaders in most submissions).
+    fn settle_refresh(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let Some(host) = self.host else { return };
+        let copy = std::sync::Arc::as_ptr(shadow) as usize;
+        let to = address.saturating_add(len);
+        if let Some(value) = host.timeline.refresh_conflict(copy, address, to, |a, b| shadow.stale(a, b)) {
+            host.settle(value);
         }
     }
 

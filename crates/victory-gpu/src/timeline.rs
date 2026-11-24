@@ -39,10 +39,24 @@ impl Ranges {
 
 type Signal = Box<dyn FnOnce() + Send>;
 
+/// The title memory a submission's GPU work touches.
+#[derive(Default)]
+pub(crate) struct Touches {
+    /// What its shaders write: the host copy (by address) and the range.
+    pub(crate) shaders: Vec<(usize, usize, usize)>,
+    /// What its bottom-of-pipe writes write.
+    pub(crate) labels: Vec<(usize, usize)>,
+    /// What it reads (host copies and textures brought up to date for it).
+    pub(crate) reads: Vec<(usize, usize)>,
+}
+
 struct Entry<W> {
     /// The host fence value the submission signals.
     value: u64,
+    /// Everything it writes, shaders' and labels'.
     writes: Ranges,
+    labels: Ranges,
+    shaders: Vec<(usize, usize, usize)>,
     reads: Ranges,
     /// Title fence signals the title queued after it.
     signals: Vec<Signal>,
@@ -71,12 +85,16 @@ impl<W> Timeline<W> {
     }
 
     /// A submission that signals `value` (higher than any before it), the
-    /// title memory its GPU work writes and reads, and its work once it ran.
-    pub(crate) fn push(&self, value: u64, writes: Ranges, reads: Ranges, work: W) {
+    /// title memory its GPU work touches, and its work once it ran.
+    pub(crate) fn push(&self, value: u64, touches: Touches, work: W) {
+        let Touches { shaders, labels, reads } = touches;
+        let writes = shaders.iter().map(|&(_, a, b)| (a, b)).chain(labels.iter().copied());
         self.entries().push_back(Entry {
             value,
-            writes,
-            reads,
+            writes: Ranges::new(writes.collect()),
+            labels: Ranges::new(labels),
+            shaders,
+            reads: Ranges::new(reads),
             signals: Vec::new(),
             work: Some(work),
         });
@@ -117,6 +135,47 @@ impl<W> Timeline<W> {
             .rev()
             .find(|e| e.writes.overlaps(from, to) || writing && e.reads.overlaps(from, to))
             .map(|e| e.value)
+    }
+
+    /// For a refresh of `[from, to)` through the host copy `copy`: the
+    /// newest submission not finished yet it must wait for. One whose
+    /// bottom-of-pipe writes overlap the range counts, and so does one whose
+    /// shaders write it through another copy; one whose shaders write it
+    /// through this copy counts only if `stale` says the title wrote some of
+    /// the overlap since the copy took it. Otherwise the copy already holds
+    /// what the refresh would bring, and those shaders' writes reach it in
+    /// queue order.
+    pub(crate) fn refresh_conflict(
+        &self,
+        copy: usize,
+        from: usize,
+        to: usize,
+        stale: impl Fn(usize, usize) -> bool,
+    ) -> Option<u64> {
+        if from >= to {
+            return None;
+        }
+        let (mut must, mut parts) = (None, Vec::new());
+        for e in self.entries().iter() {
+            if e.labels.overlaps(from, to) {
+                must = Some(e.value);
+            }
+            for &(c, a, b) in e.shaders.iter().filter(|&&(_, a, b)| a < to && b > from) {
+                if c == copy {
+                    parts.push((e.value, a.max(from), b.min(to)));
+                } else {
+                    must = Some(e.value);
+                }
+            }
+        }
+        // Asked outside the lock, newest first.
+        parts.sort_unstable_by_key(|p| std::cmp::Reverse(p.0));
+        parts
+            .into_iter()
+            .take_while(|&(v, ..)| must.is_none_or(|m| v > m))
+            .find(|&(_, a, b)| stale(a, b))
+            .map(|(v, ..)| v)
+            .or(must)
     }
 
     /// Blocks until a submission is left; its value.
@@ -182,8 +241,8 @@ mod tests {
         // Nothing in flight: a signal is at once.
         let l = log.clone();
         t.after(move || note(&l, "signal 0"));
-        t.push(1, Ranges::default(), Ranges::default(), "work 1");
-        t.push(2, Ranges::default(), Ranges::default(), "work 2");
+        t.push(1, Touches::default(), "work 1");
+        t.push(2, Touches::default(), "work 2");
         // Queued after both: behind the second's work.
         let l = log.clone();
         t.after(move || note(&l, "signal 2"));
@@ -208,18 +267,17 @@ mod tests {
     fn steps_conflict_with_the_newest_submission_touching_their_memory() {
         let t: Timeline<()> = Timeline::new();
         // Writes 0x1000..0x2000 and a 4-byte word at 0x9000; reads 0x5000..0x6000.
+        let touches = |shaders: Vec<(usize, usize, usize)>, labels, reads| Touches {
+            shaders,
+            labels,
+            reads,
+        };
         t.push(
             1,
-            Ranges::new(vec![(0x1000, 0x2000), (0x9000, 0x9004)]),
-            Ranges::new(vec![(0x5000, 0x6000)]),
+            touches(vec![(1, 0x1000, 0x2000)], vec![(0x9000, 0x9004)], vec![(0x5000, 0x6000)]),
             (),
         );
-        t.push(
-            2,
-            Ranges::new(vec![(0x1800, 0x1900)]),
-            Ranges::default(),
-            (),
-        );
+        t.push(2, touches(vec![(1, 0x1800, 0x1900)], vec![], vec![]), ());
         // Reading what either writes waits for the newest that does.
         assert_eq!(t.conflict(0x1880, 0x1890, false), Some(2));
         assert_eq!(t.conflict(0x1000, 0x1010, false), Some(1));
@@ -230,6 +288,15 @@ mod tests {
         // Next to, not in.
         assert_eq!(t.conflict(0x2000, 0x5000, true), None);
         assert_eq!(t.conflict(0x9004, 0x9008, true), None);
+        // A refresh through copy 1 waits only where the title wrote the
+        // overlap; labels and other copies always count.
+        let clean = |_: usize, _: usize| false;
+        let dirty_at = |at: usize| move |a: usize, b: usize| (a..b).contains(&at);
+        assert_eq!(t.refresh_conflict(1, 0x1000, 0x2000, clean), None);
+        assert_eq!(t.refresh_conflict(1, 0x1000, 0x2000, dirty_at(0x1100)), Some(1));
+        assert_eq!(t.refresh_conflict(1, 0x1000, 0x2000, dirty_at(0x1880)), Some(2));
+        assert_eq!(t.refresh_conflict(2, 0x1000, 0x1010, clean), Some(1));
+        assert_eq!(t.refresh_conflict(1, 0x8000, 0x9001, clean), Some(1));
         t.finish(2, |()| {});
         assert_eq!(t.conflict(0x1000, 0x2000, true), None);
     }
