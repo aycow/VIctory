@@ -686,6 +686,16 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_NATIVE_SUBMISSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_native_submissions() -> usize {
+    TEST_NATIVE_SUBMISSIONS.with(std::cell::Cell::get)
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -693,6 +703,8 @@ pub(crate) struct HostList {
     /// Native lists recorded after a title buffer-copy boundary.
     continuations: Mutex<Vec<Continuation>>,
     has_buffer_copies: AtomicBool,
+    /// This recording can make a later list's title-memory upload depend on it.
+    has_deferred_gpu_writes: AtomicBool,
     /// Raw host lists may record native buffer work without deferred steps.
     may_access_buffers: AtomicBool,
     /// Work for submission time, in recorded order.
@@ -1114,6 +1126,7 @@ impl Host {
                 list,
                 continuations: Mutex::default(),
                 has_buffer_copies: AtomicBool::new(false),
+                has_deferred_gpu_writes: AtomicBool::new(false),
                 may_access_buffers: AtomicBool::new(true),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
@@ -1210,17 +1223,24 @@ impl Host {
             }
         }
         SUBMISSION_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-        if !has_copies {
+        let needs_ordering = has_copies
+            || runs
+                .iter()
+                .any(|list| list.has_deferred_gpu_writes.load(Ordering::Relaxed));
+        if !needs_ordering {
             self.execute_batch(&ordered, &mut submitted);
         } else {
             let mut start = 0;
             let mut pending = Vec::new();
             for (i, &(list, _)) in ordered.iter().enumerate() {
+                // Even without buffer copies, a GPU write can feed the
+                // CPU upload (e.g. a staged CBV) of a later closed list.
                 if i != start
-                    && (list.needs_title_bytes(&pending)
-                        || ordered[start..i]
-                            .iter()
-                            .any(|(other, _)| std::ptr::eq(*other, list)))
+                    && ((has_copies || !pending.is_empty()) && list.needs_title_bytes(&pending)
+                        || has_copies
+                            && ordered[start..i]
+                                .iter()
+                                .any(|(other, _)| std::ptr::eq(*other, list)))
                 {
                     self.execute_batch(&ordered[start..i], &mut submitted);
                     pending.clear();
@@ -1275,6 +1295,8 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists and a live direct queue.
             unsafe { self.queue.ExecuteCommandLists(&lists[first..end]) };
+            #[cfg(test)]
+            TEST_NATIVE_SUBMISSIONS.with(|count| count.set(count.get() + 1));
             if timed || group + 1 == groups.len() {
                 *submitted += 1;
                 self.wait_for_submission(*submitted);
@@ -1715,6 +1737,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         self.continuations().clear();
         self.has_buffer_copies.store(false, Ordering::Relaxed);
+        self.has_deferred_gpu_writes.store(false, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states
             .lock()
@@ -1975,6 +1998,7 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
+        self.has_deferred_gpu_writes.store(true, Ordering::Relaxed);
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -2104,6 +2128,9 @@ impl HostList {
     }
 
     fn add_gpu_writes(&self, pending: &mut Vec<ShadowRange>) {
+        if !self.has_deferred_gpu_writes.load(Ordering::Relaxed) {
+            return;
+        }
         for step in &self.deferred().copies {
             if let Step::GpuWrite(shadow, address, len) = step {
                 pending.push((shadow.clone(), *address, address + len));

@@ -788,6 +788,42 @@ fn cpu_staging_reads_back_a_gpu_ordered_copy_before_gpu_consumes_upload() {
 }
 
 #[test]
+fn staged_constants_follow_shader_writes_without_a_buffer_copy() {
+    let Some(gpu) = test_gpu() else { return };
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    let reader = Shader::new(gpu.host, s!("read_constant"));
+    for (depends, expected, groups) in [(true, 29, 2), (false, 11, 1)] {
+        let produced = TitleBuffer::new(&[11]);
+        let unrelated = TitleBuffer::new(&[11]);
+        let source = if depends { &produced } else { &unrelated };
+        let output = TitleBuffer::new(&[0]);
+        let before = TitleList::new();
+        let after = TitleList::new();
+        writer.write(&before, &produced, 0, 29);
+        before.close();
+        let list = after.recording();
+        let (gpu_address, mapped) = list.scratch(256).unwrap();
+        list.defer_fill(mapped, source.address as *const u8, 4);
+        let target = output.shadow(&list, 0, true);
+        // SAFETY: the CBV names the list's scratch; the output shadow stays live.
+        unsafe {
+            list.list.SetComputeRootSignature(&reader.root);
+            list.list.SetPipelineState(&reader.pipeline);
+            list.list.SetComputeRootConstantBufferView(0, gpu_address);
+            list.list.SetComputeRootUnorderedAccessView(1, output.gpu(&target, 0));
+            list.list.Dispatch(1, 1, 1);
+        }
+        after.close();
+
+        let submitted = crate::host::test_native_submissions();
+        gpu.execute(&[before.host(), after.host()]);
+        assert_eq!(output.words(), [expected]);
+        assert_eq!(produced.words(), [29]);
+        assert_eq!(crate::host::test_native_submissions() - submitted, groups);
+    }
+}
+
+#[test]
 fn disjoint_ranges_in_one_native_buffer_copy_in_gpu_order() {
     let Some(gpu) = test_gpu() else { return };
     let writer = Shader::new(gpu.host, s!("write_word"));
