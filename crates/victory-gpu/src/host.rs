@@ -1380,7 +1380,9 @@ pub(crate) fn test_submission_copy_bytes() -> u64 {
 /// small title buffers placed side by side) share one question for written
 /// pages; the rest goes through each copy's own grouping
 /// (`Shadow::update_ready`).
-fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)]) -> usize {
+pub(crate) fn refresh_across(
+    per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+) -> usize {
     use crate::watch::PAGE;
     const SPAN_GAP: usize = 1 << 20;
     #[cfg(feature = "diagnostics")]

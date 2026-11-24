@@ -1836,6 +1836,194 @@ mod tests {
     }
 
     #[test]
+    fn cross_shadow_review_preserves_oldest_coverage_and_pending_bytes() {
+        let Some((title, first)) = fixture(true, 2) else {
+            return;
+        };
+        let base = title.0 as usize;
+        let second = shadow_at(base, 2 * PAGE).unwrap();
+        let (first, second) = (Arc::new(first), Arc::new(second));
+        let range = (base + 16, base + 48);
+        assert_eq!(first.update(range.0, range.1 - range.0), 32);
+        assert_eq!(second.update(range.0, range.1 - range.0), 32);
+
+        // SAFETY: the title reservation is still live and no GPU work is running.
+        unsafe {
+            title.0.cast::<u8>().add(20).write(9);
+            title.0.cast::<u8>().add(34).write(11);
+        }
+        // This newer copy clears the native dirty bit. The older copy must
+        // still see it through the global journal when the ranges are grouped.
+        assert_eq!(first.update(range.0, range.1 - range.0), 32);
+        assert_eq!(native_byte(&second, 20), 1);
+        first.writing(base + 32, 8);
+        // SAFETY: this emulates a pending GPU store in the mapped test buffer.
+        unsafe { first.data.add(34).write(7) };
+        let per = [
+            (second.clone(), second.ready(&[range])),
+            (first.clone(), first.ready(&[range])),
+        ];
+        assert_eq!(per[1].1, [(base + 16, base + 32), (base + 40, base + 48)]);
+        assert_eq!(crate::host::refresh_across(&per), 32);
+        assert_eq!(native_byte(&first, 20), 9);
+        assert_eq!(native_byte(&first, 34), 7);
+        assert_eq!(native_byte(&second, 20), 9);
+        assert_eq!(native_byte(&second, 34), 11);
+        assert_eq!(first.copy_back(base + 32, 8), 8);
+        assert_eq!(second.update(base + 34, 1), 1);
+        assert_eq!(native_byte(&second, 34), 7);
+    }
+
+    #[test]
+    fn cross_shadow_review_later_write_survives_an_older_answer() {
+        let Some((title, first)) = fixture(true, 2) else {
+            return;
+        };
+        let base = title.0 as usize;
+        let second_base = base + PAGE;
+        let second = shadow_at(second_base, PAGE).unwrap();
+        let from = second_base + 16;
+        let to = from + 1;
+        assert_eq!(first.update(base + 16, 1), 1);
+        assert_eq!(second.update(from, 1), 1);
+        let after = first
+            .floor(base + 16, base + 17)
+            .min(second.floor(from, to));
+        let allocation = crate::watch::allocation(base);
+        let (sampled, pages) =
+            crate::watch::grouped_writes(base + 16, to, after, allocation).unwrap();
+
+        // SAFETY: this store into the live reservation occurs after the shared sample.
+        unsafe { (from as *mut u8).write(19) };
+        let (later, observed) = crate::watch::writes(from, to, false).unwrap();
+        assert!(later > sampled);
+        assert!(observed.contains(&(from / PAGE, later)));
+
+        let k = pages.partition_point(|&(page, _)| page < from / PAGE);
+        assert_eq!(second.answered(from, to, sampled, &pages[k..]), 0);
+        assert_eq!(native_byte(&second, 16), 1);
+        assert_eq!(second.update(from, 1), 1);
+        assert_eq!(native_byte(&second, 16), 19);
+    }
+
+    #[test]
+    fn cross_shadow_review_reported_recommit_invalidates_both_copies() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+
+        let Some((title, first)) = fixture(true, 2) else {
+            return;
+        };
+        let base = title.0 as usize;
+        let second = Arc::new(shadow_at(base, PAGE).unwrap());
+        let first = Arc::new(first);
+        let spans = [(base + 16, base + 17)];
+        let ranges = || {
+            [
+                (first.clone(), first.ready(&spans)),
+                (second.clone(), second.ready(&spans)),
+            ]
+        };
+        assert_eq!(crate::host::refresh_across(&ranges()), 2);
+        assert_eq!(native_byte(&first, 16), 1);
+        assert_eq!(native_byte(&second, 16), 1);
+        let old = crate::watch::allocation(base).unwrap();
+
+        // SAFETY: the affected page belongs to the owned test reservation.
+        unsafe {
+            assert_ne!(VirtualFree(title.0, PAGE, MEM_DECOMMIT), 0);
+            crate::watch::title_memory_allocation_changed(base, PAGE);
+            assert_eq!(
+                VirtualAlloc(title.0, PAGE, MEM_COMMIT, PAGE_READWRITE),
+                title.0
+            );
+            crate::watch::title_memory_allocation_changed(base, PAGE);
+        }
+        assert!(!old.is_live());
+        assert_eq!(crate::host::refresh_across(&ranges()), 2);
+        assert_eq!(native_byte(&first, 16), 0);
+        assert_eq!(native_byte(&second, 16), 0);
+        let unchanged = crate::host::refresh_across(&ranges());
+        eprintln!("additional bytes copied on the first clean refresh after recommit: {unchanged}");
+        assert_eq!(native_byte(&first, 16), 0);
+        assert_eq!(native_byte(&second, 16), 0);
+    }
+
+    #[test]
+    fn cross_shadow_review_quantifies_sparse_and_single_span_questions() {
+        const SPACING: usize = 1 << 20;
+        const COPIES: usize = 24;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: this is one owned private watched test reservation.
+        let title = Reservation(unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                COPIES * SPACING,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        });
+        assert!(!title.0.is_null());
+        let base = title.0 as usize;
+        if !crate::watch::allocation(base)
+            .is_some_and(|a| a.is_private_span(base, base + COPIES * SPACING))
+        {
+            return;
+        }
+        let mut per = Vec::new();
+        for i in 0..COPIES {
+            let at = base + i * SPACING;
+            let Some(shadow) = shadow_at(at, PAGE) else {
+                return;
+            };
+            // SAFETY: each byte is in the live committed reservation.
+            unsafe { (at as *mut u8).write(1 + i as u8) };
+            assert_eq!(shadow.update(at, 1), 1);
+            per.push((Arc::new(shadow), vec![(at, at + 1)]));
+        }
+        let query = |work: &dyn Fn() -> usize| {
+            let start = crate::watch::test_watch_stats();
+            assert_eq!(work(), 0);
+            let end = crate::watch::test_watch_stats();
+            (end.0 - start.0, end.1 - start.1, end.2 - start.2)
+        };
+        let baseline = query(&|| per.iter().map(|(s, r)| s.update_ready(r)).sum());
+        let gap = base + PAGE;
+        let before_gap = crate::watch::writes(gap, gap + 1, false).unwrap().0;
+        // SAFETY: the gap is committed in this reservation but unrequested.
+        unsafe { (gap as *mut u8).write(91) };
+        let candidate = query(&|| crate::host::refresh_across(&per));
+        let single_baseline = query(&|| per[0].0.update_ready(&per[0].1));
+        let single_candidate = query(&|| crate::host::refresh_across(&per[..1]));
+        eprintln!(
+            "(watch calls, watch span bytes, allocation lookups): sparse baseline {baseline:?}, candidate {candidate:?}; one shadow baseline {single_baseline:?}, candidate {single_candidate:?}"
+        );
+        assert_eq!(baseline, (COPIES, COPIES * PAGE, 0));
+        assert_eq!(single_baseline, (1, PAGE, 0));
+        // Current PR behavior. This deliberately makes the extra query
+        // area and the avoidable single-copy lookup concrete.
+        let disabled =
+            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_NO_SHARED_SPANS").is_some();
+        let (next_gap, written) = crate::watch::writes(gap, gap + 1, false).unwrap();
+        let gap_generation = written
+            .into_iter()
+            .find_map(|(page, generation)| (page == gap / PAGE).then_some(generation))
+            .expect("unrequested dirty page retained in the journal");
+        assert!(gap_generation > before_gap);
+        if disabled {
+            assert_eq!(candidate, baseline);
+            assert_eq!(single_candidate, single_baseline);
+            assert_eq!(gap_generation, next_gap);
+        } else {
+            assert_eq!(candidate, (1, (COPIES - 1) * SPACING + PAGE, 1));
+            assert_eq!(single_candidate, (1, PAGE, 1));
+            assert!(gap_generation < next_gap);
+        }
+        for (i, (shadow, _)) in per.iter().enumerate() {
+            assert_eq!(native_byte(shadow, 0), 1 + i as u8);
+        }
+    }
+
+    #[test]
     fn grouped_reserved_reads_see_a_later_commit() {
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         // SAFETY: the fixture acquires and owns this private reservation.

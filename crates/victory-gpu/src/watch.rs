@@ -122,6 +122,8 @@ impl Allocation {
 /// and protection. Resolve this optionally so older Win32 providers still
 /// use the non-reset GetWriteWatch preflight.
 pub(crate) fn allocation(address: usize) -> Option<Allocation> {
+    #[cfg(test)]
+    ALLOCATION_QUERIES.with(|calls| calls.set(calls.get() + 1));
     use std::{ffi::c_void, sync::OnceLock};
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::{
@@ -262,6 +264,17 @@ impl Journal {
 #[cfg(test)]
 thread_local! {
     static KERNEL_WATCH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static KERNEL_WATCH_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ALLOCATION_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_watch_stats() -> (usize, usize, usize) {
+    (
+        KERNEL_WATCH_CALLS.with(std::cell::Cell::get),
+        KERNEL_WATCH_BYTES.with(std::cell::Cell::get),
+        ALLOCATION_QUERIES.with(std::cell::Cell::get),
+    )
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -333,7 +346,10 @@ fn query(
     let started = std::time::Instant::now();
     let mut ask = |flags| {
         #[cfg(test)]
-        KERNEL_WATCH_CALLS.with(|calls| calls.set(calls.get() + 1));
+        {
+            KERNEL_WATCH_CALLS.with(|calls| calls.set(calls.get() + 1));
+            KERNEL_WATCH_BYTES.with(|bytes| bytes.set(bytes.get() + (last - first) * PAGE));
+        }
         let mut count = capacity;
         let mut granularity = 0;
         // SAFETY: the answer buffer holds `capacity` entries.
