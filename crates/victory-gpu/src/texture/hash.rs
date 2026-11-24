@@ -2,9 +2,12 @@ use std::sync::OnceLock;
 
 const MIN_PARALLEL_BYTES: usize = 4 << 20;
 const WORKERS: usize = 2;
+static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
+#[cfg(test)]
+mod benchmark;
 
 pub(super) fn digest(bytes: &[u8]) -> blake3::Hash {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     if bytes.len() >= MIN_PARALLEL_BYTES
         && let Some(pool) = POOL.get_or_init(|| {
             let enabled = std::env::var_os("VICTORY_PARALLEL_TEXTURE_HASH").is_some();
@@ -18,7 +21,13 @@ pub(super) fn digest(bytes: &[u8]) -> blake3::Hash {
 }
 
 fn new_pool() -> Option<rayon::ThreadPool> {
-    rayon::ThreadPoolBuilder::new()
+    let builder = rayon::ThreadPoolBuilder::new();
+    #[cfg(test)]
+    let builder = match std::env::var("VICTORY_TEST_HASH_STACK_KIB") {
+        Ok(kib) => builder.stack_size(kib.parse::<usize>().unwrap() << 10),
+        Err(_) => builder,
+    };
+    builder
         .num_threads(WORKERS)
         .thread_name(|i| format!("victory-texture-hash-{i}"))
         .build()
