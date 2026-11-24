@@ -9,8 +9,8 @@
 //! needs it (a later submission's step touching memory it writes, a reset
 //! of one of its lists, a present).
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::timeline::{Timeline, Touches};
 
@@ -197,7 +197,20 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            #[cfg(test)]
+            let adapter = if std::env::var_os("VICTORY_TEST_BUFFER_COPY_NVIDIA").is_some() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+                let nvidia = (0..)
+                    .map_while(|i| factory.EnumAdapters1(i).ok())
+                    .find(|a| a.GetDesc1().is_ok_and(|d| d.VendorId == 0x10de))
+                    .ok_or_else(windows::core::Error::empty)?;
+                Some(nvidia.cast::<windows::core::IUnknown>()?)
+            } else {
+                None
+            };
+            #[cfg(not(test))]
+            let adapter: Option<windows::core::IUnknown> = None;
+            D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         create_with_device(device, debug)
@@ -321,6 +334,11 @@ pub(crate) struct HostList {
     /// Swapped for a fresh one when the list is reset while it runs.
     allocator: Mutex<ID3D12CommandAllocator>,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// Native lists recorded after a title buffer-copy boundary.
+    continuations: Mutex<Vec<Continuation>>,
+    has_buffer_copies: AtomicBool,
+    /// Raw host lists may record native buffer work without deferred steps.
+    may_access_buffers: AtomicBool,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -339,7 +357,7 @@ pub(crate) struct HostList {
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
-    budget: Mutex<Option<(ID3D12Resource, usize)>>,
+    budget: Mutex<Arc<Budget>>,
     /// The host fence value of its last submission (0: none): it is not
     /// reset, resubmitted or dropped before that one has finished.
     last: AtomicU64,
@@ -427,12 +445,15 @@ struct Retired {
     deferred: Deferred,
     scratch: Scratch,
     states: States,
-    budget: Option<(ID3D12Resource, usize)>,
+    budget: Arc<Budget>,
+    continuations: Vec<Continuation>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the scratch and budget pointers
 // are persistent mappings of their buffers, which go with them.
 unsafe impl Send for Retired {}
+
+type Budget = OnceLock<Option<(ID3D12Resource, usize)>>;
 
 type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
@@ -463,11 +484,122 @@ impl Retired {
         let mut spare = pool(&SPARE_SCRATCH);
         let room = SPARES.saturating_sub(spare.len());
         spare.extend(self.scratch.chunks.into_iter().take(room));
-        drop((self.deferred, self.states, self.budget));
+        drop((self.deferred, self.states, self.budget, self.continuations));
     }
 }
 
 /// One piece of submission-time work, in recorded order.
+#[derive(Clone)]
+enum Continuation {
+    Copy(Arc<BufferCopy>),
+    Commands(Arc<HostList>),
+}
+
+struct BufferCopy {
+    to: usize,
+    from: usize,
+    len: usize,
+    buffers: [crate::resource::BufferLease; 2],
+    native: OnceLock<NativeCopy>,
+}
+
+struct NativeCopy {
+    lists: Vec<HostList>,
+    access: Option<CopyAccess>,
+}
+
+#[derive(Clone, Copy)]
+struct CopyAccess {
+    source: usize,
+    target: usize,
+    written: (usize, usize),
+}
+
+impl CopyAccess {
+    fn independent_of(self, previous: Self) -> bool {
+        self.source != previous.target
+            && self.target != previous.source
+            && (self.target != previous.target || !overlaps(self.written, previous.written))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum QueueSegment {
+    Commands,
+    Copy { starts_group: bool },
+}
+
+impl BufferCopy {
+    fn native(&self, host: &Host) -> &NativeCopy {
+        self.native.get_or_init(|| {
+            let new_list = || {
+                host.new_list().unwrap_or_else(|e| {
+                    fail(format_args!(
+                        "a buffer copy command list did not open ({e})"
+                    ))
+                })
+            };
+            let (to, from, len) = (self.to, self.from, self.len);
+            let copy = new_list();
+            let mut lists = Vec::new();
+            let mut access = None;
+            let source = crate::shadow::find(from as u64, len as u64);
+            let target = crate::shadow::find(to as u64, len as u64);
+            if let (Some(source), Some(target)) = (source, target) {
+                let (mut buffer, mut offset) = (source.buffer.clone(), source.offset(from as u64));
+                if buffer == target.buffer {
+                    // Legacy barriers cannot make one buffer COPY_SOURCE
+                    // and COPY_DEST at once. Decay between the scratch
+                    // transfer and the copy back to the same buffer.
+                    let (scratch, _) = host.shared_buffer(len as u64).unwrap_or_else(|| {
+                        fail(format_args!("no scratch for aliased buffer copy"))
+                    });
+                    let first = new_list();
+                    source.refresh(&first, from as u64, len as u64);
+                    first.keep(&scratch);
+                    // SAFETY: both live resources cover the named ranges.
+                    unsafe {
+                        first
+                            .list
+                            .CopyBufferRegion(&scratch, 0, &buffer, offset, len as u64)
+                    };
+                    first.close_native();
+                    lists.push(first);
+                    buffer = scratch;
+                    offset = 0;
+                    copy.keep(&buffer);
+                } else {
+                    source.refresh(&copy, from as u64, len as u64);
+                    access = Some(CopyAccess {
+                        source: buffer.as_raw() as usize,
+                        target: target.buffer.as_raw() as usize,
+                        written: (target.offset(to as u64) as usize, len),
+                    });
+                }
+                target.refresh(&copy, to as u64, len as u64);
+                copy.defer_gpu_write(&target, to, len);
+                // SAFETY: the live, distinct buffers cover both ranges. The
+                // copy executes on its own and both buffers can promote.
+                unsafe {
+                    copy.list.CopyBufferRegion(
+                        &target.buffer,
+                        target.offset(to as u64),
+                        &buffer,
+                        offset,
+                        len as u64,
+                    )
+                };
+            } else {
+                // A mapped fallback must wait for a pending GPU producer.
+                copy.defer_copy(to as *mut u8, from as *const u8, len);
+            }
+            copy.close_native();
+            lists.push(copy);
+            NativeCopy { lists, access }
+        })
+    }
+}
+
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
@@ -501,7 +633,7 @@ struct Deferred {
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
-    kept: Vec<windows::core::IUnknown>,
+    kept: Vec<ID3D12Object>,
     /// Descriptor slots named by the recording, retired with this recording
     /// if the list resets before its last submission completes.
     shared_tables: std::collections::HashMap<
@@ -529,10 +661,9 @@ const IN_FLIGHT: usize = 16;
 #[derive(Clone, Copy)]
 struct ListRef(*const HostList);
 
-// SAFETY: host lists are used from any thread (their state is behind
-// locks), and one is not dropped while a submission naming it is in flight
-// (`HostList::last`); a reset hands the memory such a submission uses to
-// the timeline instead of reusing it.
+// SAFETY: host lists have thread-safe state. Roots stay alive through
+// their last fence. A root owns its continuations and native copy lists,
+// and moves them to the timeline if reset before that fence.
 unsafe impl Send for ListRef {}
 
 impl ListRef {
@@ -546,7 +677,7 @@ impl ListRef {
 struct Pending {
     lists: Vec<ListRef>,
     /// The ranges its shaders write (host copy, address, bytes), each once.
-    back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    back: GpuWrites,
     /// Its bottom-of-pipe writes, in list order: address, what, bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
     submitted: std::time::Instant,
@@ -556,8 +687,7 @@ impl Pending {
     /// A submission's, after its steps ran, with the title memory its GPU
     /// work writes (copied back, written at the bottom of the pipe) and
     /// reads (host copies and textures brought up to date for it).
-    fn of(runs: &[&HostList]) -> (Pending, Touches) {
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    fn of(runs: &[&HostList], roots: &[&HostList], back: GpuWrites) -> (Pending, Touches) {
         let (mut writes, mut touches) = (Vec::new(), Touches::default());
         // One list's lock at a time: a submission may name a list twice.
         for list in runs {
@@ -567,13 +697,11 @@ impl Pending {
                     Step::GpuWrite(shadow, address, len) => {
                         let copy = std::sync::Arc::as_ptr(shadow) as usize;
                         touches.shaders.push((copy, *address, address + len));
-                        if !back.iter().any(|(s, a, l)| {
-                            std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
-                        }) {
-                            back.push((shadow.clone(), *address, *len));
-                        }
                     }
-                    Step::Refresh(_, address, len) => touches.reads.push((*address, address + len)),
+                    Step::Refresh(shadow, address, len) => {
+                        touches.reads.push((*address, address + len));
+                        touches.shadow_reads.push((Arc::as_ptr(shadow) as usize, *address, address + len));
+                    }
                     Step::Texture(staging) => {
                         touches.reads.push(staging.range());
                         touches.staging.insert(std::sync::Arc::as_ptr(staging) as usize);
@@ -581,7 +709,10 @@ impl Pending {
                     _ => {}
                 }
             }
-            for &(at, what, bytes) in &deferred.writes {
+        }
+        // Labels follow the final fence and retain the title list order.
+        for root in roots {
+            for &(at, what, bytes) in &root.deferred().writes {
                 writes.push((at, what, bytes));
                 touches.labels.push((at, at + bytes));
             }
@@ -684,6 +815,9 @@ impl Host {
             Ok(HostList {
                 allocator: Mutex::new(allocator),
                 list,
+                continuations: Mutex::default(),
+                has_buffer_copies: AtomicBool::new(false),
+                may_access_buffers: AtomicBool::new(true),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -731,9 +865,17 @@ impl Host {
         }
     }
 
-    /// Runs closed lists. Their submission joins the timeline, finished
-    /// once the GPU has run it.
+    pub(crate) fn new_title_list(&self) -> windows::core::Result<HostList> {
+        let list = self.new_list()?;
+        list.may_access_buffers.store(false, Ordering::Relaxed);
+        Ok(list)
+    }
+
+    /// Runs a title submission, settling only its CPU-dependent phases.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        if runs.is_empty() {
+            return;
+        }
         self.finisher.call_once(|| {
             let spawned = std::thread::Builder::new()
                 .name("victory-gpu-finisher".into())
@@ -742,15 +884,10 @@ impl Host {
                 tracing::warn!(error = %e, "no completion thread; submissions finish when needed");
             }
         });
-        // One submission at a time from preparation to submission: snapshots
-        // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        // What has run is finished first. A list still in flight is waited
-        // for: its upload memory, budget word and prelude are rewritten
-        // below.
         self.finish();
         for list in runs {
             if list.running() {
@@ -762,85 +899,171 @@ impl Host {
         {
             self.settle(oldest);
         }
+        let continuations: Vec<_> = runs
+            .iter()
+            .map(|list| {
+                if list.has_buffer_copies.load(Ordering::Relaxed) {
+                    list.continuations().clone()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        let has_copies = continuations.iter().any(|parts| !parts.is_empty());
+        let mut ordered = Vec::new();
+        let mut gpu_work = false;
+        for (&list, parts) in runs.iter().zip(&continuations) {
+            ordered.push((list, QueueSegment::Commands));
+            gpu_work |= has_copies && list.may_access_buffers();
+            let mut copy_group: Vec<CopyAccess> = Vec::new();
+            let mut previous_copy: Option<&BufferCopy> = None;
+            for part in parts {
+                match part {
+                    Continuation::Commands(list) => {
+                        ordered.push((list, QueueSegment::Commands));
+                        gpu_work |= list.may_access_buffers();
+                        copy_group.clear();
+                        previous_copy = None;
+                    }
+                    Continuation::Copy(copy) if gpu_work => {
+                        if previous_copy.is_some_and(|previous| {
+                            previous.to == copy.to
+                                && previous.from == copy.from
+                                && previous.len == copy.len
+                                && previous.buffers == copy.buffers
+                                && previous.native(self).access.is_some()
+                        }) {
+                            continue;
+                        }
+                        let copy = copy.as_ref();
+                        let native = copy.native(self);
+                        let starts_group = copy_group.is_empty()
+                            || native.access.is_none_or(|access| {
+                                copy_group
+                                    .iter()
+                                    .any(|&earlier| !access.independent_of(earlier))
+                            });
+                        if starts_group {
+                            copy_group.clear();
+                        }
+                        copy_group.extend(native.access);
+                        ordered.extend(native.lists.iter().enumerate().map(|(i, list)| {
+                            let segment = QueueSegment::Copy {
+                                starts_group: starts_group || i != 0,
+                            };
+                            (list, segment)
+                        }));
+                        previous_copy = Some(copy);
+                    }
+                    Continuation::Copy(copy) => {
+                        // No preceding command can have touched title
+                        // buffers. Retain the cheap mapped copy in this prefix.
+                        self.settle_range(copy.from, copy.len, false);
+                        self.settle_range(copy.to, copy.len, true);
+                        run_mapped_copy(copy.to, copy.from, copy.len, true);
+                    }
+                }
+            }
+        }
+        SUBMISSION_US[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if has_copies {
+            let mut start = 0;
+            let mut pending = Vec::new();
+            for (i, &(list, _)) in ordered.iter().enumerate() {
+                if i != start
+                    && (list.needs_title_bytes(&pending)
+                        || ordered[start..i].iter().any(|(other, _)| std::ptr::eq(*other, list)))
+                {
+                    self.execute_batch(&ordered[start..i], &[], &mut submitted);
+                    self.settle(*submitted);
+                    pending.clear();
+                    start = i;
+                }
+                list.add_gpu_writes(&mut pending);
+            }
+            self.execute_batch(&ordered[start..], runs, &mut submitted);
+        } else {
+            self.execute_batch(&ordered, runs, &mut submitted);
+        }
+    }
+
+    fn execute_batch(
+        &self,
+        ordered: &[(&HostList, QueueSegment)],
+        roots: &[&HostList],
+        submitted: &mut u64,
+    ) {
+        let started = std::time::Instant::now();
+        let runs: Vec<_> = ordered.iter().map(|&(list, _)| list).collect();
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch {
-            host: Some(self),
-            ..Batch::default()
-        };
-        for list in runs {
+        let mut groups = vec![(0, 0)];
+        #[cfg(feature = "diagnostics")]
+        let timed = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let timed = false;
+        let mut batch = Batch { host: Some(self), ..Batch::default() };
+        let mut previous_copy = false;
+        for (i, &(list, segment)) in ordered.iter().enumerate() {
             list.run_deferred(&mut batch);
-            firsts.push(lists.len());
+            // Legacy buffer states decay at ExecuteCommandLists boundaries.
+            // Keep dependent transfers and surrounding shader work in
+            // separate executions. Independent transfers can run together.
+            let starts_group = match segment {
+                QueueSegment::Commands => previous_copy,
+                QueueSegment::Copy { starts_group } => starts_group || !previous_copy,
+            };
+            if i != 0 && (starts_group || timed) {
+                groups.push((lists.len(), i));
+            }
+            previous_copy = matches!(segment, QueueSegment::Copy { .. });
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        let (pending, touches) = Pending::of(runs);
+        let writes = batch.snapshot_writes();
+        let (pending, touches) = Pending::of(&runs, roots, writes);
         let prepared = std::time::Instant::now();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-        // Diagnostics: each list on its own, timed and waited for
-        // (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
+        for (group, &(first, i)) in groups.iter().enumerate() {
+            let end = groups.get(group + 1).map_or(lists.len(), |&(end, _)| end);
             let started = std::time::Instant::now();
-            // SAFETY: closed lists, not running (waited for above); our fence.
-            let signalled = unsafe {
-                self.queue.ExecuteCommandLists(group);
-                self.queue.Signal(&self.fence, *submitted)
-            };
-            if let Err(e) = signalled {
-                // Nothing would finish it.
-                fail(format_args!(
-                    "a host submission of {} lists was not signalled ({e}){}",
-                    runs.len(),
-                    self.removal_data(runs)
-                ));
+            // SAFETY: closed lists and a live direct queue.
+            unsafe { self.queue.ExecuteCommandLists(&lists[first..end]) };
+            if timed || group + 1 == groups.len() {
+                *submitted += 1;
+                // SAFETY: our fence on our direct queue.
+                if let Err(e) = unsafe { self.queue.Signal(&self.fence, *submitted) } {
+                    fail(format_args!(
+                        "a host submission of {} lists was not signalled ({e}){}",
+                        runs.len(),
+                        self.removal_data(&runs)
+                    ));
+                }
+            }
+            if timed {
+                self.wait_gpu(*submitted, true);
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 {
-                self.wait_gpu(*submitted, true);
-                if started.elapsed() > std::time::Duration::from_millis(50) {
-                    // SAFETY: a plain query.
-                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                    let commands = runs[i]
-                        .notes
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .len();
-                    tracing::warn!(
-                        ms = started.elapsed().as_millis(),
-                        commands,
-                        "slow host list"
-                    );
-                    for (ms, op) in runs[i].slowest(frequency, 6) {
-                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
-                    }
+            if timed && started.elapsed() > std::time::Duration::from_millis(50) {
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                for (ms, op) in runs[i].slowest(frequency, 6) {
+                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
             let _ = (i, started);
         }
-        let _ = &firsts;
-        for list in runs {
+        // The root owns its continuations until this fence. A continuation
+        // has no independent submission lifetime, including when retired.
+        for list in roots {
             list.last.store(*submitted, Ordering::Release);
         }
         self.timeline.push(*submitted, touches, pending);
-        #[cfg(feature = "diagnostics")]
-        if groups.len() > 1 {
+        if timed {
             self.settle(*submitted);
         }
     }
@@ -979,15 +1202,12 @@ impl Host {
         // it (the world's passes declare the same big ranges dozens of
         // times).
         let copying = std::time::Instant::now();
-        for (shadow, address, len) in &p.back {
-            let written = shadow.copy_back(*address, *len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-        }
+        let written = p.back.copy_back();
+        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for &(at, what, bytes) in &p.writes {
             what.write(at as *mut u8, bytes);
         }
-        self.log_messages();
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1167,6 +1387,84 @@ impl Host {
 }
 
 impl HostList {
+    fn continuations(&self) -> std::sync::MutexGuard<'_, Vec<Continuation>> {
+        self.continuations.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn recording(&self) -> Option<(Arc<HostList>, bool)> {
+        if !self.has_buffer_copies.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut parts = self.continuations();
+        match parts.last()? {
+            Continuation::Commands(list) => return Some((list.clone(), false)),
+            Continuation::Copy(_) => {}
+        }
+        let current = parts
+            .iter()
+            .rev()
+            .find_map(|part| match part {
+                Continuation::Commands(list) => Some(list.as_ref()),
+                Continuation::Copy(_) => None,
+            })
+            .unwrap_or(self);
+        let mut next = host().unwrap().new_list().unwrap_or_else(|e| {
+            fail(format_args!(
+                "a buffer copy continuation did not open ({e})"
+            ))
+        });
+        *next.budget.get_mut().unwrap_or_else(|e| e.into_inner()) =
+            current.budget.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        next.deferred().budget_zeroed = current.deferred().budget_zeroed;
+        let next = Arc::new(next);
+        parts.push(Continuation::Commands(next.clone()));
+        Some((next, true))
+    }
+
+    pub(crate) fn mark_buffer_access(&self) {
+        self.may_access_buffers.store(true, Ordering::Relaxed);
+    }
+
+    fn may_access_buffers(&self) -> bool {
+        self.may_access_buffers.load(Ordering::Relaxed) || !self.deferred().copies.is_empty()
+    }
+
+    /// Ends native recording before an ordered title buffer copy. A
+    /// continuation is only created if more commands are recorded.
+    pub(crate) fn buffer_copy(
+        &self,
+        dst: crate::object::This,
+        to: usize,
+        src: crate::object::This,
+        from: usize,
+        len: usize,
+    ) {
+        if len == 0 || to == from {
+            return;
+        }
+        if overlaps((to, len), (from, len)) {
+            tracing::warn!(to, from, len, "overlapping title buffer copy");
+            return;
+        }
+        let mut parts = self.continuations();
+        match parts.last() {
+            Some(Continuation::Commands(current)) => current.close_native(),
+            Some(Continuation::Copy(_)) => {}
+            None => self.close_native(),
+        }
+        parts.push(Continuation::Copy(Arc::new(BufferCopy {
+            to,
+            from,
+            len,
+            buffers: [
+                crate::resource::BufferLease::new(src),
+                crate::resource::BufferLease::new(dst),
+            ],
+            native: OnceLock::new(),
+        })));
+        self.has_buffer_copies.store(true, Ordering::Relaxed);
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -1244,6 +1542,14 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        match self.continuations().last() {
+            Some(Continuation::Commands(last)) => last.close_native(),
+            Some(Continuation::Copy(_)) => {}
+            None => self.close_native(),
+        }
+    }
+
+    fn close_native(&self) {
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1308,13 +1614,15 @@ impl HostList {
                     deferred: std::mem::take(&mut *self.deferred()),
                     scratch: std::mem::take(&mut *scratch),
                     states: std::mem::take(&mut *states),
-                    budget: budget.take(),
+                    budget: std::mem::take(&mut *budget),
+                    continuations: std::mem::take(&mut *self.continuations()),
                 };
                 host.after(move || retired.retire());
                 // Still named by that submission: dropping waits for it.
                 self.fresh_after
                     .store(self.last.load(Ordering::Acquire), Ordering::Release);
             } else {
+                self.continuations().clear();
                 *self.deferred() = Deferred::default();
                 self.states
                     .lock()
@@ -1329,6 +1637,7 @@ impl HostList {
             }
             allocator.clone()
         };
+        self.has_buffer_copies.store(false, Ordering::Relaxed);
         self.pipelines
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1340,6 +1649,11 @@ impl HostList {
         if let Err(e) = unsafe { self.list.Reset(&allocator, None) } {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+    }
+
+    pub(crate) fn reset_title(&self) {
+        self.reset();
+        self.may_access_buffers.store(false, Ordering::Relaxed);
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -1560,18 +1874,15 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = {
-            let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
-            if budget.is_none() {
-                let (b, d) = host()?.shared_buffer(256)?;
-                *budget = Some((b, d as usize));
-            }
-            budget.clone()?
-        };
+        let budget = self.budget.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (buffer, data) = budget.get_or_init(|| {
+            let (buffer, data) = host()?.shared_buffer(256)?;
+            Some((buffer, data as usize))
+        }).as_ref()?;
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = data;
+            let at = *data;
             // SAFETY: the list's own mapped word, written before it runs.
             deferred.copies.push(Step::Host(
                 Box::new(move || unsafe { (at as *mut u32).write_volatile(0) }),
@@ -1584,7 +1895,7 @@ impl HostList {
 
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
-        if let Ok(object) = object.cast::<windows::core::IUnknown>() {
+        if let Ok(object) = object.cast::<ID3D12Object>() {
             self.deferred().kept.push(object);
         }
     }
@@ -1633,6 +1944,39 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    fn needs_title_bytes(&self, pending: &[ShadowRange]) -> bool {
+        let depends = |range| {
+            pending
+                .iter()
+                .any(|(_, from, to)| overlaps(range, (*from, to - from)))
+        };
+        self.deferred().copies.iter().any(|step| match *step {
+            Step::Fill(_, src, len) | Step::Host(_, (src, len)) => depends((src, len)),
+            // A mapped fallback changes title bytes. Keep its refreshes
+            // after prior GPU readers as well as prior GPU writers.
+            Step::Copy(..) => true,
+            // Overlapping title ranges can resolve to separate native
+            // shadows. Refresh an alias after the producer's copyback.
+            Step::Refresh(ref shadow, at, len) => pending.iter().any(|(other, from, to)| {
+                !Arc::ptr_eq(shadow, other) && overlaps((at, len), (*from, to - from))
+            }),
+            Step::Texture(ref staging) => {
+                let (from, to) = staging.range();
+                depends((from, to - from))
+            }
+            Step::Run(..) => !pending.is_empty(),
+            _ => false,
+        })
+    }
+
+    fn add_gpu_writes(&self, pending: &mut Vec<ShadowRange>) {
+        for step in &self.deferred().copies {
+            if let Step::GpuWrite(shadow, address, len) = step {
+                pending.push((shadow.clone(), *address, address + len));
+            }
+        }
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
@@ -1640,29 +1984,16 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
-            let copied = match step {
+            match step {
                 &Step::Copy(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
-                    }
                     batch.settle(src, len, false);
                     batch.settle(dst, len, true);
                     batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    len
+                    run_mapped_copy(dst, src, len, true);
                 }
                 &Step::Fill(dst, src, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Copies, 1);
-                        add(C::CopyBytes, len as u64);
-                    }
                     batch.settle(src, len, false);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                    len
+                    run_mapped_copy(dst, src, len, false);
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -1670,14 +2001,11 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
-                    // Title memory an earlier submission's shaders write is
-                    // current only once that one is copied back, if the
-                    // title wrote it since the copy took it.
-                    batch.settle_refresh(shadow, *address, *len);
                     batch.add(shadow, *address, *len);
-                    continue;
                 }
                 Step::Run(work, _, _) | Step::Host(work, _) => {
+                    #[cfg(feature = "diagnostics")]
+                    let started = std::time::Instant::now();
                     match *step {
                         Step::Run(_, (to, written), (from, read)) => {
                             batch.settle(from, read, false);
@@ -1693,16 +2021,13 @@ impl HostList {
                         add(C::Runs, 1);
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
-                    continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The range's snapshot is taken from the host copy, which
-                    // an earlier submission's shaders may still be writing;
-                    // the shaders start from the title's data.
+                    // Each native shadow has one snapshot. Finish its
+                    // previous writer before creating a new one.
                     batch.settle(*address, *len, false);
-                    batch.flush();
-                    shadow.writing(*address, *len);
-                    continue;
+                    batch.settle_shadow_write(shadow);
+                    batch.queue_write(shadow, *address, *len);
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
@@ -1710,13 +2035,27 @@ impl HostList {
                         batch.settle(from, to - from, false);
                         staging.refresh(|| batch.settle_staging(staging));
                     }
-                    continue;
                 }
-            };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
+}
+
+fn run_mapped_copy(dst: usize, src: usize, len: usize, title_dst: bool) {
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Copies, 1);
+        add(C::CopyBytes, len as u64);
+    }
+    let started = std::time::Instant::now();
+    copy_mapped(dst as *mut u8, src as *const u8, len, title_dst);
+    PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    PREPARING[1].fetch_add(len as u64, Ordering::Relaxed);
+}
+
+fn overlaps((a, a_len): (usize, usize), (b, b_len): (usize, usize)) -> bool {
+    a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -1729,11 +2068,33 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch<'a> {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<ShadowRange>,
+    writes: Vec<ShadowRange>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
     /// The host, whose earlier submissions may still be in flight.
     host: Option<&'a Host>,
+}
+
+type ShadowRange = (Arc<crate::shadow::Shadow>, usize, usize);
+
+struct GpuWrites {
+    ranges: Vec<ShadowRange>,
+    snapshots: Vec<ShadowRange>,
+}
+
+impl GpuWrites {
+    fn copy_back(self) -> usize {
+        let written = self
+            .ranges
+            .into_iter()
+            .map(|(shadow, from, to)| shadow.copy_back(from, to - from))
+            .sum();
+        for (shadow, ..) in self.snapshots {
+            shadow.finish_writes();
+        }
+        written
+    }
 }
 
 impl Batch<'_> {
@@ -1754,25 +2115,60 @@ impl Batch<'_> {
         }
     }
 
-    /// Before a refresh of `[address, address + len)` of `shadow`: as
-    /// [`Batch::settle`], but a submission whose shaders write the range
-    /// through the same copy is waited for only if the title wrote a page
-    /// of the overlap since the copy took it (the world's big heap is both
-    /// refreshed and written by shaders in most submissions).
-    fn settle_refresh(
-        &self,
-        shadow: &std::sync::Arc<crate::shadow::Shadow>,
-        address: usize,
-        len: usize,
-    ) {
-        let Some(host) = self.host else { return };
-        let copy = std::sync::Arc::as_ptr(shadow) as usize;
-        let to = address.saturating_add(len);
-        if let Some(value) = host
-            .timeline
-            .refresh_conflict(copy, address, to, |a, b| shadow.stale(a, b))
+    fn settle_shadow_write(&self, shadow: &Arc<crate::shadow::Shadow>) {
+        if let Some(host) = self.host
+            && let Some(value) = host.timeline.shadow_writer(Arc::as_ptr(shadow) as usize)
         {
             host.settle(value);
+        }
+    }
+
+    fn queue_write(&mut self, shadow: &Arc<crate::shadow::Shadow>, from: usize, len: usize) {
+        self.flush();
+        shadow.queue_write(from, len);
+        self.writes.push((shadow.clone(), from, from + len));
+    }
+
+    fn snapshot_writes(&mut self) -> GpuWrites {
+        let mut writes = std::mem::take(&mut self.writes);
+        let mut extents = std::collections::HashMap::new();
+        for (shadow, from, to) in &writes {
+            let (_, first, end) = extents
+                .entry(Arc::as_ptr(shadow))
+                .or_insert_with(|| (shadow.clone(), *from, *to));
+            *first = (*first).min(*from);
+            *end = (*end).max(*to);
+        }
+        let mut snapshots: Vec<_> = extents.into_values().collect();
+        snapshots.sort_unstable_by_key(|(_, from, _)| *from);
+        for (shadow, from, to) in &snapshots {
+            shadow.snapshot(*from, to - from);
+        }
+        // Distinct shadows can cover the same title address. Preserve
+        // declaration order in that case so the later copyback wins.
+        if snapshots.windows(2).any(|pair| pair[0].2 > pair[1].1) {
+            let mut seen = std::collections::HashSet::new();
+            writes.retain(|(s, from, to)| seen.insert((Arc::as_ptr(s), *from, *to)));
+            return GpuWrites {
+                ranges: writes,
+                snapshots,
+            };
+        }
+        writes.sort_unstable_by_key(|(shadow, from, _)| (Arc::as_ptr(shadow), *from));
+        let mut merged: Vec<ShadowRange> = Vec::new();
+        for (shadow, from, to) in writes {
+            if let Some((previous, _, end)) = merged.last_mut()
+                && Arc::ptr_eq(previous, &shadow)
+                && from <= *end
+            {
+                *end = (*end).max(to);
+            } else {
+                merged.push((shadow, from, to));
+            }
+        }
+        GpuWrites {
+            ranges: merged,
+            snapshots,
         }
     }
 
@@ -1804,7 +2200,20 @@ impl Batch<'_> {
     fn flush(&mut self) {
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
+            // Copyback can reconcile bytes into the mapped shadow even
+            // when its title input remains unchanged.
+            if let Some(host) = self.host {
+                host.settle_range(from, to - from, false);
+            }
+            let copied = shadow.update(from, to - from, |first, end| {
+                if let Some(host) = self.host
+                    && let Some(value) = host.timeline.shadow_reader(Arc::as_ptr(&shadow) as usize, first, end)
+                {
+                    // The watch coverage lock can be held here. Wait only
+                    // for native reads, without running CPU copyback.
+                    host.wait_gpu(value, true);
+                }
+            });
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);

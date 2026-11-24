@@ -48,6 +48,8 @@ pub(crate) struct Touches {
     pub(crate) labels: Vec<(usize, usize)>,
     /// What it reads (host copies and textures brought up to date for it).
     pub(crate) reads: Vec<(usize, usize)>,
+    /// Mapped host shadow reads, by shadow identity and title range.
+    pub(crate) shadow_reads: Vec<(usize, usize, usize)>,
     /// Shared texture upload buffers that the GPU may still read.
     pub(crate) staging: std::collections::HashSet<usize>,
 }
@@ -57,9 +59,9 @@ struct Entry<W> {
     value: u64,
     /// Everything it writes, shaders' and labels'.
     writes: Ranges,
-    labels: Ranges,
     shaders: Vec<(usize, usize, usize)>,
     reads: Ranges,
+    shadow_reads: Vec<(usize, usize, usize)>,
     staging: std::collections::HashSet<usize>,
     /// Title fence signals the title queued after it.
     signals: Vec<Signal>,
@@ -94,6 +96,7 @@ impl<W> Timeline<W> {
             shaders,
             labels,
             reads,
+            shadow_reads,
             staging,
         } = touches;
         let writes = shaders
@@ -103,9 +106,9 @@ impl<W> Timeline<W> {
         self.entries().push_back(Entry {
             value,
             writes: Ranges::new(writes.collect()),
-            labels: Ranges::new(labels),
             shaders,
             reads: Ranges::new(reads),
+            shadow_reads,
             staging,
             signals: Vec::new(),
             work: Some(work),
@@ -158,45 +161,26 @@ impl<W> Timeline<W> {
             .map(|e| e.value)
     }
 
-    /// For a refresh of `[from, to)` through the host copy `copy`: the
-    /// newest submission not finished yet it must wait for. One whose
-    /// bottom-of-pipe writes overlap the range counts, and so does one whose
-    /// shaders write it through another copy; one whose shaders write it
-    /// through this copy counts only if `stale` says the title wrote some of
-    /// the overlap since the copy took it. Otherwise the copy already holds
-    /// what the refresh would bring, and those shaders' writes reach it in
-    /// queue order.
-    pub(crate) fn refresh_conflict(
-        &self,
-        copy: usize,
-        from: usize,
-        to: usize,
-        stale: impl Fn(usize, usize) -> bool,
-    ) -> Option<u64> {
-        if from >= to {
-            return None;
-        }
-        let (mut must, mut parts) = (None, Vec::new());
-        for e in self.entries().iter() {
-            if e.labels.overlaps(from, to) {
-                must = Some(e.value);
-            }
-            for &(c, a, b) in e.shaders.iter().filter(|&&(_, a, b)| a < to && b > from) {
-                if c == copy {
-                    parts.push((e.value, a.max(from), b.min(to)));
-                } else {
-                    must = Some(e.value);
-                }
-            }
-        }
-        // Asked outside the lock, newest first.
-        parts.sort_unstable_by_key(|p| std::cmp::Reverse(p.0));
-        parts
-            .into_iter()
-            .take_while(|&(v, ..)| must.is_none_or(|m| v > m))
-            .find(|&(_, a, b)| stale(a, b))
-            .map(|(v, ..)| v)
-            .or(must)
+    /// A native shadow receives one copyback snapshot at a time.
+    pub(crate) fn shadow_writer(&self, copy: usize) -> Option<u64> {
+        self.entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.shaders.iter().any(|&(shadow, ..)| shadow == copy))
+            .map(|entry| entry.value)
+    }
+
+    /// Latest use of the native shadow bytes a CPU refill would change.
+    pub(crate) fn shadow_reader(&self, copy: usize, from: usize, to: usize) -> Option<u64> {
+        self.entries()
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.shadow_reads.iter().any(|&(shadow, start, end)| {
+                    shadow == copy && start < to && from < end
+                })
+            })
+            .map(|entry| entry.value)
     }
 
     /// Blocks until a submission is left; its value.
@@ -314,21 +298,16 @@ mod tests {
         // Next to, not in.
         assert_eq!(t.conflict(0x2000, 0x5000, true), None);
         assert_eq!(t.conflict(0x9004, 0x9008, true), None);
-        // A refresh through copy 1 waits only where the title wrote the
-        // overlap; labels and other copies always count.
-        let clean = |_: usize, _: usize| false;
-        let dirty_at = |at: usize| move |a: usize, b: usize| (a..b).contains(&at);
-        assert_eq!(t.refresh_conflict(1, 0x1000, 0x2000, clean), None);
-        assert_eq!(
-            t.refresh_conflict(1, 0x1000, 0x2000, dirty_at(0x1100)),
-            Some(1)
-        );
-        assert_eq!(
-            t.refresh_conflict(1, 0x1000, 0x2000, dirty_at(0x1880)),
-            Some(2)
-        );
-        assert_eq!(t.refresh_conflict(2, 0x1000, 0x1010, clean), Some(1));
-        assert_eq!(t.refresh_conflict(1, 0x8000, 0x9001, clean), Some(1));
+        assert_eq!(t.shadow_writer(1), Some(2));
+        assert_eq!(t.shadow_writer(2), None);
+        let test = Touches {
+            shadow_reads: vec![(1, 0x5000, 0x6000)],
+            ..Touches::default()
+        };
+        t.push(3, test, ());
+        assert_eq!(t.shadow_reader(1, 0x5800, 0x5900), Some(3));
+        assert_eq!(t.shadow_reader(1, 0x6000, 0x6100), None);
+        assert_eq!(t.shadow_reader(2, 0x5800, 0x5900), None);
         t.finish(2, |()| {});
         assert_eq!(t.conflict(0x1000, 0x2000, true), None);
     }
