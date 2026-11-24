@@ -117,10 +117,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -183,7 +184,19 @@ fn create() -> windows::core::Result<Host> {
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+        create_with_device(device.ok_or_else(windows::core::Error::empty)?, debug)
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn install_hiz_test_device(device: ID3D12Device) -> &'static Host {
+    assert!(HOST.set(Some(create_with_device(device, false).unwrap())).is_ok());
+    host().unwrap()
+}
+
+fn create_with_device(device: ID3D12Device, debug: bool) -> windows::core::Result<Host> {
+    // SAFETY: plain D3D12 object creation on the supplied live device.
+    unsafe {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

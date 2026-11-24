@@ -1148,6 +1148,10 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+#[path = "draw/hiz_tests.rs"]
+mod hiz_tests;
+
 /// A view in a few words (diagnostics builds).
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {
