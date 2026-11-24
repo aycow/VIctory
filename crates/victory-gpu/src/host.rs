@@ -1469,7 +1469,6 @@ fn refresh_direct_srvs(
         return Vec::new();
     };
     let started = std::time::Instant::now();
-    let _pass = crate::watch::ReservationPass::begin();
     let selection: Vec<_> = heaps
         .iter()
         .map(|heap| {

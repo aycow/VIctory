@@ -131,17 +131,15 @@ fn private_from_basic(address: usize, start: usize) -> Option<bool> {
 /// and protection. Resolve this optionally so older Win32 providers still
 /// use the non-reset GetWriteWatch preflight.
 pub(crate) fn allocation(address: usize) -> Option<Allocation> {
-    // Inside a refresh pass, reservations already looked up in it: a world
-    // frame's refresh asks for hundreds of thousands of ranges'
-    // reservations, each a system call (two under Wine), and the title's
-    // allocations elsewhere change the revision so often that an answer is
-    // rarely still live for the next range. A mapping change removes the
-    // entries its range overlaps (`record_mapping_change`); an entry no
-    // change has touched is still live at the current revision. Entries
-    // last one pass only, so a change that is not reported can't outlive it.
-    if PASS.with(|depth| depth.get()) == 0 {
-        return query_allocation(address);
-    }
+    // Views already looked up: a world frame's refresh asks for hundreds
+    // of thousands of ranges' reservations, each a system call (two under
+    // Wine), mostly for a few thousand views of title physical memory, and
+    // each comes up about once per refresh. The title's allocations
+    // elsewhere change the revision so often that an answer is rarely still
+    // live for its next use. Views are mapped and unmapped only through
+    // `title_memory_remapped`, which removes the entries its range overlaps
+    // (`record_mapping_change`), so an entry none has touched is still live
+    // at the current revision.
     let mut cache = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, &found)) = cache.range(..=address).next_back()
         && address < found.end
@@ -152,39 +150,17 @@ pub(crate) fn allocation(address: usize) -> Option<Allocation> {
     // Asked while the cache is held: a mapping change reported meanwhile
     // waits in `forget_allocations` and then removes what this inserts.
     let found = query_allocation(address)?;
-    cache.insert(found.start, found);
+    // Private memory is asked about every time: the title can allocate and
+    // free it through paths that report nothing here (its heap, for one),
+    // and a stale extent or commit size there would group or zero the wrong
+    // pages.
+    if !found.private {
+        cache.insert(found.start, found);
+    }
     Some(found)
 }
 
-thread_local! {
-    /// How many refresh passes this thread is inside.
-    static PASS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// One refresh pass: while it lives, this thread's reservation lookups are
-/// answered from the reservations already looked up since it began.
-pub(crate) struct ReservationPass(());
-
-impl ReservationPass {
-    pub(crate) fn begin() -> Self {
-        if PASS.with(|depth| depth.replace(depth.get() + 1)) == 0 {
-            ALLOCATIONS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-        }
-        ReservationPass(())
-    }
-}
-
-impl Drop for ReservationPass {
-    fn drop(&mut self) {
-        PASS.with(|depth| depth.set(depth.get() - 1));
-    }
-}
-
-/// Reservations looked up in the current pass, less those a mapping change
-/// has touched since.
+/// Views looked up, less those a mapping change has touched since.
 static ALLOCATIONS: Mutex<BTreeMap<usize, Allocation>> = Mutex::new(BTreeMap::new());
 
 /// Drops the looked-up reservations overlapping `[at, end)`.
@@ -737,57 +713,53 @@ pub(crate) mod tests {
 
     /// A private reservation is reported private, a mapped view is not
     /// (Wine fills no region flags, so this checks the fallback there).
-    /// Within a refresh pass, a reservation is asked about once until a
-    /// mapping change over it.
+    /// A view is asked about once until a mapping change over it; private
+    /// memory is asked about every time.
     #[test]
-    fn allocation_lookups_are_cached_within_a_pass_until_a_mapping_change() {
-        // SAFETY: a fresh reservation of ours.
-        let p = unsafe {
-            VirtualAlloc(
+    fn view_lookups_are_cached_until_a_mapping_change() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile,
+        };
+        // SAFETY: a fresh section and views of ours, and a fresh reservation.
+        let (view, other, private) = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
                 std::ptr::null(),
-                2 * PAGE,
-                MEM_RESERVE | MEM_COMMIT,
                 PAGE_READWRITE,
-            )
-        } as usize;
-        assert_ne!(p, 0);
+                0,
+                2 * PAGE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE);
+            let other = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE);
+            CloseHandle(section);
+            let private =
+                VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            (view.Value as usize, other.Value as usize, private as usize)
+        };
+        assert!(view != 0 && other != 0 && private != 0);
         let asked = || ALLOCATION_QUERIES.with(|calls| calls.get());
-        let outside = asked();
-        allocation(p);
-        allocation(p);
-        assert_eq!(asked(), outside + 2, "no cache outside a refresh pass");
-        let _pass = ReservationPass::begin();
-        let Some(first) = allocation(p) else {
+        let Some(first) = allocation(view) else {
             return;
         };
+        assert!(!first.private);
         let before = asked();
-        assert_eq!(allocation(p + PAGE).map(|a| a.start), Some(first.start));
+        assert_eq!(allocation(view + PAGE).map(|a| a.start), Some(first.start));
         assert_eq!(asked(), before, "answered from the cache");
-        title_memory_allocation_changed(p, PAGE);
-        assert!(allocation(p).is_some());
-        assert_eq!(asked(), before + 1, "asked again after a mapping change");
         // A change elsewhere leaves the entry, and it is still live.
-        // SAFETY: another fresh reservation of ours.
-        let q = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                PAGE,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_READWRITE,
-            )
-        } as usize;
-        assert_ne!(q, 0);
-        title_memory_allocation_changed(q, PAGE);
-        let still = allocation(p).unwrap();
-        assert!(still.is_live(), "live at the new revision");
-        assert_eq!(asked(), before + 1, "a change elsewhere keeps the entry");
-        // Nothing survives the pass, reported or not.
-        drop(_pass);
-        let _next = ReservationPass::begin();
-        allocation(p);
-        assert_eq!(asked(), before + 2, "asked again in the next pass");
-        // Not freed: the journal keeps the changes, and a later test given
-        // the same addresses would see them.
+        title_memory_remapped(other, PAGE);
+        assert!(allocation(view).unwrap().is_live(), "live at the new revision");
+        assert_eq!(asked(), before, "a change elsewhere keeps the entry");
+        title_memory_remapped(view, PAGE);
+        assert!(allocation(view).is_some());
+        assert_eq!(asked(), before + 1, "asked again after a change over it");
+        assert!(allocation(private).unwrap().private);
+        assert!(allocation(private).is_some());
+        assert_eq!(asked(), before + 3, "private memory is asked about every time");
+        // Not unmapped or freed: the journal keeps the changes, and a later
+        // test given the same addresses would see them.
     }
 
     #[test]
