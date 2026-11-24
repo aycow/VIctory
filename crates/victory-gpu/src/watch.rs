@@ -516,12 +516,14 @@ mod tests {
         assert_eq!(guard(b, b + BLOCK), Some(vec![b / PAGE]));
         // Remove the alias, then guard a on its own before adding an alias back.
         writing(a, BLOCK);
+        // SAFETY: b is a live view owned by the fixture.
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut _ }) };
         title_memory_remapped(b, BLOCK);
         B.store(0, Ordering::Relaxed);
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
         assert_eq!(guard(a, a + BLOCK), Some(vec![]), "clean before mapping an alias");
 
+        // SAFETY: The fixture owns the live section and requests a view of its committed bytes.
         let late = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK) }.Value as usize;
         assert_ne!(late, 0);
         title_memory_remapped(late, BLOCK);
@@ -529,12 +531,15 @@ mod tests {
         reopen_guarded_aliases(&[a]);
 
         // The real bytes are shared. The original guarded observer must refresh.
+        // SAFETY: The test owns the mapped view, and its store is within the block.
         unsafe { ((late + 16) as *mut u8).write_volatile(19) };
+        // SAFETY: The original view remains mapped and the byte is within its block.
         let observed = unsafe { ((a + 16) as *const u8).read_volatile() };
         let dirty = guard(a, a + BLOCK);
         assert_eq!(guard(a, a + BLOCK), Some(vec![]), "rearmed after mapping an alias");
 
         // A second write now has to fault through the newly guarded view.
+        // SAFETY: The fixture owns this mapped byte and the installed handler reopens its guard.
         unsafe { ((late + 16) as *mut u8).write_volatile(20) };
         let rearmed = guard(a, a + BLOCK);
 
@@ -545,6 +550,7 @@ mod tests {
             unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ }) };
             title_memory_remapped(v, BLOCK);
         }
+        // SAFETY: The fixture owns the section handle and no longer needs it.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(section) };
         assert_eq!(observed, 19);
         assert_eq!(dirty, Some(vec![a / PAGE]), "write through an alias mapped after the guard");
