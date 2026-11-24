@@ -568,6 +568,23 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+fn supports_typed_uav(device: &ID3D12Device, format: DXGI_FORMAT) -> bool {
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: format,
+        ..Default::default()
+    };
+    // SAFETY: `support` is sized and initialized for D3D12_FEATURE_FORMAT_SUPPORT.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok()
+        && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -576,7 +593,12 @@ fn buffer_uav(
 /// family takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+fn fits(
+    device: &ID3D12Device,
+    texture: &ID3D12Resource,
+    mut format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -596,7 +618,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         return false;
     }
     // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
+    let is_typeless = |f: u32| family(f) == f && family(f + 1) == f;
+    let typeless = is_typeless(own);
     if let Some(format) = format.as_deref_mut()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
@@ -607,10 +630,27 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return !typeless && (!unordered || supports_typed_uav(device, d.Format));
     }
-    if family(view) != family(own) {
+    if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == view) {
+        once!(unordered, view, own, "view the host does not allow");
+        return false;
+    }
+    if family(view) != family(own) || (typeless && is_typeless(view)) {
         once!(view, own, "view format of another family");
+        return false;
+    }
+    let effective = if typeless {
+        DXGI_FORMAT(view as i32)
+    } else {
+        d.Format
+    };
+    if unordered && !supports_typed_uav(device, effective) {
+        once!(
+            view = effective.0,
+            own,
+            "view format does not support typed unordered access"
+        );
         return false;
     }
     if let Some(format) = format
@@ -649,7 +689,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
                 let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                if let Some(desc) = desc.as_mut()
+                    && desc.Format.0 == 0
+                    && let Some(format) = crate::resource::view_format(resource)
+                {
+                    desc.Format = DXGI_FORMAT(format as i32);
+                }
+                if !fits(device, texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -680,7 +726,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
             };
             let mut desc = desc.as_ref().map(uav_desc);
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            if let Some(desc) = desc.as_mut()
+                && desc.Format.0 == 0
+                && let Some(format) = crate::resource::view_format(resource)
+            {
+                desc.Format = DXGI_FORMAT(format as i32);
+            }
+            if !fits(device, texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -717,10 +769,6 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -736,11 +784,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A view of a texture the title placed in memory itself, as a view of
+/// the resource made for that memory (on first use).
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
@@ -748,7 +796,12 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let view_desc = desc[..10].try_into().ok();
+    Some(if *unordered {
+        View::Unordered(texture as usize, 0, view_desc)
+    } else {
+        View::Shader(texture as usize, view_desc)
+    })
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -972,5 +1025,445 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    fn placed_tex_desc(width: u64, height: u32, format: u32, flags: u32) -> [u32; 14] {
+        [
+            3,
+            0,
+            0,
+            0,
+            width as u32,
+            (width >> 32) as u32,
+            height,
+            1 | (1 << 16),
+            format,
+            1,
+            0,
+            0,
+            flags,
+            0,
+        ]
+    }
+
+    fn placed_tex_uav_desc(va: u64, view_format: u32) -> [u32; 16] {
+        let mut desc = [0u32; 16];
+        desc[0] = view_format;
+        desc[1] = 4; // D3D12_UAV_DIMENSION_TEXTURE2D
+        desc[10] = va as u32;
+        desc[11] = (va >> 32) as u32;
+        desc
+    }
+
+    fn placed_tex_srv_desc(va: u64, view_format: u32) -> [u32; 16] {
+        let mut desc = [0u32; 16];
+        desc[0] = view_format;
+        desc[1] = 4; // D3D12_SRV_DIMENSION_TEXTURE2D
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[5] = 1; // MipLevels
+        desc[10] = va as u32;
+        desc[11] = (va >> 32) as u32;
+        desc
+    }
+
+    fn compile_compute(
+        source: &str,
+        device: &ID3D12Device,
+    ) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: source and entrypoint names are valid for the duration of the call.
+        let compiled = unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("placed_uav_test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(e) = compiled {
+            let msg = errors
+                .map(|b| {
+                    // SAFETY: blob owns its error message bytes.
+                    unsafe {
+                        String::from_utf8_lossy(std::slice::from_raw_parts(
+                            b.GetBufferPointer().cast::<u8>(),
+                            b.GetBufferSize(),
+                        ))
+                        .into_owned()
+                    }
+                })
+                .unwrap_or_default();
+            panic!("D3DCompile failed ({e}): {msg}");
+        }
+        let code = code.unwrap();
+        // SAFETY: blob owns compiled DXBC with embedded root signature.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let pso = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        }
+    }
+
+    #[test]
+    fn placed_uav_textures_create_real_host_uavs() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 32) else {
+            return;
+        };
+        let cases = [
+            (28u32, 28u32, 4u32, true),  // R8G8B8A8_UNORM
+            (27u32, 28u32, 4u32, true),  // R8G8B8A8_TYPELESS -> R8G8B8A8_UNORM
+            (29u32, 29u32, 4u32, true),  // R8G8B8A8_UNORM_SRGB -> linear R8G8B8A8_UNORM
+            (29u32, 0u32, 4u32, true),   // R8G8B8A8_UNORM_SRGB + UNKNOWN -> linear 28
+            (91u32, 91u32, 4u32, true),  // B8G8R8A8_UNORM_SRGB -> linear B8G8R8A8_UNORM
+            (91u32, 0u32, 4u32, true),   // B8G8R8A8_UNORM_SRGB + UNKNOWN -> linear 87
+            (28u32, 28u32, 0u32, false), // missing ALLOW_UNORDERED_ACCESS -> null fallback
+            (93u32, 93u32, 4u32, false), // B8G8R8X8_UNORM_SRGB -> unsupported typed UAV
+            (93u32, 0u32, 4u32, false),  // B8G8R8X8_UNORM_SRGB + UNKNOWN -> unsupported typed UAV
+            (92u32, 88u32, 4u32, false), // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM unsupported UAV
+            (92u32, 93u32, 4u32, false), // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM_SRGB unsupported UAV
+            (40u32, 40u32, 4u32, false), // D32_FLOAT + UAV flag (no depth flag) -> null fallback
+            (55u32, 55u32, 4u32, false), // D16_UNORM + UAV flag (no depth flag) -> null fallback
+            (39u32, 40u32, 4u32, false), // R32_TYPELESS + D32_FLOAT view -> null fallback
+            (53u32, 55u32, 4u32, false), // R16_TYPELESS + D16_UNORM view -> null fallback
+            (27u32, 27u32, 4u32, false), // R8G8B8A8_TYPELESS + typeless view -> null fallback
+        ];
+        let mut slots = [[0u32; 8]; 24];
+        for (idx, (res_fmt, view_fmt, flags, expect_real)) in cases.into_iter().enumerate() {
+            let backing = Box::leak(Box::new([0u8; 256]));
+            let va = backing.as_ptr() as u64;
+            let resource = placed_tex_desc(4, 4, res_fmt, flags);
+            let desc = placed_tex_uav_desc(va, view_fmt);
+            let slot_addr = slots[idx].as_mut_ptr() as u64;
+            crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &desc, slot_addr);
+            let view = crate::descriptor::view(slot_addr).unwrap();
+            assert!(matches!(
+                placed_texture(&view),
+                Some(View::Unordered(_, 0, Some(_)))
+            ));
+            assert!(heap.mirror(idx as u32, slot_addr, false).is_some());
+            assert!(
+                heap.kept.lock().unwrap()[idx].is_none(),
+                "case {idx} mirror(false) should defer host creation"
+            );
+            let mirrored = heap.mirror(idx as u32, slot_addr, true).unwrap();
+            let dyn_slot = heap.count() + idx as u32;
+            heap.make_at(dyn_slot, &mirrored);
+            let kept = heap.kept.lock().unwrap();
+            assert_eq!(kept[idx].is_some(), expect_real, "case {idx} mirror");
+            assert_eq!(
+                kept[dyn_slot as usize].is_some(),
+                expect_real,
+                "case {idx} make_at"
+            );
+        }
+        for (offset, (res_fmt, view_fmt, expect_real)) in [
+            (39u32, 40u32, false), // R32_TYPELESS + D32_FLOAT SRV -> null fallback
+            (53u32, 55u32, false), // R16_TYPELESS + D16_UNORM SRV -> null fallback
+            (29u32, 0u32, true),   // R8G8B8A8_UNORM_SRGB + UAV + UNKNOWN SRV -> 29
+            (91u32, 0u32, true),   // B8G8R8A8_UNORM_SRGB + UAV + UNKNOWN SRV -> 91
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let idx = cases.len() + offset;
+            let backing = Box::leak(Box::new([0u8; 256]));
+            let va = backing.as_ptr() as u64;
+            let resource = placed_tex_desc(4, 4, res_fmt, 4);
+            let desc = placed_tex_srv_desc(va, view_fmt);
+            let slot_addr = slots[idx].as_mut_ptr() as u64;
+            crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, slot_addr);
+            heap.mirror(idx as u32, slot_addr, true).unwrap();
+            assert_eq!(
+                heap.kept.lock().unwrap()[idx].is_some(),
+                expect_real,
+                "srv case {offset}"
+            );
+        }
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn compute_dispatch_writes_placed_texture_and_buffer_uavs() {
+        use crate::object::{S_OK, This, guid, slot};
+        use crate::resource::{HeapProperties, ResourceDesc, create_committed};
+        use std::ffi::c_void;
+        use victory_shader::{ResourceType, RootType, UsedResource};
+
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+
+        let tex1_mem = Box::leak(Box::new([0x11u8; 256]));
+        let tex1_va = tex1_mem.as_ptr() as u64;
+        let tex1_res = placed_tex_desc(4, 4, 28, 4);
+        let tex1_uav_desc = placed_tex_uav_desc(tex1_va, 28);
+        let tex1_srv_desc = placed_tex_srv_desc(tex1_va, 28);
+
+        let tex2_mem = Box::leak(Box::new([0x22u8; 256]));
+        let tex2_va = tex2_mem.as_ptr() as u64;
+        // sRGB 29 + ALLOW_UNORDERED_ACCESS + DXGI_FORMAT_UNKNOWN (0) -> linear R8G8B8A8_UNORM (28)
+        let tex2_res = placed_tex_desc(4, 4, 29, 4);
+        let tex2_uav_desc = placed_tex_uav_desc(tex2_va, 0);
+
+        let buf_res = [1u32, 0, 0, 0, 256, 0, 1, 1 | (1 << 16), 0, 1, 0, 1, 0, 0];
+        let props = [1u32, 0, 0, 0, 0];
+        let resource_iid = guid(
+            0x6964_42be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut buf_obj: This = std::ptr::null();
+        assert_eq!(
+            create_committed(
+                std::ptr::null(),
+                props.as_ptr().cast::<HeapProperties>(),
+                0,
+                buf_res.as_ptr().cast::<ResourceDesc>(),
+                0,
+                std::ptr::null(),
+                &resource_iid,
+                &mut buf_obj,
+            ),
+            S_OK
+        );
+        let mut buf_ptr: *mut u8 = std::ptr::null_mut();
+        type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> i32;
+        assert_eq!(
+            slot::<Map>(buf_obj, 0x40)(buf_obj, 0, std::ptr::null(), &mut buf_ptr),
+            S_OK
+        );
+        let buf_va = buf_ptr as u64;
+        let mut buf_uav_desc = [0u32; 16];
+        buf_uav_desc[0] = 42; // DXGI_FORMAT_R32_UINT
+        buf_uav_desc[1] = 1; // D3D12_UAV_DIMENSION_BUFFER
+        buf_uav_desc[4] = 64; // NumElements
+        buf_uav_desc[10] = buf_va as u32;
+        buf_uav_desc[11] = (buf_va >> 32) as u32;
+
+        let mut title_slots = [[0u32; 8]; 3];
+        let slot0 = title_slots[0].as_mut_ptr() as u64;
+        let slot1 = title_slots[1].as_mut_ptr() as u64;
+        let slot2 = title_slots[2].as_mut_ptr() as u64;
+        crate::descriptor::create_placed_uav(std::ptr::null(), &tex1_res, &tex1_uav_desc, slot0);
+        crate::descriptor::create_placed_uav(std::ptr::null(), &buf_res, &buf_uav_desc, slot1);
+        crate::descriptor::create_placed_srv(std::ptr::null(), &tex1_res, &tex1_srv_desc, slot2);
+
+        let view0 = heap.mirror(0, slot0, true).unwrap();
+        let view1 = heap.mirror(1, slot1, true).unwrap();
+        let view2 = heap.mirror(2, slot2, true).unwrap();
+        let view3 = View::Placed(true, tex2_res, tex2_uav_desc);
+        heap.make_at(3, &view3);
+
+        let (root1, pso1) = compile_compute(
+            r#"
+            #define RS "DescriptorTable(UAV(u0, numDescriptors=2))"
+            RWTexture2D<float4> outTex : register(u0);
+            RWBuffer<uint> outBuf : register(u1);
+            [RootSignature(RS)]
+            [numthreads(4, 4, 1)]
+            void main(uint3 id : SV_DispatchThreadID) {
+                outTex[id.xy] = float4((id.x + 1.0) / 4.0, (id.y + 1.0) / 4.0, 0.25, 1.0);
+                if (id.x == 0 && id.y == 0) outBuf[0] = 0x1234ABCDu;
+            }
+            "#,
+            &host.device,
+        );
+        let (root2, pso2) = compile_compute(
+            r#"
+            #define RS "DescriptorTable(SRV(t0, numDescriptors=1)), DescriptorTable(UAV(u0, numDescriptors=1))"
+            Texture2D<float4> inTex : register(t0);
+            RWTexture2D<float4> outTex : register(u0);
+            [RootSignature(RS)]
+            [numthreads(4, 4, 1)]
+            void main(uint3 id : SV_DispatchThreadID) {
+                outTex[id.xy] = inTex.Load(int3(id.xy, 0));
+            }
+            "#,
+            &host.device,
+        );
+
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 2048,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+
+        let list = host.new_list().unwrap();
+        let uav_used = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let srv_used = UsedResource {
+            kind: ResourceType::Srv,
+            ..uav_used
+        };
+
+        // SAFETY: live heap, root signatures, PSOs, and resources on an open list.
+        unsafe {
+            let gpu_start = heap.heap.GetGPUDescriptorHandleForHeapStart();
+            let gpu_at = |idx: u32| D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: gpu_start.ptr + u64::from(idx) * u64::from(heap.step),
+            };
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+
+            crate::draw::readable(&list, &uav_used, &view0);
+            crate::draw::readable(&list, &uav_used, &view1);
+            list.list.SetComputeRootSignature(&root1);
+            list.list.SetPipelineState(&pso1);
+            list.list.SetComputeRootDescriptorTable(0, gpu_at(0));
+            list.list.Dispatch(1, 1, 1);
+
+            crate::draw::readable(&list, &srv_used, &view2);
+            crate::draw::readable(&list, &uav_used, &view3);
+            list.list.SetComputeRootSignature(&root2);
+            list.list.SetPipelineState(&pso2);
+            list.list.SetComputeRootDescriptorTable(0, gpu_at(2));
+            list.list.SetComputeRootDescriptorTable(1, gpu_at(3));
+            list.list.Dispatch(1, 1, 1);
+
+            let tex1_obj = crate::resource::texture_at(tex1_va, &tex1_res).unwrap();
+            let tex2_obj = crate::resource::texture_at(tex2_va, &tex2_res).unwrap();
+            crate::list::ensure_state(&list, tex1_obj, 0x800);
+            crate::list::ensure_state(&list, tex2_obj, 0x800);
+
+            for (offset, tex_obj) in [(0u64, tex1_obj), (1024u64, tex2_obj)] {
+                let host_tex = crate::resource::host_resource(tex_obj).unwrap();
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: offset,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                                Width: 4,
+                                Height: 4,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(host_tex),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: execution completed via execute(); readback buffer is 2048 bytes.
+        let bytes = unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE {
+                        Begin: 0,
+                        End: 2048,
+                    }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 2048)
+        };
+        let expected = [64u8, 128, 191, 255];
+        for (name, base) in [
+            ("placed UAV texture", 0usize),
+            ("placed SRV->UAV texture", 1024),
+        ] {
+            for row in 0..4 {
+                for col in 0..4 {
+                    let at = base + row * 256 + col * 4;
+                    let px = &bytes[at..at + 4];
+                    assert!(
+                        px[0].abs_diff(expected[col]) <= 1
+                            && px[1].abs_diff(expected[row]) <= 1
+                            && px[2].abs_diff(64) <= 1
+                            && px[3] == 255,
+                        "{name} pixel ({col},{row}) mismatch: {px:?}"
+                    );
+                }
+            }
+        }
+        // SAFETY: `readback` was mapped at subresource 0 above.
+        unsafe { readback.Unmap(0, None) };
+        // SAFETY: buf_ptr points to at least 256 bytes of committed title memory.
+        assert_eq!(unsafe { *buf_ptr.cast::<u32>() }, 0x1234_ABCD);
+        type Release = extern "system" fn(This) -> u32;
+        assert_eq!(slot::<Release>(buf_obj, 0x10)(buf_obj), 0);
     }
 }

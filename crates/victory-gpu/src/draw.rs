@@ -1102,7 +1102,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+pub(crate) fn readable(list: &HostList, u: &UsedResource, view: &View) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1218,4 +1218,66 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placed_uav_texture_transitions_to_unordered_access_and_placed_srv_to_shader_resource() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let backing = Box::leak(Box::new([0x33u8; 256]));
+        let va = backing.as_ptr() as u64;
+        let resource = [3u32, 0, 0, 0, 4, 0, 4, 1 | (1 << 16), 28, 1, 0, 0, 4, 0];
+        let mut uav_desc = [0u32; 16];
+        uav_desc[0] = 28;
+        uav_desc[1] = 4; // D3D12_UAV_DIMENSION_TEXTURE2D
+        uav_desc[10] = va as u32;
+        uav_desc[11] = (va >> 32) as u32;
+        let mut srv_desc = [0u32; 16];
+        srv_desc[0] = 28;
+        srv_desc[1] = 4; // D3D12_SRV_DIMENSION_TEXTURE2D
+        srv_desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc[5] = 1; // MipLevels
+        srv_desc[10] = va as u32;
+        srv_desc[11] = (va >> 32) as u32;
+
+        let list = host.new_list().unwrap();
+        let uav_used = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let srv_used = UsedResource {
+            kind: ResourceType::Srv,
+            ..uav_used
+        };
+
+        readable(&list, &uav_used, &View::Placed(true, resource, uav_desc));
+        let tex = crate::resource::texture_at(va, &resource)
+            .expect("placed UAV texture should resolve to a host texture");
+        assert_eq!(
+            list.transition(tex, 0x800).map(|(_, before)| before),
+            Some(0x8),
+            "placed UAV should place the texture in UNORDERED_ACCESS"
+        );
+
+        readable(&list, &srv_used, &View::Placed(false, resource, srv_desc));
+        assert_eq!(
+            list.transition(tex, 0x800).map(|(_, before)| before),
+            Some(0xC0),
+            "placed SRV of a UAV texture should transition to SHADER_RESOURCE without CPU upload"
+        );
+        let host_tex = crate::resource::host_resource(tex).unwrap();
+        assert!(!crate::texture::title_written(host_tex));
+        list.close();
+    }
 }
