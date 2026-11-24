@@ -297,12 +297,19 @@ fn a_bound_bindless_upload_preserves_an_earlier_submitted_gpu_producer() {
     let host = install_bindless_test_device(device);
     let (root, pipeline) = pipeline(host);
     let (output, mapped) = host.shared_buffer(BYTES).unwrap();
+    // Keep distinct addresses live in every case. A freed address can be
+    // reused while the placed cache still names its prior texture.
+    let backings: [_; 4] = std::array::from_fn(|_| {
+        (
+            resource::Memory::zeroed(BYTES, BYTES).unwrap(),
+            resource::Memory::zeroed(BYTES, BYTES).unwrap(),
+        )
+    });
     for placed in [false, true] {
         for early in [false, true] {
             let (title_heap, handle) = make_shader_heap(8);
             let native_heap = heap(title_heap).host_arc().unwrap();
-            let cpu = resource::Memory::zeroed(BYTES, BYTES).unwrap();
-            let producer_memory = resource::Memory::zeroed(BYTES, BYTES).unwrap();
+            let (cpu, producer_memory) = &backings[2 * usize::from(placed) + usize::from(early)];
             // SAFETY: each allocation holds a full texture, still idle.
             unsafe {
                 (cpu.address() as *mut u32).write(INPUT_NEW);
