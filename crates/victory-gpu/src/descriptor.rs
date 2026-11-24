@@ -711,6 +711,9 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(all(test, windows))]
+pub(crate) use tests::{test_sampler_heap, test_view_heap};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,6 +727,39 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn test_sampler_heap() -> This {
+        test_shader_heap(super::SAMPLERS, 1)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn test_view_heap(
+        count: u32,
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    ) -> This {
+        let heap = test_shader_heap(VIEWS_KIND, count);
+        let native = super::host::HostHeap::new_on_with_dynamic(
+            device, false, count, super::host::MIN_DYNAMIC,
+        )
+        .unwrap();
+        assert!(super::heap(heap).host.set(Some(native)).is_ok());
+        heap
+    }
+
+    #[cfg(windows)]
+    fn test_shader_heap(kind: u32, count: u32) -> This {
+        let mut heap = std::ptr::null();
+        assert_eq!(
+            create(
+                HeapDesc { kind, count, flags: SHADER_VISIBLE, nodes: 0 },
+                Placement { address: 0, size: 0 },
+                &mut heap,
+            ),
+            S_OK
+        );
+        heap
     }
 
     #[test]

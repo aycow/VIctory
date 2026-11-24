@@ -87,3 +87,18 @@ The production table builder also has to distinguish the same CBV record before 
 Set `VICTORY_CBV_SNAPSHOT_WIDTH` to 1, 16, 178, or 256 and run the exact test in a fresh process per width and adapter. Width 1 is CBV-only. The other cases use an original mixed table with the CBV in the first slot and an actual raw placed SRV in the last. The shader checks both CBV words and reads the SRV value (881). The fixture replays the same recordings with different title bytes. The first two lists and the two versions in the single-list case hold four ranges, which occupy 4, 64, 712, or 1,024 slots across the respective widths.
 
 All 12 adapter and width combinations passed on AMD Radeon Graphics, RTX 5070 Laptop, and WARP with full D3D12 GPU-based validation. The WARP width-178 mutation bypassing the version check reproduced a late result of [101, 102, 881] instead of [201, 202, 881]. This test exercises version correctness. Cross-list mixed-table sharing and the cost at title-scale pressure remain open.
+
+
+## Transactional reservations under heap pressure
+
+This branch composes #1126's rollback with #562's versioned native tables. A rejected bind releases its new dynamic ranges and shared-table references. It also restores any prior entry replaced by a newer CBV version. Existing native ranges keep their original owners. The rollback covers descriptor reservations and cache entries. It does not remove native state changes or transient upload preparation already recorded while attempting the bind.
+
+An actual 65,536-slot heap test stages widths of 16, 178, and 256, with a blocker leaving only 194 available after the accepted 16-slot table. The new CBV version (16) and second table (178) fit. The third cannot fit, and all 194 slots become available again. The 32 rejected attempts preserve the original table and can be followed by an accepted attempt after removing the blocker. Both this test and the separate width-178 mixed raw-SRV/CBV replay readback passed on AMD, NVIDIA, and WARP with full GPU-based validation.
+
+With the usual `VICTORY_TABLE_TEST_ADAPTER` and `VICTORY_TABLE_TEST_AGILITY` variables, run:
+
+~~~powershell
+cargo test --locked -p victory-gpu --features diagnostics --lib draw::tests::rejected_bind_releases_only_its_new_tables -- --exact --nocapture
+~~~
+
+These are reservation and replay checks. Cross-list CBV sharing still requires a sealed upload version or a binding chosen after the ordered writes for each execution.

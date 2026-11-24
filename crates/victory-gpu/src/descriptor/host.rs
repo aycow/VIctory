@@ -132,7 +132,7 @@ pub(super) const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
+pub(super) const MIN_DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -143,7 +143,7 @@ impl HostHeap {
         Self::new_on_with_dynamic(device, sampler, count, DYNAMIC)
     }
 
-    fn new_on_with_dynamic(
+    pub(super) fn new_on_with_dynamic(
         device: &ID3D12Device,
         sampler: bool,
         count: u32,
@@ -1120,4 +1120,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod reuse_tests;
+pub(crate) mod reuse_tests;

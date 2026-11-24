@@ -102,6 +102,16 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    #[cfg(test)]
+    pub(crate) fn test_compute(translated: Translated) -> Arc<Self> {
+        Arc::new(Self {
+            stage: "compute",
+            hash: "test-compute".into(),
+            container: Vec::new(),
+            translated: OnceLock::from(Some(translated)),
+        })
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
