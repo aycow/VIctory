@@ -1362,14 +1362,22 @@ fn directly_indexed_srvs_of_neighbouring_copies_share_a_question() {
         return;
     };
     use crate::copystat::{C, read as counter};
-    const BUFFERS: u32 = 8;
     const SIZE: u64 = 65536;
+    let profile = std::env::var_os("VICTORY_COH_PROFILE_SHARED_SPANS").is_some();
+    let layout = std::env::var("VICTORY_COH_PROFILE_SHARED_LAYOUT").unwrap_or_else(|_| "dense".into());
+    let buffers = if profile { 64 } else { 8 };
+    let stride = match layout.as_str() {
+        "dense" => SIZE,
+        "thin" if profile => SIZE * 16,
+        "gapped" if profile => SIZE * 32,
+        _ => panic!("unknown shared-span profiling layout {layout}"),
+    };
     let pipeline = pipeline(host, &dxc);
-    let title = TitleBuffer::watched(u64::from(BUFFERS) * SIZE);
+    let title = TitleBuffer::watched(u64::from(buffers - 1) * stride + SIZE);
     // The reservation is registered as one buffer; register the others
     // inside it, each its own resource and host copy.
-    let bases: Vec<u64> = (1..BUFFERS)
-        .map(|i| title.base + u64::from(i) * SIZE)
+    let bases: Vec<u64> = (1..buffers)
+        .map(|i| title.base + u64::from(i) * stride)
         .collect();
     for &base in &bases {
         crate::shadow::register(base as usize, base, SIZE);
@@ -1394,20 +1402,60 @@ fn directly_indexed_srvs_of_neighbouring_copies_share_a_question() {
         view(heap.handle(i as u32 + 1), base);
     }
     let (output, mapped) = host.shared_buffer(4).unwrap();
-    for round in 0..2u32 {
-        for i in [0, BUFFERS - 1] {
-            title.set(u64::from(i) * SIZE, 1000 * round + 100 + i);
-            let list = host.new_list().unwrap();
-            record(&list, heap.0, &pipeline, i, &output);
-            list.close();
+    let lists = [0, buffers - 1].map(|i| {
+        let list = host.new_list().unwrap();
+        record(&list, heap.0, &pipeline, i, &output);
+        list.close();
+        (i, list)
+    });
+    let observe = |round: u32| {
+        for (i, list) in &lists {
+            let expected = 1000 * round + 100 + i;
+            title.set(u64::from(*i) * stride, expected);
             let watches = counter(C::Watches);
-            host.execute(&[&list]);
-            assert!(
-                counter(C::Watches) - watches <= 1,
-                "one question for all copies"
-            );
-            assert_eq!(read(mapped), 1000 * round + 100 + i);
+            host.execute(&[list]);
+            if !profile {
+                assert!(
+                    counter(C::Watches) - watches <= 1,
+                    "one question for all copies"
+                );
+            }
+            assert_eq!(read(mapped), expected);
         }
+    };
+    observe(0);
+    if profile {
+        let sample = || {
+            let (prepare_us, _) = crate::host::test_submission_counters();
+            [
+                prepare_us,
+                crate::host::test_submission_queue_us(),
+                counter(C::DirectUs),
+                counter(C::SharedReadyNs) / 1000,
+                counter(C::SharedSortNs) / 1000,
+                counter(C::SharedGroupNs) / 1000,
+                counter(C::SharedObserveNs) / 1000,
+                counter(C::SharedApplyNs) / 1000,
+                counter(C::SharedFallbackNs) / 1000,
+                counter(C::WatchUs),
+                counter(C::Watches),
+                counter(C::SharedSpans),
+            ]
+        };
+        for batch in 0..3 {
+            let before = sample();
+            for round in 1..=40 {
+                observe(batch * 40 + round);
+            }
+            let after = sample();
+            let [prep, queue, direct, ready, sort, groups, observe, apply, fallback, watch, calls, shared] =
+                std::array::from_fn(|i| after[i] - before[i]);
+            eprintln!(
+                "{layout} 80 submissions: prepare_us={prep} queue_us={queue} direct_us={direct} ready_us={ready} sort_us={sort} groups_us={groups} observe_us={observe} apply_us={apply} fallback_us={fallback} watch_us={watch} calls={calls} shared={shared}"
+            );
+        }
+    } else {
+        observe(1);
     }
     for &base in &bases {
         crate::shadow::unregister(base as usize, base);

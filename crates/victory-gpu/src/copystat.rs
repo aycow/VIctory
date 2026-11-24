@@ -74,12 +74,31 @@ pub(crate) enum C {
     /// one private reservation, and the ranges they answered.
     SharedSpans,
     SharedRanges,
+    SharedReadyNs,
+    SharedSortNs,
+    SharedGroupNs,
+    SharedObserveNs,
+    SharedApplyNs,
+    SharedFallbackNs,
 }
-const COUNTERS: usize = C::SharedRanges as usize + 1;
+const COUNTERS: usize = C::SharedFallbackNs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+pub(crate) fn shared_prepare_profiling() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_PROFILE_SHARED_PREP").as_deref() == Ok("1"))
+}
+
+pub(crate) fn shared_prepare_start() -> Option<std::time::Instant> {
+    shared_prepare_profiling().then(std::time::Instant::now)
+}
+
+pub(crate) fn shared_prepare_elapsed(start: Option<std::time::Instant>) -> u64 {
+    start.map_or(0, |start| start.elapsed().as_nanos() as u64)
 }
 
 #[cfg(test)]
@@ -210,6 +229,19 @@ pub(crate) fn log(frames: f64) {
         );
     }
     let value = |counter: C| c[counter as usize];
+    if shared_prepare_profiling() {
+        let ns_to_ms = |c| value(c) / 1e6;
+        tracing::info!(
+            frames,
+            ready_ms = ns_to_ms(C::SharedReadyNs),
+            flatten_sort_ms = ns_to_ms(C::SharedSortNs),
+            reservation_groups_ms = ns_to_ms(C::SharedGroupNs),
+            observations_ms = ns_to_ms(C::SharedObserveNs),
+            apply_ms = ns_to_ms(C::SharedApplyNs),
+            fallback_ms = ns_to_ms(C::SharedFallbackNs),
+            "direct SRV preparation split per frame"
+        );
+    }
     tracing::info!(
         frames,
         conventional_ranges = value(C::ConventionalRanges),

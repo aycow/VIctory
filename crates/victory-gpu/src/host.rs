@@ -1369,6 +1369,11 @@ pub(crate) fn test_submission_counters() -> (u64, u64) {
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn test_submission_queue_us() -> u64 {
+    SUBMISSION_US[1].load(Ordering::Relaxed)
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
 pub(crate) fn test_submission_copy_bytes() -> u64 {
     PREPARING[1].load(Ordering::Relaxed)
 }
@@ -1384,13 +1389,22 @@ fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usi
     use crate::watch::PAGE;
     const SPAN_GAP: usize = 1 << 20;
     #[cfg(feature = "diagnostics")]
+    use crate::copystat::{C, add, shared_prepare_elapsed, shared_prepare_start};
+    #[cfg(feature = "diagnostics")]
     {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let off = *OFF.get_or_init(|| std::env::var_os("VICTORY_NO_SHARED_SPANS").is_some());
         if off {
-            return per.iter().map(|(s, r)| s.update_ready(r)).sum();
+            let start = shared_prepare_start();
+            let copied = per.iter().map(|(s, r)| s.update_ready(r)).sum();
+            if start.is_some() {
+                add(C::SharedFallbackNs, shared_prepare_elapsed(start));
+            }
+            return copied;
         }
     }
+    #[cfg(feature = "diagnostics")]
+    let sort_start = shared_prepare_start();
     let mut flat: Vec<(usize, usize, usize)> = per
         .iter()
         .enumerate()
@@ -1398,11 +1412,17 @@ fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usi
         .collect();
     flat.sort_unstable();
     let mut rest: Vec<Vec<(usize, usize)>> = vec![Vec::new(); per.len()];
+    #[cfg(feature = "diagnostics")]
+    if sort_start.is_some() {
+        add(C::SharedSortNs, shared_prepare_elapsed(sort_start));
+    }
     let mut copied = 0;
     let mut at = 0;
     // The last reservation looked up: ranges in it need no new question
     // (each is a system call, under Wine a round trip).
     let mut last: Option<crate::watch::Allocation> = None;
+    #[cfg(feature = "diagnostics")]
+    let (groups_start, mut observe_ns, mut apply_ns) = (shared_prepare_start(), 0, 0);
     while at < flat.len() {
         let (lo, mut hi, first) = flat[at];
         let page = lo / PAGE * PAGE;
@@ -1422,6 +1442,8 @@ fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usi
             }
         }
         let group = &flat[at..next];
+        #[cfg(feature = "diagnostics")]
+        let observe_start = groups_start.map(|_| std::time::Instant::now());
         let answer = (shared && group.iter().all(|&(_, _, i)| !per[i].0.not_watched()))
             .then(|| {
                 let after = group
@@ -1432,7 +1454,13 @@ fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usi
                 crate::watch::grouped_writes(lo, hi, after, reservation)
             })
             .flatten();
+        #[cfg(feature = "diagnostics")]
+        {
+            observe_ns += shared_prepare_elapsed(observe_start);
+        }
         if let Some((now, written)) = answer {
+            #[cfg(feature = "diagnostics")]
+            let apply_start = groups_start.map(|_| std::time::Instant::now());
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1443,6 +1471,10 @@ fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usi
                 let k = written.partition_point(|&(page, _)| page < a / PAGE);
                 copied += per[i].0.answered(a, e, now, &written[k..]);
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                apply_ns += shared_prepare_elapsed(apply_start);
+            }
         } else {
             for &(a, e, i) in group {
                 rest[i].push((a, e));
@@ -1450,10 +1482,23 @@ fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usi
         }
         at = next;
     }
+    #[cfg(feature = "diagnostics")]
+    if groups_start.is_some() {
+        let groups_ns = shared_prepare_elapsed(groups_start);
+        add(C::SharedGroupNs, groups_ns.saturating_sub(observe_ns + apply_ns));
+        add(C::SharedObserveNs, observe_ns);
+        add(C::SharedApplyNs, apply_ns);
+    }
+    #[cfg(feature = "diagnostics")]
+    let fallback_start = shared_prepare_start();
     for (i, ranges) in rest.iter().enumerate() {
         if !ranges.is_empty() {
             copied += per[i].0.update_ready(ranges);
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    if fallback_start.is_some() {
+        add(C::SharedFallbackNs, shared_prepare_elapsed(fallback_start));
     }
     copied
 }
@@ -1485,6 +1530,8 @@ fn refresh_direct_srvs(
     #[cfg(feature = "diagnostics")]
     add(C::DirectHeaps, selection.len() as u64);
     let snapshots = with_srv_ranges(&selection, |snapshots| {
+        #[cfg(feature = "diagnostics")]
+        let ready_start = crate::copystat::shared_prepare_start();
         let mut current: Option<&Arc<crate::shadow::Shadow>> = None;
         let mut uncovered = Vec::new();
         // Each copy's ready ranges, refreshed together below.
@@ -1514,6 +1561,10 @@ fn refresh_direct_srvs(
         });
         if let Some(shadow) = current {
             per.push((shadow.clone(), shadow.ready(&uncovered)));
+        }
+        #[cfg(feature = "diagnostics")]
+        if ready_start.is_some() {
+            add(C::SharedReadyNs, crate::copystat::shared_prepare_elapsed(ready_start));
         }
         copied += refresh_across(&per);
         #[cfg(feature = "diagnostics")]
