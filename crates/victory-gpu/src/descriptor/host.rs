@@ -5,23 +5,26 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::core::Interface;
 
-use super::{VIEW_TAG, View, view_at};
+use super::{TextureView, VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
+    device: ID3D12Device,
     cpu: usize,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
     /// where the host takes them, else [`MIN_DYNAMIC`].
-    dynamic: u32,
+    dynamic_count: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -30,9 +33,67 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
+    dynamic: Arc<DynamicSlots>,
+}
+
+/// View records and the resolved resources they name must both match. The
+/// native identity is held alive by the table while its key is live.
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct TableKey {
+    count: u32,
+    /// Sorted occupied offsets. Missing offsets are all the same null view.
+    views: Arc<[(u32, u64, usize)]>,
+}
+
+struct DynamicSlots {
+    first: u32,
     next: Mutex<(u32, Vec<bool>)>,
+    shared: Mutex<HashMap<TableKey, Weak<SharedTable>>>,
+}
+
+/// An allocation tied to a particular host heap, even if a later title
+/// heap reuses the same guest address.
+pub(crate) struct DynamicRange {
+    pub(crate) first: u32,
+    count: u32,
+    dynamic: Arc<DynamicSlots>,
+}
+
+impl Drop for DynamicRange {
+    fn drop(&mut self) {
+        self.dynamic.release(self.first, self.count);
+    }
+}
+
+/// One occupied range owned by the lists that may execute it. The cache has
+/// only a weak reference, so it cannot pin otherwise unused ranges.
+pub(crate) struct SharedTable {
+    key: TableKey,
+    range: DynamicRange,
+    _heap: ID3D12DescriptorHeap,
+    _resources: Vec<ID3D12Resource>,
+}
+
+impl SharedTable {
+    pub(crate) fn first(&self) -> u32 {
+        self.range.first
+    }
+}
+
+impl Drop for SharedTable {
+    fn drop(&mut self) {
+        let mut tables = self
+            .range
+            .dynamic
+            .shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A newer snapshot with this key may have been published after
+        // our reference count hit zero but before this destructor ran.
+        if tables.get(&self.key).is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self)) {
+            tables.remove(&self.key);
+        }
+    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -67,7 +128,7 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// took until it is reset (its submissions have run) or released.
 /// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
 /// each a device removal shortly after; #59).
-const DYNAMIC: u32 = 1 << 18;
+pub(super) const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
@@ -75,7 +136,19 @@ const MIN_DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
-        let host = host()?;
+        Self::new_on(&host()?.device, sampler, count)
+    }
+
+    fn new_on(device: &ID3D12Device, sampler: bool, count: u32) -> Option<Self> {
+        Self::new_on_with_dynamic(device, sampler, count, DYNAMIC)
+    }
+
+    fn new_on_with_dynamic(
+        device: &ID3D12Device,
+        sampler: bool,
+        count: u32,
+        requested_dynamic: u32,
+    ) -> Option<Self> {
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
         } else {
@@ -84,13 +157,12 @@ impl HostHeap {
         let make = |count: u32| -> windows::core::Result<ID3D12DescriptorHeap> {
             // SAFETY: plain heap creation.
             unsafe {
-                host.device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: kind,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: count,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
             }
         };
         // The larger dynamic range only where the host takes it on top of
@@ -103,8 +175,8 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
-            (heap, count, DYNAMIC)
+        } else if let Ok(heap) = make(count + requested_dynamic) {
+            (heap, count, requested_dynamic)
         } else {
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
@@ -124,7 +196,7 @@ impl HostHeap {
         let (cpu, step) = unsafe {
             (
                 heap.GetCPUDescriptorHandleForHeapStart().ptr,
-                host.device.GetDescriptorHandleIncrementSize(kind),
+                device.GetDescriptorHandleIncrementSize(kind),
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
@@ -138,14 +210,19 @@ impl HostHeap {
         ));
         let h = HostHeap {
             heap,
+            device: device.clone(),
             cpu,
             step,
             count,
-            dynamic: extra,
+            dynamic_count: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            dynamic: Arc::new(DynamicSlots {
+                first: count,
+                next: Mutex::new((0, vec![false; extra as usize])),
+                shared: Mutex::new(HashMap::new()),
+            }),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -163,34 +240,36 @@ impl HostHeap {
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
         const BLOCK: u32 = 1 << 16;
-        let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
-                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: BLOCK,
-                    ..Default::default()
-                })?;
+                self.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: kind,
+                        NumDescriptors: BLOCK,
+                        ..Default::default()
+                    })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
             let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: start.ptr + (i * self.step) as usize,
             };
             if self.sampler {
-                null_sampler(start);
+                null_sampler(&self.device, start);
             } else {
-                null_view(start);
+                null_view(&self.device, start);
             }
             let mut filled = 1;
             while filled < BLOCK {
                 let n = filled.min(BLOCK - filled);
-                host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
+                self.device
+                    .CopyDescriptorsSimple(n, at(filled), start, kind);
                 filled += n;
             }
             let mut done = 0;
             while done < total {
                 let n = BLOCK.min(total - done);
-                host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
+                self.device
+                    .CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                 done += n;
             }
         }
@@ -200,13 +279,12 @@ impl HostHeap {
     /// A plain point sampler at slot `index`, for sampler slots without a
     /// view.
     fn null_sampler(&self, index: u32) {
-        null_sampler(self.cpu(index));
+        null_sampler(&self.device, self.cpu(index));
     }
 }
 
 /// A plain point sampler at `at`.
-fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+fn null_sampler(device: &ID3D12Device, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let desc = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -217,26 +295,26 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         ..Default::default()
     };
     // SAFETY: a slot of a sampler heap of ours.
-    unsafe { host.device.CreateSampler(&desc, at) };
+    unsafe { device.CreateSampler(&desc, at) };
 }
 
 impl HostHeap {
     #[cfg(test)]
     pub(crate) fn dynamic_capacity(&self) -> u32 {
-        self.dynamic
+        self.dynamic_count
     }
 
     /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
-    pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > self.dynamic {
+    /// [`DynamicSlots::release`]: the first's index.
+    fn dynamic(&self, n: u32) -> Option<u32> {
+        if self.sampler || n == 0 || n > self.dynamic_count {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.dynamic.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
         // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        let starts = (*next as usize..self.dynamic_count as usize).chain(0..*next as usize);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -258,7 +336,7 @@ impl HostHeap {
             return None;
         };
         taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
+        *next = ((first + n) % self.dynamic_count as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -268,19 +346,62 @@ impl HostHeap {
         self.count
     }
 
-    /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
-    ///
-    /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
+    /// The returned allocation releases its own host range on drop.
+    pub(crate) fn reserve_dynamic(&self, count: u32) -> Option<DynamicRange> {
+        Some(DynamicRange {
+            first: self.dynamic(count)?,
+            count,
+            dynamic: self.dynamic.clone(),
+        })
+    }
+
+    /// Share a fully resolved texture table while at least one list owns it.
+    /// Buffer, CBV and placed views require list-local storage or preparation.
+    pub(crate) fn shared_textures(
+        &self,
+        count: u32,
+        views: &[TextureView<'_>],
+    ) -> Option<Arc<SharedTable>> {
+        let key = TableKey {
+            count,
+            views: views
+                .iter()
+                .map(|e| (e.slot, e.record, e.resource.as_raw() as usize))
+                .collect(),
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
+        let mut tables = self
+            .dynamic
+            .shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(table) = tables.get(&key).and_then(Weak::upgrade) {
+            return Some(table);
         }
+        let range = self.reserve_dynamic(count)?;
+        let first = range.first;
+        let mut resources = Vec::with_capacity(views.len());
+        let mut populated = views.iter().peekable();
+        for slot in 0..count {
+            let index = first + slot;
+            if populated.peek().is_some_and(|e| e.slot == slot) {
+                let entry = populated.next().unwrap();
+                if !make_texture(&self.device, entry.resource, entry.view, self.cpu(index)) {
+                    return None;
+                }
+                self.keep(index, None);
+                resources.push(entry.resource.clone());
+            } else {
+                self.make_null(index);
+            }
+        }
+        let table = Arc::new(SharedTable {
+            key: key.clone(),
+            range,
+            _heap: self.heap.clone(),
+            _resources: resources,
+        });
+        tables.insert(key, Arc::downgrade(&table));
+        Some(table)
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -298,7 +419,7 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            null_view(self.cpu(index));
+            null_view(&self.device, self.cpu(index));
         }
         self.keep(index, None);
     }
@@ -626,6 +747,58 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+impl DynamicSlots {
+    fn release(&self, first: u32, n: u32) {
+        let Some(at) = first.checked_sub(self.first) else {
+            return;
+        };
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let end = (at + n).min(guard.1.len() as u32) as usize;
+        if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            slots.fill(false);
+        }
+    }
+}
+
+/// Writes a view of a native texture with the same validation as the
+/// mirrored and list-local paths.
+fn make_texture(
+    device: &ID3D12Device,
+    texture: &ID3D12Resource,
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> bool {
+    match view {
+        View::Shader(_, desc) => {
+            let mut desc = desc.as_ref().map(srv_desc);
+            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                return false;
+            }
+            // SAFETY: a live texture and a slot of our heap.
+            unsafe {
+                device.CreateShaderResourceView(texture, desc.as_ref().map(std::ptr::from_ref), at)
+            };
+        }
+        View::Unordered(_, _, desc) => {
+            let mut desc = desc.as_ref().map(uav_desc);
+            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+                return false;
+            }
+            // SAFETY: a live texture and a slot of our heap.
+            unsafe {
+                device.CreateUnorderedAccessView(
+                    texture,
+                    None::<&ID3D12Resource>,
+                    desc.as_ref().map(std::ptr::from_ref),
+                    at,
+                )
+            };
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -653,19 +826,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
-                let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
-                    return None;
-                }
-                // SAFETY: a live texture and a slot of our heap.
-                unsafe {
-                    device.CreateShaderResourceView(
-                        texture,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    )
-                };
-                Some(Some(texture.clone()))
+                make_texture(device, texture, view, at).then(|| Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -684,20 +845,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
-            let mut desc = desc.as_ref().map(uav_desc);
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
-                return None;
-            }
-            // SAFETY: a live texture and a slot of our heap.
-            unsafe {
-                device.CreateUnorderedAccessView(
-                    texture,
-                    None::<&ID3D12Resource>,
-                    desc.as_ref().map(std::ptr::from_ref),
-                    at,
-                )
-            };
-            Some(Some(texture.clone()))
+            make_texture(device, texture, view, at).then(|| Some(texture.clone()))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -788,7 +936,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             // SAFETY: a slot of our heap; a zero location makes a null view.
             return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
         }
-        _ => return null_view(at),
+        _ => return null_view(&host.device, at),
     };
     let desc = if buffer {
         D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -876,11 +1024,11 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// A texture view that reads zeros with the dimension (and mip and array
 /// counts) of the title's description `words`; 2D if it names none.
 fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
     const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
     if !TEXTURES.contains(&words[1]) {
-        return null_view(at);
+        return null_view(&host.device, at);
     }
-    let Some(host) = host() else { return };
     // One mip, one slice or cube, plane 0: fields a null view still checks.
     let mut w = [0u32; 10];
     w[1] = words[1];
@@ -904,8 +1052,7 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// shortcut: slots with no view at all (kind unknown) get this null 2D
 /// view; null buffer views there did not stop the world's low-address
 /// page faults (2026-11-24, run w10), so they are not the cause.
-fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+fn null_view(device: &ID3D12Device, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -918,10 +1065,7 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         },
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-    unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+    unsafe { device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at) };
 }
 
 #[cfg(test)]
@@ -969,13 +1113,16 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let a = heap.dynamic(heap.dynamic - 100).unwrap();
+        let a = heap.dynamic(heap.dynamic_count - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
+        assert_eq!((a, b), (4, 4 + heap.dynamic_count - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
+        heap.dynamic.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic_count - 40));
     }
 }
+
+#[cfg(test)]
+mod reuse_tests;

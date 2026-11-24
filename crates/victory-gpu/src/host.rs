@@ -468,17 +468,6 @@ enum Step {
     Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
-/// Dynamic descriptor table slots leased by a recording; released when the
-/// recording drops (after its async submission completes if reset while
-/// running).
-struct DynamicLease(u64, u32, u32);
-
-impl Drop for DynamicLease {
-    fn drop(&mut self) {
-        crate::descriptor::release_dynamic(self.0, self.1, self.2);
-    }
-}
-
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -491,9 +480,13 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
-    /// Dynamic descriptor ranges leased by this recording, retired with it
-    /// if the list resets before its submission finishes.
-    dynamic: Vec<DynamicLease>,
+    /// Descriptor slots named by the recording, retired with this recording
+    /// if the list resets before its last submission completes.
+    shared_tables: std::collections::HashMap<
+        usize,
+        std::sync::Arc<crate::descriptor::host::SharedTable>,
+    >,
+    dynamic_ranges: Vec<crate::descriptor::host::DynamicRange>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1600,8 +1593,13 @@ impl HostList {
     /// Keeps dynamic descriptor slots `[first, first + n)` on title heap
     /// `heap_id` leased until this recording's submission finishes (or the
     /// list resets while idle).
-    pub(crate) fn keep_dynamic(&self, heap_id: u64, first: u32, n: u32) {
-        self.deferred().dynamic.push(DynamicLease(heap_id, first, n));
+    pub(crate) fn keep_shared_table(&self, table: std::sync::Arc<crate::descriptor::host::SharedTable>) {
+        let identity = std::sync::Arc::as_ptr(&table) as usize;
+        self.deferred().shared_tables.entry(identity).or_insert(table);
+    }
+
+    pub(crate) fn keep_dynamic_range(&self, range: crate::descriptor::host::DynamicRange) {
+        self.deferred().dynamic_ranges.push(range);
     }
 
     /// Whether this is the first time since the reset that the list asks
@@ -2764,11 +2762,11 @@ mod submissions {
         let host_heap = heap_ref.host().unwrap();
         // The portable fallback can have fewer slots than this host's first choice.
         let capacity = host_heap.dynamic_capacity();
-        let first = host_heap.dynamic(capacity).unwrap();
-        assert_eq!(host_heap.dynamic(1), None);
+        let range = host_heap.reserve_dynamic(capacity).unwrap();
+        assert!(host_heap.reserve_dynamic(1).is_none());
 
         let list = host.new_list().unwrap();
-        list.keep_dynamic(heap_ref.id(), first, capacity);
+        list.keep_dynamic_range(range);
         list.close();
 
         // Hold the host queue behind a private fence armed atomically inside
@@ -2777,19 +2775,18 @@ mod submissions {
         host.execute_gated(&[&list], &gate.0);
         list.reset();
         // Reset while in flight must NOT free the leased dynamic range yet.
-        assert_eq!(
-            host_heap.dynamic(1),
-            None,
+        assert!(
+            host_heap.reserve_dynamic(1).is_none(),
             "dynamic descriptor slots must remain leased until the async fence completes"
         );
         gate.release();
         host.drain();
-        let after = host_heap.dynamic(1);
+        let after = host_heap.reserve_dynamic(1);
         assert!(
             after.is_some(),
             "dynamic descriptor slots must be released once the submission finishes"
         );
-        host_heap.release(after.unwrap(), 1);
+        drop(after);
         assert_eq!(
             slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap),
             0

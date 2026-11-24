@@ -59,8 +59,6 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
-    #[cfg(windows)]
-    id: u64,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -72,13 +70,6 @@ impl Heap {
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
-    }
-
-    /// Unique heap identifier (guards delayed dynamic-slot releases against
-    /// pointer reuse if a heap is freed and another allocated at the same address).
-    #[cfg(windows)]
-    pub(crate) fn id(&self) -> u64 {
-        self.id
     }
 
     /// The host heap, made on first use from what the title wrote so far.
@@ -108,6 +99,55 @@ impl Heap {
             .as_ref()
     }
 
+    /// Resolve all slots in an eligible table before publishing a native
+    /// snapshot. Keep the view generations stable while recording the
+    /// list's normal texture preparation.
+    #[cfg(windows)]
+    pub(crate) fn with_texture_table<R>(
+        &self,
+        table: u64,
+        count: u32,
+        f: impl FnOnce(&[TextureView<'_>]) -> R,
+    ) -> Option<R> {
+        if self.desc.kind != VIEWS_KIND || count == 0 || count > host::DYNAMIC {
+            return None;
+        }
+        let offset = table.checked_sub(self.start)?;
+        if !offset.is_multiple_of(32) {
+            return None;
+        }
+        let last = table.checked_add(u64::from(count - 1) * 32)?;
+        self.index(last)?;
+
+        let registry = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries = Vec::new();
+        for k in 0..count {
+            let at = table + u64::from(k) * 32;
+            // SAFETY: the entire immutable snapshot span is in the title heap.
+            let [tag, id, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+            if [tag, id, generation] == [0, 0, 0] {
+                continue;
+            }
+            let (view, current) = registry.list.get(id as usize)?;
+            if tag != VIEW_TAG || *current != generation {
+                return None;
+            }
+            let resource = match view {
+                View::Shader(resource, _) | View::Unordered(resource, 0, _) => *resource,
+                _ => return None,
+            };
+            let resource = crate::resource::host_resource(resource as This)?;
+            let record = u64::from(generation) << 32 | u64::from(id);
+            entries.push(TextureView {
+                slot: k,
+                record,
+                view,
+                resource,
+            });
+        }
+        (!entries.is_empty()).then(|| f(&entries))
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
@@ -121,22 +161,18 @@ const VIEWS_KIND: u32 = 0;
 const SAMPLERS: u32 = 1;
 const SHADER_VISIBLE: u32 = 1;
 
-#[cfg(windows)]
-static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
-/// start, end, heap pointer, monotonic heap id.
+/// start, end, heap.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize, u64)>> =
-    std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let &(_, _, at, _) = heaps
+    let &(_, _, at) = heaps
         .iter()
-        .find(|&&(start, end, _, _)| (start..end).contains(&handle))?;
+        .find(|&&(start, end, _)| (start..end).contains(&handle))?;
     // SAFETY: registered heaps are live (removed when dropped).
     let heap = unsafe { &*(at as *const Heap) };
     Some((heap, heap.index(handle)?))
@@ -161,25 +197,12 @@ fn mirror(handle: u64) {
     }
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap with
-/// monotonic `id`, if that heap still exists.
-#[cfg(windows)]
-pub(crate) fn release_dynamic(id: u64, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(_, _, heap, _)) = heaps.iter().find(|&&(_, _, _, hid)| hid == id)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
-    }
-}
-
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
-        let id = self.id;
+        let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.retain(|&(_, _, _, hid)| hid != id);
+        heaps.retain(|&(_, _, h)| h != at);
     }
 }
 
@@ -306,6 +329,15 @@ pub(crate) enum View {
     /// access, the resource description, then the view's (the plain one
     /// followed by the memory address and console fields).
     Placed(bool, [u32; 14], [u32; 16]),
+}
+
+/// A texture view resolved while its title view generation is live.
+#[cfg(windows)]
+pub(crate) struct TextureView<'a> {
+    pub(crate) slot: u32,
+    record: u64,
+    pub(crate) view: &'a View,
+    resource: &'a windows::Win32::Graphics::Direct3D12::ID3D12Resource,
 }
 
 impl View {
@@ -637,15 +669,12 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
-        #[cfg(windows)]
-        id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let id = heap.id;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.push((start, start + size, at, id));
+        heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
     let _ = visible;
@@ -721,6 +750,33 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn texture_table_eligibility_excludes_constant_buffers() {
+        let mut h = std::ptr::null();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 4,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let placement = Placement {
+            address: 0,
+            size: 0,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        let s = heap(h).start;
+        create_cbv(std::ptr::null(), &[0x1000, 1, 256, 0], s + 32);
+        fn reject(_: &[TextureView<'_>]) {
+            panic!("ineligible table was passed to the cache");
+        }
+        assert_eq!(heap(h).with_texture_table(s, 4, reject), None::<()>);
+        assert_eq!(heap(h).with_texture_table(s + 1, 1, reject), None);
+        assert_eq!(heap(h).with_texture_table(s + 96, 2, reject), None);
+        assert_eq!(heap(h).with_texture_table(s + 64, 2, reject), None);
+        assert_eq!(release(h), 0);
     }
 
     #[test]

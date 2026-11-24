@@ -691,6 +691,24 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            if !entries.iter().any(|u| u.kind == ResourceType::Cbv)
+                && let Some(shared) = heap
+                    .with_texture_table(table, n, |views| {
+                        let shared = host.shared_textures(n, views)?;
+                        for u in &entries {
+                            let offset = u.table_offset_dwords / 8;
+                            if let Ok(i) = views.binary_search_by_key(&offset, |view| view.slot) {
+                                readable(list, u, views[i].view);
+                            }
+                        }
+                        Some(shared)
+                    })
+                    .flatten()
+            {
+                made.push((slot, shared.first() * 32));
+                list.keep_shared_table(shared);
+                continue;
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -712,7 +730,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(range) = host.reserve_dynamic(n) else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
@@ -721,8 +739,9 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
+            let first = range.first;
             self.fresh_tables.insert(key, first);
-            list.keep_dynamic(heap.id(), first, n);
+            list.keep_dynamic_range(range);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
