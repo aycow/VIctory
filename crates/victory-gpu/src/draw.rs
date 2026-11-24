@@ -580,6 +580,19 @@ impl State {
         true
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn census<'a>(
+        &self,
+        list: &'a HostList,
+        work: crate::census::Work,
+    ) -> Option<crate::census::Sample<'a>> {
+        if !crate::census::enabled() {
+            return None;
+        }
+        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        list.census.begin(&list.list, p.census.as_ref()?, work)
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
@@ -608,6 +621,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        let _sample = p.census.as_ref().and_then(|id| {
+            list.census.begin(&list.list, id, crate::census::Work::Dispatch([x, y, z]))
+        });
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -660,6 +677,8 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    #[cfg(feature = "diagnostics")]
+                    let _sample = self.census(list, crate::census::Work::Mesh([x, 1, 1]));
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -953,6 +972,8 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let _sample = self.census(list, crate::census::Work::Draw(count, instances));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1040,6 +1061,8 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let _sample = self.census(list, crate::census::Work::Indexed(indices, instances));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1138,6 +1161,11 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        let sample = self.census(
+            list,
+            crate::census::Work::Indirect { kind, limit: max, stride, counted: counter.is_some() },
+        );
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1150,6 +1178,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        drop(sample);
         crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
