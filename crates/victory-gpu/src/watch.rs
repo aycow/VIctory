@@ -118,6 +118,15 @@ impl Allocation {
     }
 }
 
+/// Classify the same reservation when the region provider gives no flags.
+fn private_from_basic(address: usize, start: usize) -> Option<bool> {
+    use windows_sys::Win32::System::Memory::{MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut basic = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: a query about an address; nothing is dereferenced.
+    let n = unsafe { VirtualQuery(address as *const _, &mut basic, size_of_val(&basic)) };
+    (n != 0 && basic.AllocationBase as usize == start).then_some(basic.Type == MEM_PRIVATE)
+}
+
 /// A Windows reservation extent, independent of individual page commitment
 /// and protection. Resolve this optionally so older Win32 providers still
 /// use the non-reset GetWriteWatch preflight.
@@ -174,16 +183,12 @@ pub(crate) fn allocation(address: usize) -> Option<Allocation> {
         // The Private bit is the first field of the Win32 region union.
         // Wine leaves the union's flags zero for every region; there the
         // allocation type comes from VirtualQuery instead.
-        let mut private = info.Anonymous.Anonymous._bitfield & 1 != 0;
-        if info.Anonymous.Anonymous._bitfield == 0 {
-            use windows_sys::Win32::System::Memory::{
-                MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
-            };
-            let mut basic = MEMORY_BASIC_INFORMATION::default();
-            // SAFETY: a query about an address; nothing is dereferenced.
-            let n = VirtualQuery(address as *const _, &mut basic, size_of_val(&basic));
-            private = n != 0 && basic.Type == MEM_PRIVATE;
-        }
+        let flags = info.Anonymous.Anonymous._bitfield;
+        let private = if flags == 0 {
+            private_from_basic(address, start)?
+        } else {
+            flags & 1 != 0
+        };
         (start <= address && address < end).then_some(Allocation {
             start,
             end,
@@ -655,6 +660,7 @@ pub(crate) mod tests {
     /// (Wine fills no region flags, so this checks the fallback there).
     #[test]
     fn allocation_tells_private_memory_from_views() {
+        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
             UnmapViewOfFile,
@@ -669,8 +675,12 @@ pub(crate) mod tests {
             )
         } as usize;
         assert_ne!(p, 0);
+        assert_eq!(private_from_basic(p + PAGE, p), Some(true));
+        assert_eq!(private_from_basic(p + PAGE, p + PAGE), None);
         let Some(a) = allocation(p) else {
             // QueryVirtualMemoryInformation is missing: nothing to check.
+            // SAFETY: a reservation of ours.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
             return;
         };
         assert!(a.private, "a VirtualAlloc reservation is private");
@@ -686,9 +696,15 @@ pub(crate) mod tests {
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE)
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE);
+            CloseHandle(section);
+            view
         };
         assert!(!view.Value.is_null());
+        assert_eq!(
+            private_from_basic(view.Value as usize, view.Value as usize),
+            Some(false)
+        );
         assert!(
             !allocation(view.Value as usize).unwrap().private,
             "a mapped view is not"
