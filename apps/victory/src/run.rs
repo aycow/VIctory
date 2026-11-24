@@ -118,9 +118,10 @@ pub fn run(
     }));
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
-    let code = main
-        .join()
-        .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    let joined = main.join();
+    #[cfg(feature = "diagnostics")]
+    victory_hle::modules::d3d12x::flush_gpu_census();
+    let code = joined.map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
 }

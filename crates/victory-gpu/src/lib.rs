@@ -17,6 +17,10 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod census;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use census::flush_after_drain as flush_gpu_census;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

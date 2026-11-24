@@ -31,3 +31,5 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      - name: GPU diagnostics tests
+        run: cargo test --locked -p victory-gpu --features diagnostics --lib census::tests
