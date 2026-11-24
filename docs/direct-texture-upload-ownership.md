@@ -42,6 +42,16 @@ consuming test list its own request, leaving #230 to decide at submission
 whether to copy. The producer comparison on this branch is
 `a_bound_bindless_upload_preserves_an_earlier_submitted_gpu_producer`.
 
+| Configuration | Result |
+|---|---|
+| #413 alone, producer runs after the upload is recorded | All six ordinary and placed cases returned the CPU upload `0x87654321`, overwriting the GPU value. |
+| #413 alone, upload recorded after the producer runs | All six controls retained the GPU value `0xfeed1234`. |
+| #413 + #230, either recording order | All 12 cases retained the GPU value `0xfeed1234`. |
+| #413 + #230, fixture explicitly re-arms the consuming list | All 12 discard/reorder cases read the CPU value `0x87654321`. |
+| #413 + #230, existing scheduler | The four AMD discard/reorder cases still read `0x12345678`. |
+
+The full matrices used AMD Radeon Graphics, NVIDIA RTX 5070 Laptop, and WARP with full GPU-based validation.
+
 ## Integration boundary
 
 #230 records changed texture copies in the submission prelude, with
