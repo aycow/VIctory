@@ -342,3 +342,120 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     map.insert(resource as usize, s.clone());
     Some(s)
 }
+
+#[cfg(test)]
+mod refresh_cost_tests {
+    use super::*;
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+
+    fn measure(mut operation: impl FnMut()) -> Duration {
+        let mut samples = [Duration::ZERO; 21];
+        for _ in 0..3 {
+            operation();
+        }
+        for sample in &mut samples {
+            let start = Instant::now();
+            operation();
+            *sample = start.elapsed();
+        }
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    #[test]
+    #[ignore = "release-mode CPU timings for synthetic committed textures, requires D3D12 staging"]
+    fn unwatched_tiled_texture_refresh_cost() {
+        let host = host().expect("D3D12 staging device");
+        for (width, height) in [(512, 512), (1920, 1080), (3840, 2160), (7680, 4320)] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width,
+                height,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_D,
+            })
+            .unwrap();
+            let size = layout.size as usize;
+            let row_pitch = (width * 4).next_multiple_of(256);
+            let staging_size = u64::from(row_pitch) * u64::from(height);
+            let mut source: Vec<u8> = (0..size).map(|i| i.wrapping_mul(97) as u8).collect();
+            let memory = source.as_mut_ptr();
+            let (buffer, data) = host.upload_buffer(staging_size).expect("upload buffer");
+            let staging = Staging {
+                buffer,
+                #[cfg(feature = "diagnostics")]
+                size: staging_size,
+                data,
+                footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: width,
+                        Height: height,
+                        Depth: 1,
+                        RowPitch: row_pitch,
+                    },
+                }],
+                rows: vec![height],
+                layout,
+                mips: 1,
+                memory,
+                last: Mutex::default(),
+            };
+            assert!(crate::watch::writes(memory as usize, memory as usize + size, false).is_none());
+            assert_eq!(staging.refresh_now(), size);
+            assert_eq!(
+                staging.last.lock().unwrap().hash,
+                Some(blake3::hash(&source))
+            );
+            let mapping = measure(|| {
+                assert!(committed(black_box(memory as *const u8), size));
+            });
+            let unchanged = measure(|| {
+                assert_eq!(staging.refresh_now(), size);
+            });
+            let hash = measure(|| {
+                black_box(blake3::hash(black_box(&source)));
+            });
+
+            // The compare control models a complete resident previous copy,
+            // including the cost to update it after a change.
+            let mut baseline = source.clone();
+            let compare = measure(|| {
+                assert_eq!(black_box(source.as_slice()), black_box(baseline.as_slice()));
+            });
+            let tail_texel = staging.layout.offset(0, width - 1, height - 1, 0).unwrap() as usize;
+            let changed = measure(|| {
+                // SAFETY: the original fixed-capacity source remains live.
+                unsafe { *memory.add(tail_texel) ^= 0x80 };
+                assert_eq!(staging.refresh_now(), size);
+            });
+            // SAFETY: this initialized texel is within the live upload.
+            let last = unsafe { *data.add(((height - 1) * row_pitch + (width - 1) * 4) as usize) };
+            assert_eq!(last, source[tail_texel]);
+            let compare_update = measure(|| {
+                source[tail_texel] ^= 0x80;
+                if black_box(source.as_slice()) != black_box(baseline.as_slice()) {
+                    baseline.copy_from_slice(&source);
+                }
+            });
+            assert_eq!(baseline, source);
+            let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
+            eprintln!(
+                "{width}x{height} {size} B: query {:.3} ms, hash {:.3} ms, intact refresh {:.3} ms, changed refresh {:.3} ms, compare {:.3} ms, compare and update {:.3} ms",
+                ms(mapping),
+                ms(hash),
+                ms(unchanged),
+                ms(changed),
+                ms(compare),
+                ms(compare_update)
+            );
+        }
+    }
+}
