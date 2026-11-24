@@ -28,7 +28,7 @@ const FIRST: u32 = 0x1458_acef;
 const SECOND: u32 = 0xfec1_4921;
 const SPAN: u32 = 2048;
 
-fn device(validate: bool) -> (ID3D12Device, String) {
+pub(crate) fn device(validate: bool) -> (ID3D12Device, String) {
     let sdk = std::env::var("VICTORY_TABLE_TEST_AGILITY").expect("Agility SDK 1.620.x x64 path");
     let sdk = std::ffi::CString::new(format!("{}\\", sdk.trim_end_matches(['/', '\\']))).unwrap();
     let vendor = std::env::var("VICTORY_TABLE_TEST_ADAPTER").expect("amd, nvidia or warp");

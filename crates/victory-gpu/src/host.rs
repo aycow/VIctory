@@ -189,15 +189,23 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let mut device: Option<ID3D12Device> = None;
+        #[cfg(all(test, feature = "diagnostics"))]
+        if std::env::var_os("VICTORY_ASYNC_TEST_GBV").is_some() {
+            let (selected, name) = crate::descriptor::host::reuse_tests::device(true);
+            eprintln!("explicit async host adapter: {name}");
+            device = Some(selected);
+        }
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
-            let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            tracing::info!("host device on the software adapter (WARP)");
-        } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        if device.is_none() {
+            if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+                let adapter = warp_adapter()?;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                tracing::info!("host device on the software adapter (WARP)");
+            } else {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -2609,6 +2617,81 @@ mod submissions {
     use windows::Win32::Graphics::Direct3D12::{D3D12_FENCE_FLAG_NONE, ID3D12Fence};
 
     use crate::queue::Written;
+
+    /// Set VICTORY_ASYNC_TEST_GBV=1, VICTORY_TABLE_TEST_ADAPTER to amd,
+    /// nvidia or warp, and VICTORY_TABLE_TEST_AGILITY to the SDK's x64
+    /// DLL directory. Run each adapter in a fresh diagnostic test process.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires a named D3D12 adapter and Agility SDK 1.620.x"]
+    fn full_gbv_async_gate_suite() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::{Interface, PCSTR};
+
+        static ISSUES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn capture(
+            _: D3D12_MESSAGE_CATEGORY,
+            severity: D3D12_MESSAGE_SEVERITY,
+            id: D3D12_MESSAGE_ID,
+            description: PCSTR,
+            _: *mut std::ffi::c_void,
+        ) {
+            if severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                // SAFETY: the debug callback supplies a C string for this call.
+                let text = unsafe { std::ffi::CStr::from_ptr(description.0.cast()) };
+                ISSUES
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}: {}", id.0, text.to_string_lossy()));
+            }
+        }
+
+        assert!(std::env::var_os("VICTORY_ASYNC_TEST_GBV").is_some());
+        let host = super::host().expect("explicit D3D12 test adapter");
+        let queue = host
+            .device
+            .cast::<ID3D12InfoQueue1>()
+            .expect("active debug layer");
+        let configuration = host.device.cast::<ID3D12DeviceConfiguration>().unwrap();
+        // SAFETY: plain device configuration query.
+        let flags = unsafe { configuration.GetDesc() };
+        assert_ne!(
+            flags.Flags.0 & D3D12_DEVICE_FLAG_GPU_BASED_VALIDATION_ENABLED.0,
+            0
+        );
+        assert_eq!(
+            flags.GpuBasedValidationFlags
+                & D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING.0 as u32,
+            0
+        );
+        let mut cookie = 0;
+        // SAFETY: the callback records messages to process-lifetime storage.
+        unsafe {
+            queue
+                .RegisterMessageCallback(
+                    Some(capture),
+                    D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                    std::ptr::null_mut(),
+                    &mut cookie,
+                )
+                .unwrap();
+        }
+
+        a_list_reset_while_it_runs_records_into_fresh_memory();
+        a_step_reading_what_an_earlier_submission_writes_waits_for_it();
+        dynamic_descriptor_leases_stay_held_until_async_submission_finishes();
+        signals_follow_the_writes_of_earlier_submissions();
+        crate::shadow::tests::snapshot_stays_fresh_across_disjoint_in_flight_submissions();
+        host.drain();
+        // SAFETY: the registered callback is ours, and the device is live.
+        unsafe {
+            queue.UnregisterMessageCallback(cookie).unwrap();
+            host.device.GetDeviceRemovedReason().unwrap();
+        }
+        let issues = ISSUES.lock().unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+        eprintln!("5 async cases passed with active debug layer and full GPU validation, zero warnings/errors");
+    }
 
     /// Serializes tests that temporarily gate the shared host queue so two
     /// gates never overlap.
