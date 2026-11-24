@@ -201,15 +201,12 @@ pub(crate) fn install_bindless_test_device(device: ID3D12Device) -> &'static Hos
 }
 
 fn create_with_device(device: ID3D12Device, debug: bool) -> windows::core::Result<Host> {
-    // SAFETY: plain D3D12 object creation on the supplied live device.
-    unsafe {
-        let messages = debug
-            .then(|| device.cast::<ID3D12InfoQueue>().ok())
-            .flatten();
-        let host = Host::from_device(device, messages)?;
-        tracing::info!("host D3D12 device ready");
-        Ok(host)
-    }
+    let messages = debug
+        .then(|| device.cast::<ID3D12InfoQueue>().ok())
+        .flatten();
+    let host = Host::from_device(device, messages)?;
+    tracing::info!("host D3D12 device ready");
+    Ok(host)
 }
 
 impl Host {

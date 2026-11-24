@@ -225,6 +225,7 @@ fn unsubmitted_first_recording_does_not_consume_a_bindless_texture_upload() {
     let host = install_bindless_test_device(device);
     let (root, pipeline) = pipeline(host);
     let (output, mapped) = host.shared_buffer(BYTES).unwrap();
+    let explicit_retry = std::env::var_os("VICTORY_BINDLESS_TEST_REARM").is_some();
     let mut failures = Vec::new();
     for (placed, discard) in [(false, true), (true, true), (false, false), (true, false)] {
         // Use a separate heap per case so the record-time cache cannot hide
@@ -254,6 +255,12 @@ fn unsubmitted_first_recording_does_not_consume_a_bindless_texture_upload() {
         let consumer = host.new_list().unwrap();
         native_heap.prepare_bindless_record(&consumer);
         consumer.defer_bindless(&native_heap, false);
+        if explicit_retry {
+            // Reference for the scheduler: the consuming list holds its own
+            // upload request and #230 decides the native copy at submission.
+            crate::texture::upload(&consumer, texture, native);
+            crate::list::ensure_state(&consumer, texture, READ_STATE);
+        }
         // SAFETY: this output mapping is idle until submission.
         unsafe { mapped.cast::<u32>().write(0) };
         sample(&consumer, &native_heap.heap, &root, &pipeline, &output);
