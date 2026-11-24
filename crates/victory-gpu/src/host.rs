@@ -184,6 +184,13 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        create_with_device(device, debug)
+    }
+}
+
+pub(crate) fn create_with_device(device: ID3D12Device, debug: bool) -> windows::core::Result<Host> {
+    // SAFETY: plain D3D12 object creation on a live device.
+    unsafe {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -228,7 +235,7 @@ fn create() -> windows::core::Result<Host> {
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
-fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
+pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     // SAFETY: plain DXGI adapter queries.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
@@ -305,6 +312,8 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    #[cfg(feature = "diagnostics")]
+    dependencies: Mutex<crate::dependencies::Recorded>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -484,6 +493,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                dependencies: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -501,13 +512,25 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        #[cfg(feature = "diagnostics")]
+        let mut dependency_reports = Vec::new();
         for list in runs {
+            #[cfg(feature = "diagnostics")]
+            let mut prelude_dependencies = crate::dependencies::Recorded::default();
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(
+                #[cfg(feature = "diagnostics")]
+                &mut prelude_dependencies,
+            ) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+            #[cfg(feature = "diagnostics")]
+            if crate::dependencies::enabled() {
+                let recorded = list.dependencies.lock().unwrap_or_else(|e| e.into_inner());
+                dependency_reports.extend(crate::dependencies::submitted(&prelude_dependencies, &recorded));
+            }
         }
         batch.flush();
         let prepared = std::time::Instant::now();
@@ -604,6 +627,10 @@ impl Host {
             }
         }
         self.log_messages();
+        #[cfg(feature = "diagnostics")]
+        for report in dependency_reports {
+            report.publish();
+        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -783,6 +810,14 @@ impl Host {
 }
 
 impl HostList {
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_dependency(&self, event: impl FnOnce() -> crate::dependencies::Event) {
+        if crate::dependencies::enabled() {
+            let event = event();
+            self.dependencies.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+        }
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -885,6 +920,10 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        {
+            *self.dependencies.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -920,6 +959,12 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                #[cfg(feature = "diagnostics")]
+                if before != wanted {
+                    self.note_dependency(|| crate::dependencies::Event::State {
+                        resource: copy.dependency_id, before, after: wanted, prelude: false,
+                    });
+                }
                 (before != wanted).then_some((texture, before))
             }
         }
@@ -928,13 +973,22 @@ impl HostList {
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(
+        &self,
+        #[cfg(feature = "diagnostics")] dependencies: &mut crate::dependencies::Recorded,
+    ) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
                 (real != *first).then(|| {
+                    #[cfg(feature = "diagnostics")]
+                    if crate::dependencies::enabled() {
+                        dependencies.push(crate::dependencies::Event::State {
+                            resource: copy.dependency_id, before: real, after: *first, prelude: true,
+                        });
+                    }
                     transition(
                         &copy.texture,
                         D3D12_RESOURCE_STATES(real as i32),
@@ -1587,7 +1641,13 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        #[cfg(feature = "diagnostics")] source: Option<crate::dependencies::Resource>,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -1654,18 +1714,39 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 ),
             ]);
+            #[cfg(feature = "diagnostics")]
+            p.copy.note_dependency(|| {
+                use crate::dependencies::{Access, Event, Role};
+                Event::Present {
+                    frame,
+                    source: Access {
+                        resource: source,
+                        role: Role::Present,
+                        extent: Some((desc.Width, height, desc.Format.0)),
+                        binding: None,
+                    },
+                    state_before_copy: Some(state.0 as u32),
+                }
+            });
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let shown = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            {
+                let black = probe.map(|b| crate::capture::black(&b));
+                crate::dependencies::presentation_result(frame, source, black, shown.is_ok());
+                return Some(black.unwrap_or(false));
+            }
             #[cfg(not(feature = "diagnostics"))]
-            Some(false)
+            {
+                let _ = shown;
+                Some(false)
+            }
         }
     }
 

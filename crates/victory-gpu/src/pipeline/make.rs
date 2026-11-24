@@ -59,6 +59,11 @@ impl Pending {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn dependency_key(&self) -> &str {
+        &self.key
+    }
+
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));

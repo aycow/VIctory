@@ -71,6 +71,10 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    #[cfg(feature = "diagnostics")]
+    dependency_inputs: Vec<crate::dependencies::Access>,
+    #[cfg(feature = "diagnostics")]
+    dependency_targets: Vec<crate::dependencies::Access>,
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
@@ -260,6 +264,8 @@ impl State {
             return;
         };
         self.targets.clear();
+        #[cfg(feature = "diagnostics")]
+        self.dependency_targets.clear();
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -275,6 +281,11 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            #[cfg(feature = "diagnostics")]
+            if crate::dependencies::enabled() {
+                use crate::dependencies::{Access, Role};
+                self.dependency_targets.push(Access::texture(record.resource, Role::Target));
+            }
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
@@ -283,6 +294,11 @@ impl State {
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            #[cfg(feature = "diagnostics")]
+            if crate::dependencies::enabled() {
+                use crate::dependencies::{Access, Role};
+                self.dependency_targets.push(Access::texture(record.resource, Role::Depth));
+            }
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
         // SAFETY: an open list; the views were just made.
@@ -471,6 +487,14 @@ impl State {
                 }
                 return false;
             }
+            #[cfg(feature = "diagnostics")]
+            if crate::dependencies::enabled() {
+                for u in &t.used {
+                    if let Some(access) = self.dependency_view(stage.shader.stage, u, compute, Some(&made)) {
+                        self.dependency_inputs.push(access);
+                    }
+                }
+            }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -516,12 +540,143 @@ impl State {
         true
     }
 
+    /// Captures a static texture binding, including the actual host table
+    /// offset selected by bind. This does not materialize or refresh views.
+    #[cfg(feature = "diagnostics")]
+    fn dependency_view(
+        &self,
+        stage: &'static str,
+        u: &UsedResource,
+        compute: bool,
+        made: Option<&[(u8, u32)]>,
+    ) -> Option<crate::dependencies::Access> {
+        use crate::dependencies::{Access, Binding, Role};
+        let role = match u.kind {
+            ResourceType::Srv => Role::Srv,
+            ResourceType::Uav => Role::Uav,
+            _ => return None,
+        };
+        let mut binding = Binding {
+            stage, root: u.slot, offset_dwords: u.table_offset_dwords,
+            host_slot: None, title_view: "untracked", title_resource: None, host_resource_matches: None,
+        };
+        let mut out = Access { resource: None, role, extent: None, binding: None };
+        if u.root == RootType::Table
+            && let Some(Root::Table(base)) = self.roots_ref(compute).get(usize::from(u.slot))
+            && let Some(handle) = base.checked_add(u64::from(u.table_offset_dwords) * 4)
+            && let Some(heap) = self.heap_of(handle)
+        {
+            let host = made.and_then(|made| {
+                let host = heap.host()?;
+                binding.host_slot = made.iter()
+                    .find(|m| m.0 == u.slot)
+                    .and_then(|m| (m.1 / 32).checked_add(u.table_offset_dwords / 8))
+                    .or_else(|| heap.index(handle).filter(|&index| index < host.count()));
+                Some(host)
+            });
+            let view = crate::descriptor::view(handle);
+            let resource = match view {
+                Some(View::Shader(resource, _)) => {
+                    binding.title_view = "srv";
+                    Some(resource)
+                }
+                Some(View::Unordered(resource, ..)) => {
+                    binding.title_view = "uav";
+                    Some(resource)
+                }
+                Some(View::Placed(..)) => {
+                    binding.title_view = "placed";
+                    None
+                }
+                Some(_) => {
+                    binding.title_view = "other";
+                    None
+                }
+                None => {
+                    binding.title_view = "missing";
+                    None
+                }
+            };
+            if let Some(resource) = resource {
+                let resource = resource as This;
+                out = Access::texture(resource, role);
+                binding.title_resource = out.resource;
+                if let Some(texture) = crate::resource::host_resource(resource) {
+                    let kind_matches = matches!(
+                        (role, binding.title_view),
+                        (Role::Srv, "srv") | (Role::Uav, "uav"),
+                    );
+                    binding.host_resource_matches = made.map(|_| {
+                        host.zip(binding.host_slot)
+                            .is_some_and(|(host, slot)| host.keeps_texture(slot, texture))
+                    });
+                    if !kind_matches || binding.host_resource_matches == Some(false) {
+                        out.resource = None;
+                    }
+                }
+            }
+        }
+        out.binding = Some(binding);
+        Some(out)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn note_dependency_pass(
+        &mut self,
+        list: &HostList,
+        kind: &'static str,
+        compute: bool,
+        ran: bool,
+        may_write: bool,
+    ) {
+        list.note_dependency(|| {
+            use crate::dependencies::Event;
+            let pipeline = self.pipeline as This;
+            let (key, shaders, reason) = crate::pipeline::dependency_pipeline(pipeline);
+            let mut accesses = std::mem::take(&mut self.dependency_inputs);
+            if !ran {
+                // Outputs declared by a skipped/failed shader are only
+                // candidates. They do not become observed writers.
+                accesses.clear();
+                crate::pipeline::dependency_uavs(pipeline, |stage, u| {
+                    if let Some(access) = self.dependency_view(stage, u, compute, None) {
+                        accesses.push(access);
+                    }
+                });
+            }
+            if !compute {
+                accesses.extend_from_slice(&self.dependency_targets);
+            }
+            if !may_write {
+                accesses.clear();
+            }
+            Event::Pass {
+                kind, key, shaders, accesses,
+                refusal: (!ran).then(|| reason.unwrap_or_else(|| "preparation refused".into())),
+            }
+        });
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_indirect_dependency(&mut self, list: &HostList, kind: u32, max: u32, ran: bool) {
+        let label = match kind {
+            0 | 1 => "indirect_draw",
+            2 => "indirect_compute",
+            10 => "indirect_mesh",
+            _ => "indirect_unsupported",
+        };
+        // Other signatures do not give us a reliable work class.
+        let compute = !matches!(kind, 0 | 1 | 10);
+        self.note_dependency_pass(list, label, compute, ran, max != 0);
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            self.note_dependency_pass(list, "dispatch", true, false, x != 0 && y != 0 && z != 0);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -532,13 +687,19 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
+            #[cfg(feature = "diagnostics")]
+            self.note_dependency_pass(list, "dispatch", true, false, x != 0 && y != 0 && z != 0);
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            #[cfg(feature = "diagnostics")]
+            self.note_dependency_pass(list, "dispatch", true, false, false);
             return;
         }
         if !self.bind(list, p, true) {
+            #[cfg(feature = "diagnostics")]
+            self.note_dependency_pass(list, "dispatch", true, false, x != 0 && y != 0 && z != 0);
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -547,6 +708,8 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        self.note_dependency_pass(list, "dispatch", true, true, x != 0 && y != 0 && z != 0);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -603,6 +766,8 @@ impl State {
                 }
                 Err(_) => false,
             };
+        #[cfg(feature = "diagnostics")]
+        self.note_dependency_pass(list, "mesh", false, ran, x != 0);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -862,6 +1027,8 @@ impl State {
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.note_dependency_pass(list, "draw", false, ran, vertices != 0 && instances != 0);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -949,6 +1116,8 @@ impl State {
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.note_dependency_pass(list, "draw_indexed", false, ran, indices != 0 && instances != 0);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]

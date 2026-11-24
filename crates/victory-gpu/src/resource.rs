@@ -759,6 +759,8 @@ struct Resource {
 /// lists that name it).
 #[cfg(windows)]
 pub(crate) struct HostTexture {
+    #[cfg(feature = "diagnostics")]
+    pub(crate) dependency_id: crate::dependencies::Resource,
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
 }
@@ -939,6 +941,8 @@ fn hand_out_resource(
         host: host.map(|texture| {
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
             std::sync::Arc::new(HostTexture {
+                #[cfg(feature = "diagnostics")]
+                dependency_id: crate::dependencies::new_resource(),
                 texture,
                 state: state.into(),
             })

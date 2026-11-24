@@ -9,6 +9,8 @@ use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+#[cfg(feature = "diagnostics")]
+use windows::core::Interface;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
@@ -376,6 +378,18 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// Whether this slot retains the expected host resource. This checks
+    /// resource identity only, without inspecting descriptor bytes.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn keeps_texture(&self, index: u32, resource: &ID3D12Resource) -> bool {
+        self.kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|kept| kept.as_raw() == resource.as_raw())
     }
 
     /// The view host slot `index` was made from, in a few words, with the

@@ -456,6 +456,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
+            #[cfg(feature = "diagnostics")]
+            list.note_dependency(|| {
+                use crate::dependencies::{Access, Event, Role};
+                Event::transfer("copy_resource", vec![
+                    Access::texture(src, Role::CopySource), Access::texture(dst, Role::CopyDest),
+                ])
+            });
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -587,6 +594,16 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        list.note_dependency(|| {
+            use crate::dependencies::{Access, Event, Role};
+            let dest = Access::texture(dst.resource, Role::CopyDest);
+            if src.kind == FOOTPRINT {
+                Event::transfer("buffer_to_texture", vec![dest])
+            } else {
+                Event::transfer("copy_texture_region", vec![Access::texture(src.resource, Role::CopySource), dest])
+            }
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -660,8 +677,17 @@ extern "system" fn resolve(
                     format,
                     D3D12_RESOLVE_MODE_AVERAGE,
                 );
+            } else {
+                return;
             }
         }
+        #[cfg(feature = "diagnostics")]
+        list.note_dependency(|| {
+            use crate::dependencies::{Access, Event, Role};
+            Event::transfer("resolve", vec![
+                Access::texture(src, Role::CopySource), Access::texture(dst, Role::CopyDest),
+            ])
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
@@ -716,6 +742,11 @@ extern "system" fn clear_rtv(
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
+        #[cfg(feature = "diagnostics")]
+        list.note_dependency(|| {
+            use crate::dependencies::{Access, Event, Role};
+            Event::transfer("clear_rtv", vec![Access::texture(record.resource, Role::Clear)])
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);
@@ -757,6 +788,11 @@ extern "system" fn clear_dsv(
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
+        #[cfg(feature = "diagnostics")]
+        list.note_dependency(|| {
+            use crate::dependencies::{Access, Event, Role};
+            Event::transfer("clear_dsv", vec![Access::texture(record.resource, Role::Clear)])
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
@@ -1160,6 +1196,10 @@ extern "system" fn execute_indirect(
 ) {
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if crate::dependencies::enabled() {
+            with_state(this, |list, state| state.note_indirect_dependency(list, u32::MAX, max, false));
+        }
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
@@ -1174,8 +1214,17 @@ extern "system" fn execute_indirect(
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            #[cfg(feature = "diagnostics")]
+            s.note_indirect_dependency(list, kind, max, ran);
         });
     } else {
+        #[cfg(feature = "diagnostics")]
+        if crate::dependencies::enabled() {
+            with_state(this, |list, state| {
+                let kind = if let [[kind, ..]] = args { *kind } else { u32::MAX };
+                state.note_indirect_dependency(list, kind, max, false);
+            });
+        }
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
