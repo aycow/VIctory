@@ -534,6 +534,9 @@ struct Pending {
     back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Its bottom-of-pipe writes, in list order: address, what, bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// The preludes of lists it names more than once, past their first:
+    /// each recording has its own, back to the spares once it has run.
+    preludes: Vec<Prelude>,
     submitted: std::time::Instant,
 }
 
@@ -577,6 +580,7 @@ impl Pending {
             lists: runs.iter().map(|&l| ListRef(l)).collect(),
             back,
             writes,
+            preludes: Vec::new(),
             submitted: std::time::Instant::now(),
         };
         (pending, touches)
@@ -762,32 +766,52 @@ impl Host {
             host: Some(self),
             ..Batch::default()
         };
-        for list in runs {
+        // A list named again in this submission: its earlier prelude is
+        // not yet run, so the repeat records into a spare one, and starts
+        // a new `ExecuteCommandLists` call (the queue runs them in order, so
+        // nothing waits). Where each such call starts in `lists`.
+        let mut preludes = Vec::new();
+        let mut cuts = vec![0];
+        let mut since_cut: Vec<*const HostList> = Vec::with_capacity(runs.len());
+        for (i, list) in runs.iter().enumerate() {
+            let id: *const HostList = *list;
+            let repeated = runs[..i].iter().any(|&l| std::ptr::eq(l, id));
+            if since_cut.contains(&id) {
+                cuts.push(lists.len());
+                since_cut.clear();
+            }
+            since_cut.push(id);
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some((prelude, spare)) = list.prelude(repeated.then_some(self)) {
                 lists.push(Some(prelude));
+                preludes.extend(spare);
             }
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        let (pending, touches) = Pending::of(runs);
+        let (mut pending, touches) = Pending::of(runs);
+        pending.preludes = preludes;
         let prepared = std::time::Instant::now();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        cuts.push(lists.len());
         // Diagnostics: each list on its own, timed and waited for
         // (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let timed = timing();
+        #[cfg(feature = "diagnostics")]
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timed {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
                 .map(|(&a, &b)| &lists[a..b])
                 .collect()
         } else {
-            vec![&lists[..]]
+            cuts.windows(2).map(|c| &lists[c[0]..c[1]]).collect()
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups: Vec<&[Option<ID3D12CommandList>]> =
+            cuts.windows(2).map(|c| &lists[c[0]..c[1]]).collect();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -811,7 +835,7 @@ impl Host {
                 ));
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 {
+            if timed {
                 self.wait_gpu(*submitted, true);
                 if started.elapsed() > std::time::Duration::from_millis(50) {
                     // SAFETY: a plain query.
@@ -839,7 +863,7 @@ impl Host {
         }
         self.timeline.push(*submitted, touches, pending);
         #[cfg(feature = "diagnostics")]
-        if groups.len() > 1 {
+        if timed {
             self.settle(*submitted);
         }
     }
@@ -985,6 +1009,12 @@ impl Host {
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for &(at, what, bytes) in &p.writes {
             what.write(at as *mut u8, bytes);
+        }
+        for prelude in p.preludes {
+            // SAFETY: the submission that ran from it has finished.
+            if unsafe { prelude.0.Reset() }.is_ok() && pool(&SPARE_PRELUDES).len() < SPARES {
+                pool(&SPARE_PRELUDES).push(prelude);
+            }
         }
         self.log_messages();
     }
@@ -1368,8 +1398,11 @@ impl HostList {
 
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// states become those the list ends with. With `repeated` (the list's
+    /// earlier prelude in the same submission has not run yet), it records
+    /// into a spare prelude from `repeated`, returned for the submission to
+    /// keep until it has run.
+    fn prelude(&self, repeated: Option<&Host>) -> Option<(ID3D12CommandList, Option<Prelude>)> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
@@ -1387,21 +1420,34 @@ impl HostList {
         if barriers.is_empty() {
             return None;
         }
-        let prelude = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
-        let (allocator, list) = &*prelude;
-        // SAFETY: the prelude is not executing (`execute` waits for the
-        // list's last submission first); the textures are live.
-        let recorded = unsafe {
-            allocator.Reset().and_then(|()| {
-                list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
-                list.Close()
-            })
+        let record = |(allocator, list): &Prelude| {
+            // SAFETY: nothing pending or running uses the prelude (`execute`
+            // waits for the list's last submission first, and a repeat in
+            // one submission records into a spare); the textures are live.
+            let recorded = unsafe {
+                allocator.Reset().and_then(|()| {
+                    list.Reset(allocator, None)?;
+                    list.ResourceBarrier(&barriers);
+                    list.Close()
+                })
+            };
+            if let Err(e) = recorded {
+                fail(format_args!("a host state prelude did not record ({e})"));
+            }
+            list.cast::<ID3D12CommandList>().ok()
         };
-        if let Err(e) = recorded {
-            fail(format_args!("a host state prelude did not record ({e})"));
+        match repeated {
+            Some(host) => {
+                let Some(spare) = host.fresh_prelude() else {
+                    fail(format_args!("no fresh host prelude for a repeated list"));
+                };
+                Some((record(&spare)?, Some(spare)))
+            }
+            None => {
+                let prelude = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+                Some((record(&prelude)?, None))
+            }
         }
-        list.cast().ok()
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -2661,6 +2707,70 @@ mod submissions {
         };
         assert_eq!((a, b), (7, 9));
         assert!(!list.running());
+    }
+
+    /// A submission naming one list twice: the repeat's prelude records into
+    /// its own allocator and list while the first is still pending, so both
+    /// run with their own barriers, and nothing waits on the CPU.
+    #[test]
+    fn a_list_named_twice_in_a_submission_has_two_preludes() {
+        use std::sync::atomic::Ordering;
+        let Some(host) = super::host() else { return };
+        let _guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let null = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        // A 16x16 RGBA8 render target, starting in COMMON.
+        let desc: [u32; 14] = [3, 0, 0, 0, 16, 0, 16, (1 << 16) | 1, 28, 1, 0, 0, 1, 0];
+        let mut tex = null;
+        let made = crate::resource::create_at_address(
+            null,
+            0x5_0000,
+            desc.as_ptr().cast(),
+            0,
+            null.cast(),
+            &iid,
+            &mut tex,
+        );
+        assert_eq!(made, crate::object::S_OK);
+        let list = host.new_list().unwrap();
+        // The list starts at RENDER_TARGET and ends at COPY_SOURCE.
+        assert!(list.transition(tex, 0x4).is_none());
+        let (texture, before) = list.transition(tex, 0x800).unwrap();
+        assert_eq!(before, 0x4);
+        // SAFETY: an open list and a live texture.
+        unsafe {
+            list.list.ResourceBarrier(&[super::transition(
+                texture,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES(0x4),
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        list.close();
+        let gate = Gate::new(host);
+        // COMMON -> RENDER_TARGET before the first run, COPY_SOURCE ->
+        // RENDER_TARGET before the second: two different barriers.
+        host.execute_gated(&[&list, &list], &gate.0);
+        assert!(list.running());
+        let mut spares = 0;
+        host.timeline.each_work(|w| {
+            if w.lists.iter().any(|l| std::ptr::eq(l.0, &list)) {
+                spares += w.preludes.len();
+            }
+        });
+        assert_eq!(spares, 1, "the repeat records into its own prelude");
+        gate.release();
+        host.drain();
+        let copy = crate::resource::host_copy(tex).unwrap();
+        assert_eq!(copy.state.load(Ordering::Relaxed), 0x800);
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        type Release = extern "system" fn(crate::object::This) -> u32;
+        crate::object::slot::<Release>(tex, 0x10)(tex);
     }
 
     #[test]
