@@ -72,6 +72,8 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
+    /// Heap handles made with a non-uniform index.
+    pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -127,6 +129,7 @@ impl Shader {
             heap_buffer_srv_indices: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
+            nonuniform_handles: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -305,8 +308,16 @@ impl Shader {
         )
     }
 
-    /// A descriptor heap handle, annotated with `props`.
-    pub fn heap_handle(&mut self, block: usize, index: V, sampler: bool, props: (u32, u32)) -> V {
+    /// A descriptor heap handle, annotated with `props`; `nonuniform` when
+    /// the index may differ between lanes (`NonUniformResourceIndex`).
+    pub fn heap_handle(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+    ) -> V {
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {
@@ -319,7 +330,8 @@ impl Shader {
         if !sampler && props.0 & IS_UAV == 0 && matches!(props.0 & KIND, 10..=12) {
             self.heap_buffer_srv_indices.push(index);
         }
-        let (s, n) = (self.m.bool(sampler), self.m.bool(false));
+        self.nonuniform_handles += u32::from(nonuniform);
+        let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
             "createHandleFromHeap",
@@ -762,10 +774,10 @@ mod tests {
     fn heap_buffer_srv_usage_excludes_unrelated_handles() {
         let mut s = Shader::new(false);
         let index = s.m.undef(s.t.i32);
-        s.heap_handle(s.entry, index, true, (14, 0));
-        s.heap_handle(s.entry, index, false, (2, 0));
-        s.heap_handle(s.entry, index, false, (13, 0));
-        s.heap_handle(s.entry, index, false, (0x100b, 0));
+        s.heap_handle(s.entry, index, true, false, (14, 0));
+        s.heap_handle(s.entry, index, false, false, (2, 0));
+        s.heap_handle(s.entry, index, false, false, (13, 0));
+        s.heap_handle(s.entry, index, false, false, (0x100b, 0));
         s.root_srv_handle(0);
         assert_eq!(s.heap_buffer_srv_usage(), HeapBufferSrvUsage::None);
     }
@@ -778,7 +790,7 @@ mod tests {
         let bytes = s.m.bin(s.entry, Bin::Add, part, offset);
         let shift = s.m.i32(5);
         let slot = s.m.bin(s.entry, Bin::LShr, bytes, shift);
-        s.heap_handle(s.entry, slot, false, (11, 0));
+        s.heap_handle(s.entry, slot, false, false, (11, 0));
         assert_eq!(
             s.heap_buffer_srv_usage(),
             HeapBufferSrvUsage::Exact(vec![17])
@@ -797,9 +809,9 @@ mod tests {
         let choose = s.m.new_block();
         let join = s.m.new_block();
         let phi = s.m.phi(join, s.t.i32);
-        s.heap_handle(join, phi, false, (12, 32));
+        s.heap_handle(join, phi, false, false, (12, 32));
         s.m.set_phi(phi, vec![(bounded, s.entry), (other, choose)]);
-        s.heap_handle(s.entry, base, false, (10, 0));
+        s.heap_handle(s.entry, base, false, false, (10, 0));
         assert_eq!(
             s.heap_buffer_srv_usage(),
             HeapBufferSrvUsage::Exact(vec![30, 31, 32, 33, 47])
@@ -812,14 +824,14 @@ mod tests {
         let unknown = s.m.undef(s.t.i32);
         let mask = s.m.i32(127);
         let broad = s.m.bin(s.entry, Bin::And, unknown, mask);
-        s.heap_handle(s.entry, broad, false, (11, 0));
+        s.heap_handle(s.entry, broad, false, false, (11, 0));
         assert_eq!(s.heap_buffer_srv_usage(), HeapBufferSrvUsage::All);
 
         let mut s = Shader::new(false);
         let unknown = s.m.undef(s.t.i32);
         let fixed = s.m.i32(7);
-        s.heap_handle(s.entry, fixed, false, (11, 0));
-        s.heap_handle(s.entry, unknown, false, (11, 0));
+        s.heap_handle(s.entry, fixed, false, false, (11, 0));
+        s.heap_handle(s.entry, unknown, false, false, (11, 0));
         assert_eq!(s.heap_buffer_srv_usage(), HeapBufferSrvUsage::All);
     }
 }
