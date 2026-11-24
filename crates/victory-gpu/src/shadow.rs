@@ -195,16 +195,24 @@ impl Shadow {
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+                    let changed = if title == old {
+                        // No CPU changes in the sampled title piece. The
+                        // GPU's bytes are already the merged result.
+                        title.copy_from_slice(host);
+                        true
+                    } else {
+                        // Keep the title's bytes where the GPU made no change.
+                        // The shadow also takes the merged result.
+                        let mut changed = false;
+                        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                            if *h != *o && *t != *h {
+                                *t = *h;
+                                changed = true;
+                            }
+                            *h = *t;
                         }
-                        *h = *t;
-                    }
+                        changed
+                    };
                     if changed {
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);

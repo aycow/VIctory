@@ -898,3 +898,33 @@ fn native_copy_control_with_explicit_known_states() {
     assert_eq!(b.words(), [500]);
     assert_eq!(output.words(), [500]);
 }
+
+#[test]
+fn copyback_merges_cpu_changes_after_the_snapshot() {
+    let Some(gpu) = test_gpu() else { return };
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    for (cpu_first, cpu_second, expected_first, changed) in [
+        (11, 27, 500, true),
+        (0x0100_000b, 99, 0x0100_01f4, true),
+        (500, 99, 500, false),
+    ] {
+        let buffer = TitleBuffer::new(&[11, 27]);
+        let shadow = shadow::find(buffer.address, buffer.len).unwrap();
+        let start = buffer.address as usize;
+        let len = buffer.len as usize;
+        assert_eq!(shadow.update(start, len), len);
+        shadow.queue_write(start, len);
+        shadow.snapshot(start, len);
+        buffer.set(0, cpu_first);
+        buffer.set(1, cpu_second);
+
+        let commands = gpu.host.new_list().unwrap();
+        writer.write_gpu(&commands, buffer.gpu(&shadow, 0), 500);
+        commands.close();
+        gpu.execute(&[&commands]);
+
+        assert_eq!(shadow.copy_back(start, len), if changed { len } else { 0 });
+        shadow.finish_writes();
+        assert_eq!(buffer.words(), [expected_first, cpu_second]);
+    }
+}
