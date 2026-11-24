@@ -1931,7 +1931,7 @@ fn visit_direct_ranges<'a>(
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<ShadowRange>,
+    refreshes: Vec<ShadowReadRanges>,
     writes: Vec<ShadowRange>,
     sampled: Option<SampledRanges>,
     /// Staging buffers (by address) refreshed since the last title write.
@@ -2054,14 +2054,17 @@ impl Batch {
     }
 
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        if len == 0 {
+            return;
+        }
+        let range = (address, address + len);
         match self
             .refreshes
             .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
         {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+            Some((_, ranges)) => ranges.push(range),
+            None => self.refreshes.push((shadow.clone(), vec![range])),
         }
     }
 
@@ -2082,28 +2085,28 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        for (shadow, mut ranges) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
+            ranges.sort_unstable();
+            // Keep the exact union. The shadow can ask about a larger span,
+            // but only copies the requested bytes of an observed dirty page.
+            ranges.dedup_by(|next, previous| {
+                if next.0 > previous.1 {
+                    return false;
+                }
+                previous.1 = previous.1.max(next.1);
+                true
+            });
+            let copied = shadow.update_ranges(&ranges);
+            let shadow_id = std::sync::Arc::as_ptr(&shadow) as usize;
             if let Some(sampled) = &mut self.sampled {
-                sampled.add(std::sync::Arc::as_ptr(&shadow) as usize, from, to);
+                for &(from, to) in &ranges {
+                    sampled.add(shadow_id, from, to);
+                }
             }
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add, range};
-                range(
-                    std::sync::Arc::as_ptr(&shadow) as usize,
-                    from,
-                    to - from,
-                    copied,
-                    us,
-                );
-                add(C::ConventionalRanges, 1);
-                add(C::ConventionalRequested, (to - from) as u64);
-                add(C::ConventionalBytes, copied as u64);
-                add(C::ConventionalUs, us);
-            }
+            crate::copystat::conventional_refresh(shadow_id, &ranges, copied, us);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }

@@ -99,14 +99,16 @@ pub(crate) fn mode() -> u8 {
 
 #[derive(Default)]
 struct RangeStats {
-    calls: u64,
+    batches: u64,
+    ranges: u64,
+    requested: u64,
     filled: u64,
     us: u64,
 }
 
 #[derive(Default)]
 struct RefreshStats {
-    /// Conventional refreshes by native shadow, title address, and requested size.
+    /// Conventional refreshes by native shadow and enclosing title span.
     ranges: HashMap<(usize, usize, usize), RangeStats>,
     /// Failed watch probes by native shadow.
     failed: HashMap<usize, (u64, u64)>,
@@ -114,14 +116,29 @@ struct RefreshStats {
 
 static REFRESH: Mutex<Option<RefreshStats>> = Mutex::new(None);
 
-pub(crate) fn range(shadow: usize, src: usize, len: usize, filled: usize, us: u64) {
+pub(crate) fn conventional_refresh(
+    shadow: usize,
+    ranges: &[(usize, usize)],
+    filled: usize,
+    us: u64,
+) {
+    let requested = ranges.iter().map(|&(from, to)| (to - from) as u64).sum::<u64>();
+    add(C::ConventionalRanges, ranges.len() as u64);
+    add(C::ConventionalRequested, requested);
+    add(C::ConventionalBytes, filled as u64);
+    add(C::ConventionalUs, us);
+
+    let src = ranges[0].0;
+    let span = ranges[ranges.len() - 1].1 - src;
     let mut stats = REFRESH.lock().unwrap_or_else(|e| e.into_inner());
     let e = stats
         .get_or_insert_with(RefreshStats::default)
         .ranges
-        .entry((shadow, src, len))
+        .entry((shadow, src, span))
         .or_default();
-    e.calls += 1;
+    e.batches += 1;
+    e.ranges += ranges.len() as u64;
+    e.requested += requested;
     e.filled += filled as u64;
     e.us += us;
 }
@@ -254,9 +271,10 @@ pub(crate) fn log(frames: f64) {
         let kind = info.Type;
         let (failed_probes, failed_bytes) = failed.get(&shadow).copied().unwrap_or_default();
         tracing::info!(
-            "  copied from {src:#x}+{len:#x} (memory {kind:#x}, shadow {shadow:#x}): {:.1}x/frame, {:.2} MB requested/frame, {:.2} MB filled/frame, {:.2} ms/frame, {:.1} failed watch probes/frame ({:.2} MB requested/frame)",
-            stats.calls as f64 / frames,
-            (stats.calls * len as u64) as f64 / 1e6 / frames,
+            "  copied within {src:#x}+{len:#x} (memory {kind:#x}, shadow {shadow:#x}): {:.1} batches/frame, {:.1} ranges/frame, {:.2} MB requested/frame, {:.2} MB filled/frame, {:.2} ms/frame, {:.1} failed watch probes/frame ({:.2} MB requested/frame)",
+            stats.batches as f64 / frames,
+            stats.ranges as f64 / frames,
+            stats.requested as f64 / 1e6 / frames,
             stats.filled as f64 / 1e6 / frames,
             stats.us as f64 / 1e3 / frames,
             failed_probes as f64 / frames,

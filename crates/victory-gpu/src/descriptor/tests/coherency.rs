@@ -1156,6 +1156,99 @@ void main(uint3 id : SV_DispatchThreadID) {
     assert_eq!(read(title.base as *mut u8), 733);
 }
 
+#[cfg(feature = "diagnostics")]
+#[test]
+#[ignore = "allocates and touches a 174 MiB watched shadow"]
+fn conventional_refresh_does_not_fill_disjoint_gap() {
+    let Some((host, _)) = test_host() else {
+        return;
+    };
+    use crate::copystat::{C, read as counter};
+
+    const PAGE: u64 = crate::watch::PAGE as u64;
+    const SIZE: u64 = 174 << 20;
+    let title = TitleBuffer::watched(SIZE);
+    let shadow = crate::shadow::find(title.base, SIZE).unwrap();
+    // SAFETY: The fixture owns the committed pages. Fault them in before
+    // taking the first write-watch sample to keep the test deterministic.
+    unsafe { (title.base as *mut u8).write_bytes(0, SIZE as usize) };
+    let prepare = |ranges: &[(u64, u64)]| {
+        let list = host.new_list().unwrap();
+        for &(offset, len) in ranges {
+            shadow.refresh(&list, title.base + offset, len);
+        }
+        list.close();
+        let stats = || {
+            [
+                counter(C::ConventionalRanges),
+                counter(C::ConventionalRequested),
+                counter(C::ConventionalBytes),
+                counter(C::ConventionalUs),
+            ]
+        };
+        let before = stats();
+        host.execute(&[&list]);
+        let after = stats();
+        std::array::from_fn::<_, 4, _>(|i| after[i] - before[i])
+    };
+    prepare(&[(0, SIZE)]);
+
+    let mut mapped = std::ptr::null_mut();
+    // SAFETY: The shadow is CPU-visible and kept live. Each read below
+    // follows the completion wait of the submission that filled it.
+    unsafe {
+        shadow
+            .buffer
+            .Map(
+                0,
+                Some(&D3D12_RANGE { Begin: 0, End: SIZE as usize }),
+                Some(&mut mapped),
+            )
+            .unwrap()
+    };
+    let word = |offset| {
+        // SAFETY: Offsets used below are aligned and inside the live mapping.
+        read(unsafe { mapped.cast::<u8>().add(offset as usize) })
+    };
+
+    // Dirty pages across the entire span. Request only the two endpoint
+    // pages, including out-of-order, overlapping and adjacent parts.
+    for offset in (0..SIZE).step_by(PAGE as usize) {
+        title.set(offset, 13);
+    }
+    title.set(0, 17);
+    title.set(SIZE - PAGE, 23);
+    let sparse = prepare(&[
+        (SIZE - PAGE, PAGE),
+        (PAGE / 2, PAGE / 2),
+        (0, PAGE / 2),
+        (PAGE / 4, PAGE / 2),
+    ]);
+    let endpoints = (word(0), word(SIZE - PAGE));
+    let gap_before = word(SIZE / 2);
+    let gap = prepare(&[(SIZE / 2, 4)]);
+    let gap_after = word(SIZE / 2);
+
+    for offset in (0..SIZE).step_by(PAGE as usize) {
+        title.set(offset, 37);
+    }
+    let dense = prepare(&[(SIZE / 2, SIZE / 2), (0, SIZE / 2 + PAGE)]);
+    let dense_words = (word(0), word(SIZE / 2), word(SIZE - PAGE));
+    // SAFETY: Close the Map above. The test only read this mapping.
+    unsafe { shadow.buffer.Unmap(0, Some(&D3D12_RANGE::default())) };
+
+    eprintln!(
+        "174 MiB conventional refresh, [ranges, requested, copied, us]: sparse {sparse:?}, gap {gap:?}, dense {dense:?}; endpoints {endpoints:?}, gap word {gap_before} -> {gap_after}, dense words {dense_words:?}"
+    );
+    assert_eq!(endpoints, (17, 23));
+    assert_eq!(&dense[..3], &[1, SIZE, SIZE]);
+    assert_eq!(dense_words, (37, 37, 37));
+    assert_eq!(&sparse[..3], &[2, 2 * PAGE, 2 * PAGE]);
+    assert_eq!(gap_before, 0);
+    assert_eq!(&gap[..3], &[1, 4, 4]);
+    assert_eq!(gap_after, 13);
+}
+
 /// Full-size synthetic traffic using a bounded title and shadow working set.
 #[cfg(feature = "diagnostics")]
 #[test]
