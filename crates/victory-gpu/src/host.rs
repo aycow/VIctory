@@ -1,11 +1,18 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
-//! shortcut: every submission is waited for, so CPU and GPU never overlap;
-//! overlap them with per-submission fences once more than clears run.
+//! Submissions are not waited for: each signals the next value of the host
+//! fence and joins the [`Timeline`], and is finished (what its shaders
+//! wrote copied back into title memory, then its bottom-of-pipe writes and
+//! the title fence signals queued behind it) in submission order once the
+//! GPU has run it: by our completion thread, or by whichever thread first
+//! needs it (a later submission's step touching memory it writes, a reset
+//! of one of its lists, a present).
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+use crate::timeline::{Ranges, Timeline};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -41,7 +48,10 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
-    event: HANDLE,
+    /// Submissions not finished yet, oldest first.
+    timeline: Timeline<Pending>,
+    /// Whether the completion thread runs.
+    finisher: std::sync::Once,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
     /// A ring of depth views, used as `rtvs`.
@@ -56,7 +66,7 @@ pub(crate) struct Host {
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
-// free-threaded; the event handle is only waited on under `submitted`.
+// free-threaded; the timeline's lists are pinned while in it (`Pending`).
 unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
@@ -117,10 +127,16 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
+/// The host GPU if it was made (never makes it).
+pub(crate) fn made() -> Option<&'static Host> {
+    HOST.get()?.as_ref()
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -192,7 +208,6 @@ fn create() -> windows::core::Result<Host> {
             ..Default::default()
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -213,7 +228,8 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
-            event,
+            timeline: Timeline::new(),
+            finisher: std::sync::Once::new(),
             rtvs,
             rtv_size,
             dsvs,
@@ -301,6 +317,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// The host fence value of its last submission (0: none): it is not
+    /// reset, resubmitted or dropped before that one has finished.
+    last: AtomicU64,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -309,6 +328,14 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+impl Drop for HostList {
+    /// Its allocators and upload memory may not go while the GPU runs it,
+    /// and a submission in flight still names it.
+    fn drop(&mut self) {
+        self.settle();
+    }
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -378,10 +405,11 @@ enum Step {
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
-    /// Work that writes host memory only.
-    Host(Box<dyn Fn() + Send>),
+    /// Work that may write title memory: the range it writes, the range it
+    /// reads (address, bytes).
+    Run(Box<dyn Fn() + Send>, (usize, usize), (usize, usize)),
+    /// Work that writes host memory only, and the title memory it reads.
+    Host(Box<dyn Fn() + Send>, (usize, usize)),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -411,6 +439,92 @@ struct Deferred {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+}
+
+/// Submissions in flight at most: a submission past them waits for the
+/// oldest first.
+const IN_FLIGHT: usize = 16;
+
+/// A list a submission in flight names.
+#[derive(Clone, Copy)]
+struct ListRef(*const HostList);
+
+// SAFETY: host lists are used from any thread (their state is behind
+// locks), and one is not reset or dropped while a submission naming it is
+// in flight (`HostList::last`).
+unsafe impl Send for ListRef {}
+
+impl ListRef {
+    fn get<'a>(self) -> &'a HostList {
+        // SAFETY: as above, the list outlives the submission.
+        unsafe { &*self.0 }
+    }
+}
+
+/// What is left of a submission once the GPU has run it.
+struct Pending {
+    lists: Vec<ListRef>,
+    /// The ranges its shaders write (host copy, address, bytes), each once.
+    back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Its bottom-of-pipe writes, in list order: address, what, bytes.
+    writes: Vec<(usize, crate::queue::Written, usize)>,
+    submitted: std::time::Instant,
+}
+
+impl Pending {
+    /// A submission's, after its steps ran, with the title memory its GPU
+    /// work writes (copied back, written at the bottom of the pipe) and
+    /// reads (host copies and textures brought up to date for it).
+    fn of(runs: &[&HostList]) -> (Pending, Ranges, Ranges) {
+        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let (mut writes, mut wrote, mut read) = (Vec::new(), Vec::new(), Vec::new());
+        // One list's lock at a time: a submission may name a list twice.
+        for list in runs {
+            let deferred = list.deferred();
+            for step in &deferred.copies {
+                match step {
+                    Step::GpuWrite(shadow, address, len) => {
+                        wrote.push((*address, address + len));
+                        if !back.iter().any(|(s, a, l)| {
+                            std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
+                        }) {
+                            back.push((shadow.clone(), *address, *len));
+                        }
+                    }
+                    Step::Refresh(_, address, len) => read.push((*address, address + len)),
+                    Step::Texture(staging) => read.push(staging.range()),
+                    _ => {}
+                }
+            }
+            for &(at, what, bytes) in &deferred.writes {
+                writes.push((at, what, bytes));
+                wrote.push((at, at + bytes));
+            }
+        }
+        let pending = Pending {
+            lists: runs.iter().map(|&l| ListRef(l)).collect(),
+            back,
+            writes,
+            submitted: std::time::Instant::now(),
+        };
+        (pending, Ranges::new(wrote), Ranges::new(read))
+    }
+}
+
+/// A thread's event for waiting on the host fence.
+struct Event(HANDLE);
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        // SAFETY: our own handle, no longer waited on.
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+thread_local! {
+    /// Null if it could not be made: the fence wait then blocks by itself.
+    // SAFETY: plain event creation.
+    static EVENT: Event = Event(unsafe { CreateEventW(None, false, false, None) }.unwrap_or_default());
 }
 
 impl Host {
@@ -481,6 +595,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                last: AtomicU64::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -489,18 +604,42 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
+    /// Runs closed lists. Their submission joins the timeline, finished
+    /// once the GPU has run it.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
-        // One submission at a time from preparation to copy-back: snapshots
+        self.finisher.call_once(|| {
+            let spawned = std::thread::Builder::new()
+                .name("victory-gpu-finisher".into())
+                .spawn(|| made().into_iter().for_each(Host::finish_loop));
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "no completion thread; submissions finish when needed");
+            }
+        });
+        // One submission at a time from preparation to submission: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        // What has run is finished first. A list still in flight is waited
+        // for: its upload memory, budget word and prelude are rewritten
+        // below.
+        self.finish();
+        for list in runs {
+            self.settle(list.last.load(Ordering::Acquire));
+        }
+        if self.timeline.len() >= IN_FLIGHT
+            && let Some((oldest, _)) = self.timeline.span()
+        {
+            self.settle(oldest);
+        }
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch {
+            host: Some(self),
+            ..Batch::default()
+        };
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -510,8 +649,11 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        let (pending, writes, reads) = Pending::of(runs);
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        // Diagnostics: each list on its own, timed and waited for
+        // (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
             firsts
@@ -527,81 +669,194 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
+            // SAFETY: closed lists, not running (waited for above); our fence.
+            let signalled = unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+                self.queue.Signal(&self.fence, *submitted)
+            };
+            if let Err(e) = signalled {
+                // Nothing would finish it.
+                fail(format_args!(
+                    "a host submission of {} lists was not signalled ({e}){}",
+                    runs.len(),
+                    self.removal_data(runs)
+                ));
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+            if groups.len() > 1 {
+                self.wait_gpu(*submitted, true);
+                if started.elapsed() > std::time::Duration::from_millis(50) {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    let commands = runs[i]
+                        .notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len();
+                    tracing::warn!(
+                        ms = started.elapsed().as_millis(),
+                        commands,
+                        "slow host list"
+                    );
+                    for (ms, op) in runs[i].slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
                 }
             }
             let _ = (i, started);
         }
         let _ = &firsts;
-        let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
-        SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-        // The host resets a device whose submission runs for about 2 s.
-        if gpu > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = runs
-                .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .collect();
-            tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
-        }
-        // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-            fail(format_args!(
-                "host GPU device removed after a submission of {} lists{}{}",
-                runs.len(),
-                self.removal_data(runs),
-                last_notes(runs)
-            ));
-        }
-        // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done; each range once per
-        // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
-        let copying = std::time::Instant::now();
-        // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
+            list.last.store(*submitted, Ordering::Release);
+        }
+        self.timeline.push(*submitted, writes, reads, pending);
+        #[cfg(feature = "diagnostics")]
+        if groups.len() > 1 {
+            self.settle(*submitted);
+        }
+    }
+
+    /// Finishes, in order, the submissions the GPU has run (no waiting).
+    fn finish(&self) {
+        // SAFETY: a plain query (all ones once the device is removed).
+        let reached = unsafe { self.fence.GetCompletedValue() };
+        self.timeline.finish(reached, |p| self.complete(p));
+    }
+
+    /// Finishes every submission up to the one that signals `value`,
+    /// waiting for the GPU to run them.
+    pub(crate) fn settle(&self, value: u64) {
+        if self
+            .timeline
+            .span()
+            .is_some_and(|(oldest, _)| oldest <= value)
+        {
+            self.wait_gpu(value, true);
+            self.finish();
+        }
+    }
+
+    /// Finishes every submission made so far.
+    pub(crate) fn drain(&self) {
+        if let Some((_, newest)) = self.timeline.span() {
+            self.settle(newest);
+        }
+    }
+
+    /// Before a submission's step reads title memory `[address, address +
+    /// len)` (or, with `writing`, writes it): finishes the submissions in
+    /// flight whose GPU work writes it (or reads it), so that the step sees
+    /// title memory and host copies as if they had run when submitted.
+    fn settle_range(&self, address: usize, len: usize, writing: bool) {
+        if let Some(value) = self
+            .timeline
+            .conflict(address, address.saturating_add(len), writing)
+        {
+            self.settle(value);
+        }
+    }
+
+    /// Runs `signal` once every submission made so far has finished.
+    pub(crate) fn after(&self, signal: impl FnOnce() + Send + 'static) {
+        self.timeline.after(signal);
+    }
+
+    /// Blocks until the GPU has run what signals `value`; the time counts
+    /// as waiting for the GPU if `counted`.
+    fn wait_gpu(&self, value: u64, counted: bool) {
+        // SAFETY: plain calls on our fence and this thread's event.
+        unsafe {
+            if self.fence.GetCompletedValue() >= value {
+                return;
+            }
+            let started = std::time::Instant::now();
+            let waited = EVENT.with(|e| {
+                self.fence
+                    .SetEventOnCompletion(value, e.0)
+                    .map(|()| WaitForSingleObject(e.0, INFINITE))
+            });
+            if let Err(e) = waited {
+                tracing::warn!(error = %e, "host fence wait failed; polling");
+                while self.fence.GetCompletedValue() < value {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
+            if counted {
+                SUBMISSION_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
         }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+    }
+
+    /// The completion thread: finishes each submission as soon as the GPU
+    /// has run it, so that title fences and bottom-of-pipe writes move on
+    /// their own (the title waits for its events and reads its memory).
+    fn finish_loop(&self) {
+        loop {
+            let value = self.timeline.next();
+            self.wait_gpu(value, false);
+            self.finish();
+        }
+    }
+
+    /// Once the GPU has run a submission: what its shaders wrote goes back
+    /// into title memory, then its bottom-of-pipe writes, which tell the
+    /// title the GPU is done.
+    fn complete(&self, p: Pending) {
+        // SAFETY: a plain query.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            // Any submission in flight may have faulted.
+            let mut runs: Vec<&HostList> = p.lists.iter().map(|l| l.get()).collect();
+            self.timeline
+                .each_work(|w| runs.extend(w.lists.iter().map(|l| l.get())));
+            fail(format_args!(
+                "host GPU device removed after a submission of {} lists{}{}",
+                p.lists.len(),
+                self.removal_data(&runs),
+                last_notes(&runs)
+            ));
+        }
+        // About how long it ran: from its submission or the end of the one
+        // before, whichever is later.
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let now = std::time::Instant::now();
+        let ran = {
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            let from = last.map_or(p.submitted, |l| l.max(p.submitted));
+            *last = Some(now);
+            now - from
+        };
+        // The host resets a device whose submission runs for about 2 s.
+        if ran > std::time::Duration::from_millis(250) {
+            let pipelines: std::collections::BTreeSet<String> = p
+                .lists
+                .iter()
+                .flat_map(|l| {
+                    l.get()
+                        .pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                })
+                .collect();
+            tracing::warn!(
+                ms = ran.as_millis(),
+                lists = p.lists.len(),
+                ?pipelines,
+                "slow host submission"
+            );
+        }
+        // What shaders wrote goes back before the bottom-of-pipe writes;
+        // each range once per submission, however many dispatches declared
+        // it (the world's passes declare the same big ranges dozens of
+        // times).
+        let copying = std::time::Instant::now();
+        for (shadow, address, len) in &p.back {
+            let written = shadow.copy_back(*address, *len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
-        for list in runs {
-            for &(at, what, bytes) in &list.deferred().writes {
-                what.write(at as *mut u8, bytes);
-            }
+        for &(at, what, bytes) in &p.writes {
+            what.write(at as *mut u8, bytes);
         }
         self.log_messages();
     }
@@ -877,9 +1132,20 @@ impl HostList {
         }
     }
 
-    /// Only after the list's last submission finished (every one is waited
-    /// for).
+    /// Waits for the list's last submission and finishes it (and those
+    /// before it).
+    pub(crate) fn settle(&self) {
+        let last = self.last.load(Ordering::Acquire);
+        if last != 0
+            && let Some(host) = made()
+        {
+            host.settle(last);
+        }
+    }
+
+    /// After the list's last submission has finished (waited for here).
     pub(crate) fn reset(&self) {
+        self.settle();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -947,8 +1213,8 @@ impl HostList {
             return None;
         }
         let (allocator, list) = &self.prelude;
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // SAFETY: the prelude is not executing (`execute` waits for the
+        // list's last submission first); the textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -1122,9 +1388,10 @@ impl HostList {
             deferred.budget_zeroed = true;
             let at = *data;
             // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
+            deferred.copies.push(Step::Host(
+                Box::new(move || unsafe { (at as *mut u32).write_volatile(0) }),
+                (0, 0),
+            ));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -1144,15 +1411,26 @@ impl HostList {
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
+    /// `work` may write title memory (refreshes after it copy again): the
+    /// range `writes` (address, bytes); it reads `reads`.
+    pub(crate) fn defer(
+        &self,
+        writes: (usize, usize),
+        reads: (usize, usize),
+        work: impl Fn() + Send + 'static,
+    ) {
+        self.deferred()
+            .copies
+            .push(Step::Run(Box::new(work), writes, reads));
         self.deferred().refreshed.clear();
     }
 
-    /// As [`HostList::defer`], for work that writes only host memory.
-    pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work)));
+    /// As [`HostList::defer`], for work that writes only host memory (and
+    /// reads the title's `reads`).
+    pub(crate) fn defer_host(&self, reads: (usize, usize), work: impl Fn() + Send + 'static) {
+        self.deferred()
+            .copies
+            .push(Step::Host(Box::new(work), reads));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -1176,6 +1454,8 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    batch.settle(src, len, false);
+                    batch.settle(dst, len, true);
                     batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
@@ -1186,6 +1466,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    batch.settle(src, len, false);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -1195,12 +1476,21 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
+                    // Title memory an earlier submission's shaders write is
+                    // current only once that one is copied back.
+                    batch.settle(*address, *len, false);
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written();
+                Step::Run(work, _, _) | Step::Host(work, _) => {
+                    match *step {
+                        Step::Run(_, (to, written), (from, read)) => {
+                            batch.settle(from, read, false);
+                            batch.settle(to, written, true);
+                            batch.title_written();
+                        }
+                        Step::Host(_, (from, read)) => batch.settle(from, read, false),
+                        _ => {}
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -1211,13 +1501,18 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
+                    // The range's snapshot is taken from the host copy, which
+                    // an earlier submission's shaders may still be writing;
+                    // the shaders start from the title's data.
+                    batch.settle(*address, *len, false);
                     batch.flush();
                     shadow.writing(*address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
+                        let (from, to) = staging.range();
+                        batch.settle(from, to - from, false);
                         staging.refresh();
                     }
                     continue;
@@ -1238,13 +1533,24 @@ impl HostList {
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
-struct Batch {
+struct Batch<'a> {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// The host, whose earlier submissions may still be in flight.
+    host: Option<&'a Host>,
 }
 
-impl Batch {
+impl Batch<'_> {
+    /// Before a step reads (or, with `writing`, writes) title memory
+    /// `[address, address + len)`: earlier submissions whose GPU work
+    /// writes (or reads) it are finished first.
+    fn settle(&self, address: usize, len: usize, writing: bool) {
+        if let Some(host) = self.host {
+            host.settle_range(address, len, writing);
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         match self
@@ -1607,7 +1913,9 @@ impl Host {
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
-            // SAFETY: no back buffer is held; every submission was waited for.
+            // The back buffers may not be in use.
+            self.drain();
+            // SAFETY: no back buffer is held; every submission has finished.
             let resized = unsafe {
                 p.swap_chain
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
@@ -1656,11 +1964,17 @@ impl Host {
             ]);
             p.copy.close();
             self.execute(&[&p.copy]);
+            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // shortcut: the frame's submissions are finished before the
+            // present returns, as when every submission was waited for (the
+            // title may take a present for the GPU being done with the
+            // frame). Only work within a frame overlaps; let one frame run
+            // on once titles are known to wait for their fences instead.
+            self.drain();
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -2051,5 +2365,66 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod submissions {
+    use crate::queue::Written;
+
+    #[test]
+    fn a_list_is_finished_before_it_is_reset() {
+        let Some(host) = super::host() else { return }; // no host GPU here
+        let list = host.new_list().unwrap();
+        let word = Box::new(0u64);
+        list.defer_write((&raw const *word).cast_mut().cast(), Written::Value(7), 8);
+        list.close();
+        host.execute(&[&list]);
+        // The bottom-of-pipe write is done by the time the list may be
+        // recorded again.
+        list.reset();
+        // SAFETY: our word; the finishing thread is done with it.
+        assert_eq!(unsafe { std::ptr::read_volatile(&*word) }, 7);
+    }
+
+    #[test]
+    fn signals_follow_the_writes_of_earlier_submissions() {
+        let Some(host) = super::host() else { return };
+        let list = host.new_list().unwrap();
+        let word: &'static mut u64 = Box::leak(Box::new(0));
+        let at = (&raw mut *word) as usize;
+        list.defer_write(at as *mut u8, Written::Value(3), 8);
+        list.close();
+        host.execute(&[&list]);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let s = seen.clone();
+        host.after(move || {
+            // SAFETY: the leaked word lives on.
+            let value = unsafe { std::ptr::read_volatile(at as *const u64) };
+            *s.lock().unwrap() = Some(value);
+        });
+        host.drain();
+        assert_eq!(*seen.lock().unwrap(), Some(3));
+    }
+
+    #[test]
+    fn a_step_reading_what_an_earlier_submission_writes_waits_for_it() {
+        let Some(host) = super::host() else { return };
+        let (first, second) = (host.new_list().unwrap(), host.new_list().unwrap());
+        let word = Box::new(0u64);
+        let at = (&raw const *word).cast_mut().cast::<u8>();
+        first.defer_write(at, Written::Value(0x1234_5678_9abc), 8);
+        first.close();
+        // The second submission copies the word at submission: after the
+        // first's write, as the GPU would order them.
+        let copy = Box::new(0u64);
+        second.defer_fill((&raw const *copy).cast_mut().cast(), at, 8);
+        second.close();
+        host.execute(&[&first]);
+        host.execute(&[&second]);
+        // SAFETY: our word, copied while the second was submitted.
+        assert_eq!(unsafe { std::ptr::read_volatile(&*copy) }, 0x1234_5678_9abc);
+        second.reset();
+        first.reset();
     }
 }

@@ -78,7 +78,9 @@ fn give_back(v: Vec<u8>) {
 const NOT_WATCHED: u8 = 2;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written only on the submitting thread.
+// written by the submitting thread, and by the thread finishing an earlier
+// submission only in ranges that one's shaders wrote (which the submitting
+// thread leaves alone until it has finished).
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
@@ -247,8 +249,10 @@ impl Shadow {
                 }
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        // Every submitted step that declared the range is done with it
+        // (submissions in flight do not declare overlapping ranges of a
+        // copy: a later one finishes the earlier first), and the snapshot
+        // with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         if pending.is_empty()
