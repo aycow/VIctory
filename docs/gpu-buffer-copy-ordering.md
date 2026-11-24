@@ -245,3 +245,38 @@ Independent copies share native calls but still allocate individual transfer
 lists on first use. The tests measure synthetic workloads. Game performance
 and shader-to-CPU staging dependencies inside a single unsplit native segment
 remain unverified. [Copyback work in PR #261](https://github.com/Marvisak/VIctory/pull/261) · [Mapped copy costs in PR #322](https://github.com/Marvisak/VIctory/pull/322) · [Buffer state tracking in PR #334](https://github.com/Marvisak/VIctory/pull/334)
+
+## Current async composition
+
+Commit `1814187` combines #595 `ba55d3c`, rebased #562 `05c3757`, and
+rebased #387 `489c9bf` over `ffe310e`. CPU steps that consume an ordered
+copy's destination wait for its native fence and copyback. GPU-only tails
+return after submission and retain continuations, scratch, staging, and
+descriptor ranges through the final fence. Writes to one native shadow
+serialize until its previous copyback retires. Independent shadows can
+remain asynchronous. Concurrent title writes during whole-piece copyback
+remain a separate ownership issue. [PR #595](https://github.com/Marvisak/VIctory/pull/595)
+· [PR #1024](https://github.com/Marvisak/VIctory/pull/1024)
+
+Use an Agility SDK 1.620.x x64 runtime directory and run each adapter in a
+fresh diagnostic test process. Unset `VICTORY_D3D12_GBV` and
+`VICTORY_GPU_TIMING` to keep full state tracking and normal submission
+behavior in the fixture.
+
+```powershell
+$env:VICTORY_TEST_BUFFER_COPY = '1'
+$env:VICTORY_TEST_BUFFER_COPY_GBV = '1'
+$env:VICTORY_TABLE_TEST_AGILITY = 'C:\path\to\Agility\build\native\bin\x64'
+foreach ($adapter in 'amd', 'nvidia', 'warp') {
+    $env:VICTORY_TABLE_TEST_ADAPTER = $adapter
+    cargo test --locked -p victory-gpu --features diagnostics --lib list::buffer_copy_tests -- --test-threads=1 --nocapture
+    if ($LASTEXITCODE) { throw "Copy ordering failed on $adapter" }
+    cargo test --locked -p victory-gpu --features diagnostics --lib host::submissions::failed_or_early_wait_requires_native_fence_completion -- --exact --ignored --test-threads=1 --nocapture
+    if ($LASTEXITCODE) { throw "Fence wait failed on $adapter" }
+}
+```
+
+On Agility 1.620.2, all 21 copy cases and the failed/early-fence-wake case
+passed on AMD Radeon Graphics, NVIDIA RTX 5070 Laptop, and Microsoft WARP.
+The copy cases verified that the debug layer and full GPU-based validation
+were active. These are synthetic correctness results.

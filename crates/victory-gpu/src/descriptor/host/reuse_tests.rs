@@ -13,6 +13,8 @@ use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::PCSTR;
 
+mod cbv_snapshots;
+
 const HLSL: &str = r#"
 #define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=2, b0), UAV(u0)"
 cbuffer Constants : register(b0) { uint slot, index; };
@@ -83,11 +85,11 @@ pub(crate) fn device(validate: bool) -> (ID3D12Device, String) {
     }
 }
 
-fn shader() -> Vec<u8> {
+fn shader(hlsl: &str) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("table.hlsl");
     let binary = dir.path().join("table.dxil");
-    std::fs::write(&source, HLSL).unwrap();
+    std::fs::write(&source, hlsl).unwrap();
     let result = std::process::Command::new(std::env::var_os("VICTORY_TABLE_TEST_DXC").unwrap())
         .args(["-E", "main", "-T", "cs_6_6", "-Fo"])
         .arg(&binary)
@@ -100,6 +102,27 @@ fn shader() -> Vec<u8> {
         String::from_utf8_lossy(&result.stderr)
     );
     std::fs::read(binary).unwrap()
+}
+
+fn compute_pipeline(
+    device: &ID3D12Device,
+    code: &[u8],
+) -> (ID3D12RootSignature, ID3D12PipelineState) {
+    // SAFETY: live device and compiled compute shader with an embedded root signature.
+    unsafe {
+        let root = device.CreateRootSignature(0, code).unwrap();
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: ManuallyDrop::new(Some(ID3D12RootSignature::clone(&root))),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
+            },
+            ..Default::default()
+        };
+        let pipeline = device.CreateComputePipelineState(&desc);
+        drop(ManuallyDrop::into_inner(desc.pRootSignature));
+        (root, pipeline.unwrap())
+    }
 }
 
 fn resource(
@@ -169,7 +192,8 @@ struct Fixture {
 
 impl Fixture {
     fn new(device: ID3D12Device) -> Self {
-        let code = shader();
+        let code = shader(HLSL);
+        let (root, pso) = compute_pipeline(&device, &code);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Format: DXGI_FORMAT_R32_UINT,
@@ -196,17 +220,6 @@ impl Fixture {
             let queue = device
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())
                 .unwrap();
-            let root = device.CreateRootSignature(0, &code).unwrap();
-            let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: ManuallyDrop::new(Some(ID3D12RootSignature::clone(&root))),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: code.as_ptr().cast(),
-                    BytecodeLength: code.len(),
-                },
-                ..Default::default()
-            };
-            let pso = device.CreateComputePipelineState(&pso_desc).unwrap();
-            drop(ManuallyDrop::into_inner(pso_desc.pRootSignature));
             let mut data = std::ptr::null_mut();
             upload
                 .Map(0, Some(&D3D12_RANGE::default()), Some(&mut data))
@@ -500,24 +513,28 @@ fn capped_pool_texture_table_reuse() {
     }
     if let Some(info) = info {
         heap_replacement(&fixture);
-        // SAFETY: fetch each validation message into its aligned buffer.
-        unsafe {
-            for i in 0..info.GetNumStoredMessages() {
-                let mut bytes = 0;
-                info.GetMessage(i, None, &mut bytes).unwrap();
-                let mut storage = vec![0u64; bytes.div_ceil(8)];
-                let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
-                info.GetMessage(i, Some(message), &mut bytes).unwrap();
-                let message = &*message;
-                assert!(
-                    message.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0,
-                    "{}",
-                    String::from_utf8_lossy(std::slice::from_raw_parts(
-                        message.pDescription,
-                        message.DescriptionByteLength,
-                    ))
-                );
-            }
+        check_debug_messages(&info);
+    }
+}
+
+fn check_debug_messages(info: &ID3D12InfoQueue) {
+    // SAFETY: fetch each validation message into its aligned buffer.
+    unsafe {
+        for i in 0..info.GetNumStoredMessages() {
+            let mut bytes = 0;
+            info.GetMessage(i, None, &mut bytes).unwrap();
+            let mut storage = vec![0u64; bytes.div_ceil(8)];
+            let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            info.GetMessage(i, Some(message), &mut bytes).unwrap();
+            let message = &*message;
+            assert!(
+                message.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0,
+                "{}",
+                String::from_utf8_lossy(std::slice::from_raw_parts(
+                    message.pDescription,
+                    message.DescriptionByteLength,
+                ))
+            );
         }
     }
 }
