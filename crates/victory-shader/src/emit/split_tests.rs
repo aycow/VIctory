@@ -1230,3 +1230,180 @@ fn nested_exec_masks_keep_shared_visibility_results_across_halves() {
         }
     }
 }
+
+/// The group compacts lane-dependent record counts into one output stream.
+/// A cross-half prefix gives each lane its own segment, and an EXEC loop
+/// writes one record per active lane per iteration.
+#[test]
+#[ignore = "requires Agility SDK 1.620.2 and a Wave32 or Wave64 adapter"]
+fn wave64_scan_drives_divergent_scatter() {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+
+    const GROUP_WORDS: u32 = 164;
+    let mut body = vec![
+        0x7e0e_0300, // v_mov_b32 v7, v0
+        0x3600_0083, // v_and_b32 v0, 3, v0
+        0x4a00_0081, // v_add_nc_u32 v0, 1, v0
+    ];
+    body.extend(reduction_scan(37, 128)); // v1 = inclusive sum of v0
+    body.extend([
+        0x7e0a_0300, // v_mov_b32 v5, v0
+        0x4a04_0e81, // v_add_nc_u32 v2, 1, v7
+        0x4e02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x3406_0282, // v_lshlrev_b32 v3, 2, v1
+        0x4a06_0608, // v_add_nc_u32 v3, s8, v3
+        0xbe8e_047e, // s_mov_b64 s[14:15], exec
+        // loop:
+        0xe070_1000,
+        0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
+        0x4e06_0684, // v_subrev_nc_u32 v3, 4, v3
+        0x4e0a_0a81, // v_subrev_nc_u32 v5, 1, v5
+        0x7d82_0a80, // v_cmp_lt_u32 vcc, 0, v5
+        0xbe8c_246a, // s_and_saveexec_b64 s[12:13], vcc
+        0xbf85_fff9, // s_cbranch_scc1 loop
+        0xbefe_040e, // s_mov_b64 exec, s[14:15]
+    ]);
+    let mut p = program(&body, 64);
+    p.code[5 * 4..6 * 4].copy_from_slice(&(GROUP_WORDS * 4).to_le_bytes());
+    p.code.truncate(p.code.len() - 5 * 4); // replace the standard linear store
+    p.code.extend(S_ENDPGM.to_le_bytes());
+    p.vgprs = p.vgprs.max(8);
+
+    let name = std::env::var("VICTORY_TEST_WAVE_SCATTER_ADAPTER").expect("explicit adapter");
+    let host = scatter_test_device(&name);
+    let target = host.target();
+    if !target.runs(32) && !target.runs(64) {
+        assert_eq!(name, "warp", "unexpected adapter wave size: {target:?}");
+        eprintln!("{name} lacks Wave32 and Wave64; hardware readback skipped");
+        return;
+    }
+    let validation: ID3D12InfoQueue = host.device.cast().expect("D3D12 debug layer");
+    let mut shader = emit_for(&p, target).unwrap();
+    super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+        .expect("DXIL validator")
+        .validate(&mut shader.dxil)
+        .unwrap();
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    let data = vec![0; (shader.user_data_dwords() as usize).max(1)];
+    let views = [View::RawUav(GROUP_WORDS * 2)];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(data))],
+                views: &views,
+                samplers: &[],
+                groups: [2, 1, 1],
+            },
+        )
+        .unwrap();
+    let mut expect: Vec<u32> = (0..64)
+        .flat_map(|lane| std::iter::repeat_n(lane + 1, (lane as usize & 3) + 1))
+        .collect();
+    expect.resize(GROUP_WORDS as usize, 0);
+    // SAFETY: read-only query of the debug layer's message queue.
+    let messages = unsafe { validation.GetNumStoredMessages() };
+    for index in 0..messages {
+        let mut bytes = 0;
+        // SAFETY: this query obtains the size for the exact message below.
+        unsafe { validation.GetMessage(index, None, &mut bytes).unwrap() };
+        let mut aligned = vec![0usize; bytes.div_ceil(size_of::<usize>())];
+        let message = aligned.as_mut_ptr().cast::<D3D12_MESSAGE>();
+        // SAFETY: aligned storage of at least the size the debug layer requested.
+        unsafe {
+            validation.GetMessage(index, Some(message), &mut bytes).unwrap();
+            let message = &*message;
+            assert!(
+                message.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0,
+                "{name}: {}",
+                std::ffi::CStr::from_ptr(message.pDescription.cast()).to_string_lossy()
+            );
+        }
+    }
+    assert_eq!(out, [expect.repeat(2)], "{name}: {target:?}");
+    eprintln!("{name}: {target:?}, 2 groups match the reference");
+}
+
+
+fn scatter_test_device(which: &str) -> Host {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+
+    let vendor = match which {
+        "amd" => Some(0x1002),
+        "nvidia" => Some(0x10de),
+        "warp" => None,
+        _ => panic!("unexpected adapter {which}"),
+    };
+    let host = scatter_test_host(&scatter_test_factory(true), vendor);
+    let configuration: ID3D12DeviceConfiguration = host.device.cast().unwrap();
+    // SAFETY: a read-only configuration of the live device.
+    let configuration = unsafe { configuration.GetDesc() };
+    assert_eq!(configuration.SDKVersion, 620);
+    assert_ne!(
+        configuration.Flags.0 & D3D12_DEVICE_FLAG_GPU_BASED_VALIDATION_ENABLED.0,
+        0
+    );
+    assert_eq!(configuration.GpuBasedValidationFlags, 0);
+    host
+}
+
+fn scatter_test_factory(
+    validate: bool,
+) -> windows::Win32::Graphics::Direct3D12::ID3D12DeviceFactory {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::s;
+
+    // SAFETY: both configuration interfaces receive pointers to their SDK's live GUIDs.
+    unsafe {
+        let mut configuration: Option<ID3D12SDKConfiguration1> = None;
+        D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut configuration).unwrap();
+        let factory: ID3D12DeviceFactory = configuration
+            .unwrap()
+            .CreateDeviceFactory(620, s!(".\\D3D12\\"))
+            .unwrap();
+        if validate {
+            let debug: ID3D12Debug1 = factory.GetConfigurationInterface(&CLSID_D3D12Debug).unwrap();
+            debug.EnableDebugLayer();
+            debug.SetEnableGPUBasedValidation(true);
+        }
+        factory
+    }
+}
+
+fn scatter_test_host(
+    device_factory: &windows::Win32::Graphics::Direct3D12::ID3D12DeviceFactory,
+    vendor: Option<u32>,
+) -> Host {
+    use windows::Win32::Graphics::Direct3D::*;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::*;
+
+    // SAFETY: the test selects an adapter with DXGI and all output pointers stay live.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let adapter: IDXGIAdapter1 = match vendor {
+            None => factory.EnumWarpAdapter().unwrap(),
+            Some(vendor) => (0..)
+                .map_while(|i| factory.EnumAdapters1(i).ok())
+                .find(|a| a.GetDesc1().unwrap().VendorId == vendor)
+                .expect("requested adapter"),
+        };
+        let desc = adapter.GetDesc1().unwrap();
+        assert_eq!(
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+            vendor.is_none()
+        );
+        let name = String::from_utf16_lossy(&desc.Description);
+        eprintln!("adapter: {}", name.trim_end_matches('\0'));
+        let mut device: Option<ID3D12Device> = None;
+        device_factory
+            .CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+            .unwrap();
+        Host {
+            device: device.unwrap(),
+        }
+    }
+}
