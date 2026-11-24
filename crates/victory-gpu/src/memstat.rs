@@ -47,7 +47,7 @@ pub(crate) static TEXTURE_READ: Gauge = Gauge {
     peak: AtomicU64::new(0),
 };
 
-fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("VICTORY_MEMORY_STATS").is_some())
 }
@@ -247,6 +247,45 @@ mod tests {
         crate::shadow::register(address as usize, address, title.len() as u64);
         let shadow = crate::shadow::find(address, title.len() as u64).unwrap();
         assert_eq!(SHADOW.sample(), (4 * MIB, 4 * MIB));
+        let (view, own) = crate::shadow::for_view(address + 4, 456, 456).unwrap();
+        assert!(own);
+        // SAFETY: a read-only description of our live exact-view buffer.
+        let view_width = unsafe { view.buffer.GetDesc() }.Width;
+        let charged = SHADOW.sample().0 - 4 * MIB;
+        eprintln!("exact-view buffer width {view_width}, charged {charged}");
+        assert_eq!(view_width, 512);
+        assert_eq!(charged, view_width);
+        let extents = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            loop {
+                if let Some(ranges) = crate::shadow::cached_shadow_ranges() {
+                    break ranges;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "cached shadow sample remained busy"
+                );
+                std::thread::yield_now();
+            }
+        };
+        assert_eq!(
+            extents(),
+            ShadowRanges {
+                count: 2,
+                described_bytes: 4 * MIB + 456,
+                unique_virtual_bytes: 4 * MIB,
+            }
+        );
+        drop(view);
+        assert_eq!(
+            extents(),
+            ShadowRanges {
+                count: 1,
+                described_bytes: 4 * MIB,
+                unique_virtual_bytes: 4 * MIB,
+            }
+        );
+        assert_eq!(SHADOW.sample(), (4 * MIB, 4 * MIB + view_width));
         assert_eq!(shadow.update(address as usize, title.len()), title.len());
         shadow.writing(address as usize, (2 * MIB) as usize);
         assert_eq!(SNAPSHOT.sample(), (2 * MIB, 2 * MIB));
@@ -270,12 +309,12 @@ mod tests {
         assert_eq!(SCRATCH.sample(), (0, 4 * MIB));
         crate::shadow::unregister(address as usize, address);
         drop(shadow);
-        assert_eq!(SHADOW.sample(), (0, 4 * MIB));
+        assert_eq!(SHADOW.sample(), (0, 4 * MIB + view_width));
         let process = crate::copystat::process_memory().unwrap();
         let (system, limit) = commit().unwrap();
         assert!(process.private_usage > 0 && system <= limit);
         eprintln!(
-            "peak shadow 4 MiB, peak active snapshot 6 MiB (4 MiB final live), idle snapshots 6 MiB, peak scratch 4 MiB, peak deferred upload 5 MiB; process private {}, system commit {system}/{limit}",
+            "peak shadow 4 MiB + {view_width} B, peak active snapshot 6 MiB (4 MiB final live), idle snapshots 6 MiB, peak scratch 4 MiB, peak deferred upload 5 MiB; process private {}, system commit {system}/{limit}",
             process.private_usage
         );
     }

@@ -4,7 +4,7 @@ Set `VICTORY_MEMORY_STATS=1` in a Windows diagnostics build. After device creati
 
 The sampler combines process private commit, working set, cumulative page faults, system commit and its limit, node-zero DXGI local and non-local usage, and capacities of tracked owners. The DXGI fields are optional because the selected adapter might not expose them. These measurements overlap and cannot be added together.
 
-- `shadow_bytes` counts the rounded buffer widths held by live shadow owners. `cached_shadow_guest_bytes` sums the logical guest extents of cached shadows. `cached_shadow_guest_unique_bytes` takes their union in guest virtual address space. The difference measures overlap at the same guest addresses. The sample cannot identify aliases mapped at different virtual addresses and excludes uncached shadows still held by recordings.
+- `shadow_bytes` sums actual D3D12 buffer widths held by live shadow owners, including the smaller alignment of a view-specific copy. `cached_shadow_guest_bytes` sums logical guest extents of registered buffers, loose windows and live view-specific cache entries. `cached_shadow_guest_unique_bytes` takes their union in guest virtual address space. The difference measures overlap at the same guest addresses. Distinct virtual aliases and uncached shadows still held by recordings fall outside the extent sample.
 - `snapshot_bytes` counts CPU snapshot capacity in active snapshots, including both allocations while one grows. `idle_snapshot_bytes` covers the separate retained snapshot pool from #602.
 - `list_scratch_bytes` counts chunks kept for command-list reuse, including after reset. `list_upload_bytes` counts dedicated uploads retained by the recording.
 - `texture_upload_bytes` and `texture_read_bytes` cover live staging owners and their retained CPU read buffers. The #602 frame sample reports the same capacities, including staging still held by a recording. Use one sample stream for each comparison. A version with shared detile scratch would need to account for its global buffer separately.
@@ -16,10 +16,12 @@ Each tracked owner's high-water counter measures peak capacity during the proces
 
 ```powershell
 $env:VICTORY_MEMORY_STATS = '1'
-cargo test -p victory-gpu --features diagnostics --lib observes_shadow_and_list_capacity_through_reset_and_release -- --ignored --nocapture
+cargo test --locked -p victory-gpu --features diagnostics --lib observes_shadow_and_list_capacity_through_reset_and_release -- --ignored --nocapture --test-threads=1
 ```
 
-Run the command in a new process for each adapter. `VICTORY_D3D12_WARP=1` selects WARP in this source tree. The fixture creates a 4 MiB live shadow. Its snapshot grows from 2 to 4 MiB while both allocations briefly coexist, so the diagnostics observe a 6 MiB active peak. Copyback moves the 6 MiB to the idle pool. Reset releases a 5 MiB dedicated upload and retains the 4 MiB scratch chunk until list release. Default AMD and WARP both passed the capacity checks and returned process and system commit samples. The fixture exercises allocation lifetime, with no GPU dispatch.
+Run the command in a new process for each adapter. `VICTORY_D3D12_WARP=1` selects WARP in this source tree. The fixture creates a 4 MiB live shadow and a nested 456-byte view with a 512-byte buffer. The view's buffer width contributes 512 bytes to the live gauge, while the 456-byte logical range contributes to cached extent overlap only while the view has an owner. A snapshot grows from 2 to 4 MiB while both allocations briefly coexist, so the diagnostics observe a 6 MiB active peak. Copyback moves the 6 MiB to the idle pool. Reset releases a 5 MiB dedicated upload and retains the 4 MiB scratch chunk until list release. The fixture exercises allocation lifetime and reports process and system commit.
+
+With the fixture on `8b405d3`, Radeon Graphics reported a 512-byte resource width and charged 65,536 bytes. The corrected package charged 512 bytes and passed the capacity and lifetime checks on Radeon Graphics and WARP.
 
 ## Title measurements
 

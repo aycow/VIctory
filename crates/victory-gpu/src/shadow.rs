@@ -227,6 +227,14 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        #[cfg(feature = "diagnostics")]
+        let capacity = if crate::memstat::enabled() {
+            // SAFETY: the buffer is live and describing it is read-only.
+            let width = unsafe { buffer.GetDesc() }.Width;
+            crate::memstat::Charge::new(&crate::memstat::SHADOW, width)
+        } else {
+            crate::memstat::Charge::default()
+        };
         Shadow {
             buffer,
             data,
@@ -237,10 +245,7 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             #[cfg(feature = "diagnostics")]
-            _capacity: crate::memstat::Charge::new(
-                &crate::memstat::SHADOW,
-                len.next_multiple_of(1 << 16),
-            ),
+            _capacity: capacity,
         }
     }
 
@@ -593,12 +598,19 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 pub(crate) fn cached_shadow_ranges() -> Option<crate::memstat::ShadowRanges> {
     let buffers = BUFFERS.try_lock().ok()?;
     let loose = LOOSE.try_lock().ok()?;
+    let exact = EXACT.try_lock().ok()?;
     let ranges = buffers
         .values()
         .filter_map(|entry| entry.shadow.as_deref())
         .chain(loose.values().map(Arc::as_ref))
         .map(|shadow| (shadow.start, shadow.start + shadow.len))
+        .chain(
+            exact.1.iter()
+                .filter(|(_, owner)| owner.strong_count() != 0)
+                .map(|(&(start, len), _)| (start, start + len)),
+        )
         .collect();
+    drop(exact);
     drop(loose);
     drop(buffers);
     Some(crate::memstat::ShadowRanges::from_extents(ranges))
