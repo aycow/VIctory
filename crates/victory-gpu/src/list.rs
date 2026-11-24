@@ -273,14 +273,21 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // Its memory is the GPU's until the list's last submission has run.
-    #[cfg(windows)]
-    if let Some(host) = host_list(this) {
-        host.settle();
-    }
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let mut uploads = uploads.lock().unwrap_or_else(|e| e.into_inner());
+    // Memory the list's running submission may still use goes once it has
+    // finished.
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && list.running()
+        && let Some(host) = crate::host::made()
+    {
+        let old = std::mem::take(&mut *uploads);
+        host.after(move || drop(old));
+    }
+    uploads.clear();
+    drop(uploads);
     #[cfg(windows)]
     with_state(this, |host, state| {
         host.reset();

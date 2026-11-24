@@ -296,7 +296,8 @@ mod tests {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
+    /// Swapped for a fresh one when the list is reset while it runs.
+    allocator: Mutex<ID3D12CommandAllocator>,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
@@ -311,15 +312,18 @@ pub(crate) struct HostList {
     /// resource first.
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    prelude: Mutex<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: Mutex<Option<(ID3D12Resource, usize)>>,
     /// The host fence value of its last submission (0: none): it is not
     /// reset, resubmitted or dropped before that one has finished.
     last: AtomicU64,
+    /// Up to which of its submissions the list's memory was handed to the
+    /// timeline by a reset: its recording since uses none of theirs.
+    fresh_after: AtomicU64,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -394,6 +398,53 @@ unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 
+/// What a list reset while it ran leaves to its running submission.
+struct Retired {
+    allocator: ID3D12CommandAllocator,
+    prelude: Prelude,
+    deferred: Deferred,
+    scratch: Scratch,
+    states: States,
+    budget: Option<(ID3D12Resource, usize)>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the scratch and budget pointers
+// are persistent mappings of their buffers, which go with them.
+unsafe impl Send for Retired {}
+
+type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
+
+/// Allocators, preludes and scratch chunks whose submissions finished,
+/// for lists reset while they run (dozens per world frame).
+static SPARE_ALLOCATORS: Mutex<Vec<ID3D12CommandAllocator>> = Mutex::new(Vec::new());
+static SPARE_PRELUDES: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
+static SPARE_SCRATCH: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec::new());
+/// Spares kept of each kind at most.
+const SPARES: usize = 256;
+
+fn pool<T>(spares: &'static Mutex<Vec<T>>) -> std::sync::MutexGuard<'static, Vec<T>> {
+    spares.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Retired {
+    /// Once the submission that used them has finished.
+    fn retire(self) {
+        // SAFETY: nothing running uses the allocators any more.
+        unsafe {
+            if self.allocator.Reset().is_ok() && pool(&SPARE_ALLOCATORS).len() < SPARES {
+                pool(&SPARE_ALLOCATORS).push(self.allocator);
+            }
+            if self.prelude.0.Reset().is_ok() && pool(&SPARE_PRELUDES).len() < SPARES {
+                pool(&SPARE_PRELUDES).push(self.prelude);
+            }
+        }
+        let mut spare = pool(&SPARE_SCRATCH);
+        let room = SPARES.saturating_sub(spare.len());
+        spare.extend(self.scratch.chunks.into_iter().take(room));
+        drop((self.deferred, self.states, self.budget));
+    }
+}
+
 /// One piece of submission-time work, in recorded order.
 enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
@@ -450,8 +501,9 @@ const IN_FLIGHT: usize = 16;
 struct ListRef(*const HostList);
 
 // SAFETY: host lists are used from any thread (their state is behind
-// locks), and one is not reset or dropped while a submission naming it is
-// in flight (`HostList::last`).
+// locks), and one is not dropped while a submission naming it is in flight
+// (`HostList::last`); a reset hands the memory such a submission uses to
+// the timeline instead of reusing it.
 unsafe impl Send for ListRef {}
 
 impl ListRef {
@@ -588,20 +640,46 @@ impl Host {
             )?;
             prelude.Close()?;
             Ok(HostList {
-                allocator,
+                allocator: Mutex::new(allocator),
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
-                prelude: (prelude_allocator, prelude),
+                prelude: Mutex::new((prelude_allocator, prelude)),
                 pipelines: Mutex::default(),
-                budget: OnceLock::new(),
+                budget: Mutex::default(),
                 last: AtomicU64::new(0),
+                fresh_after: AtomicU64::new(0),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
+        }
+    }
+
+    /// A command allocator nothing runs from: a spare, or a new one.
+    fn fresh_allocator(&self) -> Option<ID3D12CommandAllocator> {
+        let spare = pool(&SPARE_ALLOCATORS).pop();
+        // SAFETY: plain object creation.
+        spare.or_else(|| unsafe { self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.ok())
+    }
+
+    /// A closed prelude list and its allocator, nothing running from them.
+    fn fresh_prelude(&self) -> Option<Prelude> {
+        let spare = pool(&SPARE_PRELUDES).pop();
+        if spare.is_some() {
+            return spare;
+        }
+        let allocator = self.fresh_allocator()?;
+        // SAFETY: plain object creation.
+        unsafe {
+            let list: ID3D12GraphicsCommandList = self
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .ok()?;
+            list.Close().ok()?;
+            Some((allocator, list))
         }
     }
 
@@ -627,7 +705,9 @@ impl Host {
         // below.
         self.finish();
         for list in runs {
-            self.settle(list.last.load(Ordering::Acquire));
+            if list.running() {
+                self.settle(list.last.load(Ordering::Acquire));
+            }
         }
         if self.timeline.len() >= IN_FLIGHT
             && let Some((oldest, _)) = self.timeline.span()
@@ -1144,25 +1224,68 @@ impl HostList {
         }
     }
 
-    /// After the list's last submission has finished (waited for here).
+    /// Whether the list's last submission, with the memory the list
+    /// records into now, has not finished yet.
+    pub(crate) fn running(&self) -> bool {
+        let last = self.last.load(Ordering::Acquire);
+        last > self.fresh_after.load(Ordering::Acquire)
+            && made().is_some_and(|h| {
+                h.timeline
+                    .span()
+                    .is_some_and(|(oldest, _)| oldest <= last)
+            })
+    }
+
+    /// Opens the list for recording again. D3D12 lets a list be reset as
+    /// soon as it is submitted (titles record the next frame into it while
+    /// the GPU runs this one): what its running submission uses (allocator,
+    /// prelude, upload and scratch memory, the objects and textures it
+    /// keeps, its budget word) then goes to the timeline, freed or reused
+    /// once that submission has finished, and the list records into fresh
+    /// ones.
     pub(crate) fn reset(&self) {
-        self.settle();
-        *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let running = if self.running() { made() } else { None };
+        let allocator = {
+            let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(host) = running {
+                let (Some(fresh), Some(prelude)) = (host.fresh_allocator(), host.fresh_prelude())
+                else {
+                    fail(format_args!("no fresh host command allocator for a running list"));
+                };
+                let mut old_prelude = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+                let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+                let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+                let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+                let retired = Retired {
+                    allocator: std::mem::replace(&mut *allocator, fresh),
+                    prelude: std::mem::replace(&mut *old_prelude, prelude),
+                    deferred: std::mem::take(&mut *self.deferred()),
+                    scratch: std::mem::take(&mut *scratch),
+                    states: std::mem::take(&mut *states),
+                    budget: budget.take(),
+                };
+                host.after(move || retired.retire());
+                // Still named by that submission: dropping waits for it.
+                self.fresh_after
+                    .store(self.last.load(Ordering::Acquire), Ordering::Release);
+            } else {
+                *self.deferred() = Deferred::default();
+                self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+                (scratch.current, scratch.used) = (0, 0);
+                // SAFETY: nothing running uses the allocator.
+                if let Err(e) = unsafe { allocator.Reset() } {
+                    fail(format_args!("a host command allocator did not reset ({e})"));
+                }
+            }
+            allocator.clone()
+        };
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        {
-            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            (scratch.current, scratch.used) = (0, 0);
-        }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
+        // SAFETY: a closed list (D3D12 allows resetting one that still
+        // runs) and an allocator nothing running uses.
+        if let Err(e) = unsafe { self.list.Reset(&allocator, None) } {
             fail(format_args!("a host command list did not reset ({e})"));
         }
     }
@@ -1213,7 +1336,8 @@ impl HostList {
         if barriers.is_empty() {
             return None;
         }
-        let (allocator, list) = &self.prelude;
+        let prelude = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+        let (allocator, list) = &*prelude;
         // SAFETY: the prelude is not executing (`execute` waits for the
         // list's last submission first); the textures are live.
         let recorded = unsafe {
@@ -1361,11 +1485,18 @@ impl HostList {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-            name(&buffer, || "list scratch".into());
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
+            let spare = pool(&SPARE_SCRATCH).pop();
+            let chunk = match spare {
+                Some(chunk) => chunk,
+                None => {
+                    let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
+                    name(&buffer, || "list scratch".into());
+                    // SAFETY: a live buffer.
+                    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                    (buffer, data as usize, gpu)
+                }
+            };
+            s.chunks.push(chunk);
             s.used = 0;
         }
         let (_, data, gpu) = s.chunks[s.current];
@@ -1377,17 +1508,18 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
+        let (buffer, data) = {
+            let mut budget = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+            if budget.is_none() {
                 let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
+                *budget = Some((b, d as usize));
+            }
+            budget.clone()?
+        };
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
+            let at = data;
             // SAFETY: the list's own mapped word, written before it runs.
             deferred.copies.push(Step::Host(
                 Box::new(move || unsafe { (at as *mut u32).write_volatile(0) }),
@@ -2389,18 +2521,24 @@ mod submissions {
     use crate::queue::Written;
 
     #[test]
-    fn a_list_is_finished_before_it_is_reset() {
+    fn a_list_reset_while_it_runs_records_into_fresh_memory() {
         let Some(host) = super::host() else { return }; // no host GPU here
         let list = host.new_list().unwrap();
-        let word = Box::new(0u64);
-        list.defer_write((&raw const *word).cast_mut().cast(), Written::Value(7), 8);
+        let (first, second) = (Box::new(0u64), Box::new(0u64));
+        list.defer_write((&raw const *first).cast_mut().cast(), Written::Value(7), 8);
         list.close();
         host.execute(&[&list]);
-        // The bottom-of-pipe write is done by the time the list may be
-        // recorded again.
+        // Recorded again at once, as titles do: the running submission
+        // keeps what it uses, including its bottom-of-pipe write.
         list.reset();
-        // SAFETY: our word; the finishing thread is done with it.
-        assert_eq!(unsafe { std::ptr::read_volatile(&*word) }, 7);
+        list.defer_write((&raw const *second).cast_mut().cast(), Written::Value(9), 8);
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        // SAFETY: our words; the finishing thread is done with them.
+        let (a, b) = unsafe { (std::ptr::read_volatile(&*first), std::ptr::read_volatile(&*second)) };
+        assert_eq!((a, b), (7, 9));
+        assert!(!list.running());
     }
 
     #[test]
