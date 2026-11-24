@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{Interface, PCSTR};
 
-fn copy_program() -> emit::HostShader {
+fn copy_program(atomic_offset: u32) -> emit::HostShader {
     // One lane. The scalar and vector reads use a guest address in s[0:1].
     // Scalar data goes to output +16 and also increments output +20.
     let words = [
@@ -26,7 +26,7 @@ fn copy_program() -> emit::HostShader {
         0x0002_0200, // global_store_dwordx4 v0, v[2:5], s[2:3]
         0xDC70_8010,
         0x0002_0600, // global_store_dword v0, v6, s[2:3] offset:16
-        0xDCC8_8014,
+        0xDCC8_8000 | atomic_offset,
         0x0002_0600, // global_atomic_add v0, v6, s[2:3] offset:20
         0xBF81_0000,
     ];
@@ -135,13 +135,20 @@ pub(crate) fn device(validate: bool) -> (ID3D12Device, String) {
 #[ignore = "requires a chosen D3D12 adapter, Agility 1.620.x and the DXIL validator"]
 fn computed_map_supports_shared_and_shadow_backing() {
     let bench = std::env::var_os("VICTORY_MAP_TEST_BENCH").is_some();
-    let overlap = std::env::var_os("VICTORY_MAP_TEST_OVERLAP").is_some();
     let (device, name) = device(!bench);
     let messages = (!bench).then(|| device.cast::<ID3D12InfoQueue>().unwrap());
     let host = install_address_map_test_device(device);
-    let shader = address_map_test_shader(copy_program());
-    let pipeline = HostPipeline::new(&[shader], None).expect("translated map pipeline");
-    let stage = &pipeline.stages[0];
+    let pipeline = |atomic_offset| {
+        let shader = address_map_test_shader(copy_program(atomic_offset));
+        HostPipeline::new(&[shader], None).unwrap_or_else(|| {
+            if let Some(messages) = &messages {
+                check_debug_messages(messages);
+            }
+            panic!("translated map pipeline with atomic byte offset {atomic_offset}");
+        })
+    };
+    let aligned = pipeline(20);
+    let unaligned = pipeline(22);
     let heap = HostHeap::new(false, 1).unwrap();
     let samplers = HostHeap::new(true, 1).unwrap();
 
@@ -179,14 +186,17 @@ fn computed_map_supports_shared_and_shadow_backing() {
             shadow: None,
         },
     ];
-    if overlap {
-        inputs.push(Backing {
-            span: (guest, 16),
-            resource: &first,
-            shadow: None,
-        });
-    }
+    const OVERLAP: usize = 4;
+    const GAP: usize = 5;
+    const UNALIGNED_ATOMIC: usize = 6;
+    const PARTIAL_ATOMIC: usize = 7;
+    inputs.extend([16, 4, 16, 16].into_iter().map(|bytes| Backing {
+        span: (guest, bytes),
+        resource: &first,
+        shadow: None,
+    }));
     const GUEST_OUT: u64 = 0x20_ffff_fffc;
+    const GUARD: u32 = 0xdeca_fbad;
     let mut runs = Vec::new();
     for (i, input) in inputs.into_iter().enumerate() {
         let list = host.new_list().unwrap();
@@ -199,7 +209,7 @@ fn computed_map_supports_shared_and_shadow_backing() {
                 shadow: None,
             },
         ];
-        if i == 4 {
+        if i == OVERLAP {
             // This inner mapping owns the last three guest dwords, while
             // the outer raw view is still wide enough to read all four.
             backings.push(Backing {
@@ -207,6 +217,29 @@ fn computed_map_supports_shared_and_shadow_backing() {
                 resource: &replacement,
                 shadow: None,
             });
+        }
+        if i == GAP {
+            // The second vector dword is unmapped, but the next two are valid.
+            backings.push(Backing {
+                span: (guest + 8, 8),
+                resource: &replacement,
+                shadow: None,
+            });
+        }
+        let inner = matches!(i, OVERLAP | PARTIAL_ATOMIC).then(|| host.shared_buffer(8).unwrap());
+        if let Some((resource, cpu)) = &inner {
+            let span = if i == OVERLAP {
+                (GUEST_OUT + 4, 8)
+            } else {
+                (GUEST_OUT + 20, 3)
+            };
+            backings.push(Backing {
+                span,
+                resource,
+                shadow: None,
+            });
+            // SAFETY: the owned native buffer is mapped and has not executed yet.
+            unsafe { cpu.cast::<[u32; 2]>().write([GUARD; 2]) };
         }
         let (map, slots) = make_backed(&list, &heap, &backings).unwrap();
         let input_addr = if i == 3 { 0x40_ffff_0000 } else { guest };
@@ -216,6 +249,12 @@ fn computed_map_supports_shared_and_shadow_backing() {
             GUEST_OUT as u32,
             (GUEST_OUT >> 32) as u32,
         ];
+        let pipeline = if i == UNALIGNED_ATOMIC {
+            &unaligned
+        } else {
+            &aligned
+        };
+        let stage = &pipeline.stages[0];
         let (param, count) = stage.user_data.unwrap();
         let mut values = vec![0u32; count as usize];
         for u in &stage.translated().host.user_data {
@@ -223,7 +262,7 @@ fn computed_map_supports_shared_and_shadow_backing() {
         }
         // SAFETY: root resources and the two descriptor heaps outlive this submission.
         unsafe {
-            output_cpu.cast::<[u32; 8]>().write([0xdeca_fbad; 8]);
+            output_cpu.cast::<[u32; 8]>().write([GUARD; 8]);
             list.list
                 .SetDescriptorHeaps(&[Some(heap.heap.clone()), Some(samplers.heap.clone())]);
             list.list.SetComputeRootSignature(&pipeline.root);
@@ -238,7 +277,7 @@ fn computed_map_supports_shared_and_shadow_backing() {
             list.list.Dispatch(1, 1, 1);
         }
         list.close();
-        runs.push((list, slots, output_cpu));
+        runs.push((list, slots, output_cpu, inner.map(|(_, cpu)| cpu)));
     }
     // Drop map inputs before execution. The native recordings retain them.
     drop((first, replacement));
@@ -246,34 +285,46 @@ fn computed_map_supports_shared_and_shadow_backing() {
     let start = std::time::Instant::now();
     host.execute(&lists);
     let wall = start.elapsed();
-    let dispatches = if bench {
+    if let Some(messages) = &messages {
+        check_debug_messages(messages);
+    }
+    if bench {
         benchmark_replay(host, [&runs[0].0, &runs[1].0]);
-        [32, 32, 1, 1, 1]
-    } else {
-        [1; 5]
-    };
+    }
     let expected = [
         [7, 11, 19, 23, 7],
         [31, 37, 41, 43, 31],
         [47, 53, 59, 61, 47],
         [0, 0, 0, 0, 0],
-        [31, 47, 53, 59, 31],
+        [31, GUARD, GUARD, 59, 31],
+        [31, 0, 47, 53, 31],
+        [31, 37, 41, 43, 31],
+        [31, 37, 41, 43, 31],
     ];
-    for (i, (list, (first, count), data)) in runs.into_iter().enumerate() {
+    for (i, (list, (first, count), data, inner)) in runs.into_iter().enumerate() {
         // SAFETY: the queue completed and this list still owns the mapped output.
         let words = unsafe { data.cast::<[u32; 8]>().read() };
         assert_eq!(words[..5], expected[i], "case {i}");
-        assert_eq!(words[5], 0xdeca_fbad + dispatches[i] * expected[i][4]);
-        assert_eq!(words[6..], [0xdeca_fbad; 2]);
+        let dispatches = if bench && i < 2 { 32 } else { 1 };
+        let atomic_delta = if matches!(i, UNALIGNED_ATOMIC | PARTIAL_ATOMIC) {
+            0
+        } else {
+            dispatches * expected[i][4]
+        };
+        assert_eq!(words[5], GUARD + atomic_delta, "atomic case {i}");
+        assert_eq!(words[6..], [GUARD; 2]);
+        if let Some(inner) = inner {
+            // SAFETY: completed work and the list retains the mapped buffer.
+            let words = unsafe { inner.cast::<[u32; 2]>().read() };
+            let expected_inner = if i == OVERLAP { [47, 53] } else { [GUARD; 2] };
+            assert_eq!(words, expected_inner, "inner mapping case {i}");
+        }
         heap.release(first, count);
         drop(list);
     }
-    if let Some(messages) = messages {
-        check_debug_messages(&messages);
-    }
     crate::shadow::unregister(guest as usize, guest);
     eprintln!(
-        "{name}: computed scalar/vector reads, stores, atomics and miss correct; four-list wall {wall:?}"
+        "{name}: computed scalar/vector reads, stores, atomics and misses correct; eight-list wall {wall:?}"
     );
 }
 

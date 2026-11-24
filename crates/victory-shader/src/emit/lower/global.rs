@@ -20,6 +20,20 @@ const SEARCH_STEPS: u32 = 16;
 /// there read zero and write nothing, even a node's dwords after it.
 const OUTSIDE: u32 = 0x8000_0000;
 
+#[derive(Clone, Copy)]
+struct MapCursor {
+    index: V,
+    count: V,
+    last: V,
+}
+
+#[derive(Clone, Copy)]
+struct MappedBytes {
+    view: V,
+    offset: V,
+    available: V,
+}
+
 impl Lower<'_> {
     /// Whether the access at `site` reads title memory through the map.
     pub(super) fn is_global(&self, site: Site) -> bool {
@@ -76,16 +90,13 @@ impl Lower<'_> {
             .collect()
     }
 
-    /// Looks up title address `va` (an i64) in the address map: whether a
-    /// range covers it, the heap index of the range's view, and the byte
-    /// in that view `va` is at (out of the view's range where none does).
+    /// Looks up title address `va` (an i64) in the address map.
     ///
     /// Straight-line code: a binary search of [`SEARCH_STEPS`] steps, each
     /// probe clamped to the entries the map has. A loop per access made the
     /// ray-tracing passes' control flow too large for the host's DXIL
     /// conversion to finish.
-    pub(super) fn map_lookup(&mut self, va: V) -> (V, V, V) {
-        let i32t = self.s.t.i32;
+    fn map_lookup(&mut self, va: V) -> (MapCursor, MappedBytes) {
         let zero = self.s.m.i32(0);
         let one = self.s.m.i32(1);
         let count = self.map_dwords(zero, 1)[0];
@@ -94,23 +105,39 @@ impl Lower<'_> {
         let has = self.s.m.cmp(c, pred::NE, count, zero);
         let less = self.s.m.bin(c, Bin::Sub, count, one);
         let last = self.s.m.select(c, has, less, zero);
-        // The last range starting at or below `va`.
-        let mut lo = zero;
-        for k in (0..SEARCH_STEPS).rev() {
+        self.map_lookup_from(
+            va,
+            MapCursor {
+                index: zero,
+                count,
+                last,
+            },
+            SEARCH_STEPS,
+        )
+    }
+
+    /// From a previous entry, find the last range starting at or below `va`.
+    fn map_lookup_from(
+        &mut self,
+        va: V,
+        mut cursor: MapCursor,
+        steps: u32,
+    ) -> (MapCursor, MappedBytes) {
+        for k in (0..steps).rev() {
             let c = self.cur;
             let step = self.s.m.i32(1 << k);
-            let probe = self.s.m.bin(c, Bin::Add, lo, step);
-            let within = self.s.m.cmp(c, pred::IULT, probe, count);
-            let at = self.s.m.select(c, within, probe, last);
+            let probe = self.s.m.bin(c, Bin::Add, cursor.index, step);
+            let within = self.s.m.cmp(c, pred::IULT, probe, cursor.count);
+            let at = self.s.m.select(c, within, probe, cursor.last);
             let start = self.entry_dwords(at, 0, 2);
             let start = self.wide(start[0], start[1]);
             let c = self.cur;
             let below = self.s.m.cmp(c, pred::IULE, start, va);
             let take = self.s.m.bin(c, Bin::And, within, below);
-            lo = self.s.m.select(c, take, probe, lo);
+            cursor.index = self.s.m.select(c, take, probe, cursor.index);
         }
-        let e = self.entry_dwords(lo, 0, 4);
-        let view_offset = self.entry_dwords(lo, 16, 1)[0];
+        let e = self.entry_dwords(cursor.index, 0, 4);
+        let view_offset = self.entry_dwords(cursor.index, 16, 1)[0];
         let c = self.cur;
         let start = self.wide(e[0], e[1]);
         let rel = self.s.m.bin(c, Bin::Sub, va, start);
@@ -118,12 +145,52 @@ impl Lower<'_> {
         let after = self.s.m.cmp(c, pred::IUGE, va, start);
         let inside = self.s.m.cmp(c, pred::IULT, rel, size);
         let hit = self.s.m.bin(c, Bin::And, after, inside);
-        let hit = self.s.m.bin(c, Bin::And, hit, has);
+        let i32t = self.s.t.i32;
         let rel = self.s.m.cast(c, Cast::Trunc, rel, i32t);
-        let byte = self.s.m.bin(c, Bin::Add, rel, view_offset);
-        let away = self.s.m.i32(OUTSIDE);
-        let byte = self.s.m.select(c, hit, byte, away);
-        (hit, e[3], byte)
+        let offset = self.s.m.bin(c, Bin::Add, rel, view_offset);
+        let remaining = self.s.m.bin(c, Bin::Sub, e[2], rel);
+        let zero = self.s.m.i32(0);
+        let three = self.s.m.i32(3);
+        let low = self.s.m.bin(c, Bin::And, offset, three);
+        let aligned = self.s.m.cmp(c, pred::EQ, low, zero);
+        let hit = self.s.m.bin(c, Bin::And, hit, aligned);
+        let has = self.s.m.cmp(c, pred::NE, cursor.count, zero);
+        let hit = self.s.m.bin(c, Bin::And, hit, has);
+        let available = self.s.m.select(c, hit, remaining, zero);
+        (
+            cursor,
+            MappedBytes {
+                view: e[3],
+                offset,
+                available,
+            },
+        )
+    }
+
+    /// Advance one dword. Starts are unique integer addresses, so at most
+    /// four starts can lie between two adjacent dword addresses.
+    fn next_mapped_word(&mut self, address: V, cursor: MapCursor) -> (V, MapCursor, MappedBytes) {
+        let c = self.cur;
+        let t = self.s.m.int(64);
+        let four = self.s.m.int_const(t, 4);
+        let next = self.s.m.bin(c, Bin::Add, address, four);
+        let wrapped = self.s.m.cmp(c, pred::IULT, next, address);
+        let end = self.s.m.int_const(t, -1);
+        let next = self.s.m.select(c, wrapped, end, next);
+        let (cursor, location) = self.map_lookup_from(next, cursor, 3);
+        (next, cursor, location)
+    }
+
+    fn mapped_word(&mut self, location: MappedBytes) -> V {
+        let bytes = self.s.m.i32(4);
+        self.s
+            .m
+            .cmp(self.cur, pred::IUGE, location.available, bytes)
+    }
+
+    fn map_offset(&mut self, location: MappedBytes, fits: V) -> V {
+        let outside = self.s.m.i32(OUTSIDE);
+        self.s.m.select(self.cur, fits, location.offset, outside)
     }
 
     /// Dwords `first / 4..` (`n`, at most 4) of map entry `index`.
@@ -138,22 +205,25 @@ impl Lower<'_> {
 
     /// `n` dwords of title memory from address `va` (an i64), zero where
     /// no range of the map covers `va`. `uniform`: the same address in
-    /// every lane (a scalar load). The dwords are taken to lie in the range
-    /// that holds the first.
+    /// every lane (a scalar load). A dword must fit one range, but the
+    /// dwords in a vector can be supplied by different ranges.
     pub(super) fn global_read(&mut self, va: V, n: u32, uniform: bool) -> Vec<V> {
-        // A miss reads outside the view, which gives zeros.
-        let (_, view, byte) = self.map_lookup(va);
-        let h = self.s.heap_handle(self.cur, view, false, !uniform, RAW_UAV);
-        let mut out = Vec::with_capacity(n as usize);
-        let mut k = 0;
-        while k < n {
-            let chunk = (n - k).min(4);
-            let off = self.s.m.i32(4 * k);
-            let from = self.s.m.bin(self.cur, Bin::Add, byte, off);
-            out.extend(self.raw_dwords(h, from, chunk));
-            k += chunk;
+        let (mut cursor, mut location) = self.map_lookup(va);
+        let mut address = va;
+        let mut results = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            if i != 0 {
+                (address, cursor, location) = self.next_mapped_word(address, cursor);
+            }
+            let fits = self.mapped_word(location);
+            let byte = self.map_offset(location, fits);
+            let h = self
+                .s
+                .heap_handle(self.cur, location.view, false, !uniform, RAW_UAV);
+            let word = self.raw_dwords(h, byte, 1)[0];
+            results.push(word);
         }
-        out
+        results
     }
 
     /// `byte`, or [`OUTSIDE`] in lanes where `guard` does not hold.
@@ -334,16 +404,35 @@ impl Lower<'_> {
         let vals = self.data_dwords(inst, reg, n)?;
         let guard = self.guard(b, i)?;
         let va = self.global_address(inst)?;
-        // Lanes that miss, or do not run it, store outside the view: nothing.
-        let (_, view, byte) = self.map_lookup(va);
-        let byte = self.unless_guarded(guard, byte);
+        let (mut cursor, mut location) = self.map_lookup(va);
+        let mut address = va;
+        for (i, value) in vals.into_iter().enumerate() {
+            if i != 0 {
+                (address, cursor, location) = self.next_mapped_word(address, cursor);
+            }
+            let fits = self.mapped_word(location);
+            // Lanes that miss, or do not run it, store outside the view: nothing.
+            let byte = self.map_offset(location, fits);
+            let byte = self.unless_guarded(guard, byte);
+            self.store_mapped(location.view, byte, value);
+        }
+        Ok(())
+    }
+
+    fn store_mapped(&mut self, view: V, byte: V, value: V) {
         let h = self.s.heap_handle(self.cur, view, false, true, RAW_UAV);
         let iu = self.s.m.undef(self.s.t.i32);
-        let mut args = vec![h, byte, iu];
-        args.extend(&vals);
-        args.resize(3 + 4, iu);
-        args.push(self.s.m.i8((1u8 << n) - 1));
-        args.push(self.s.m.i32(4));
+        let args = [
+            h,
+            byte,
+            iu,
+            value,
+            iu,
+            iu,
+            iu,
+            self.s.m.i8(1),
+            self.s.m.i32(4),
+        ];
         let void = self.s.t.void;
         self.s.op(
             self.cur,
@@ -353,7 +442,6 @@ impl Lower<'_> {
             140,
             &args,
         );
-        Ok(())
     }
 
     /// `global_atomic_*` (32-bit) at an address the program computes. A
@@ -383,10 +471,20 @@ impl Lower<'_> {
         let vals = self.data_dwords(inst, reg, if op == u32::MAX { 2 } else { 1 })?;
         let guard = self.guard(b, i)?;
         let va = self.global_address(inst)?;
-        // Lanes that miss, or do not run it, change nothing and get 0.
-        let (_, view, byte) = self.map_lookup(va);
+        // A guest atomic may not cross a boundary or start unaligned.
+        let (_, location) = self.map_lookup(va);
+        let fits = self.mapped_word(location);
+        let t = self.s.m.int(64);
+        let mask = self.s.m.int_const(t, 3);
+        let zero = self.s.m.int_const(t, 0);
+        let low = self.s.m.bin(self.cur, Bin::And, va, mask);
+        let aligned = self.s.m.cmp(self.cur, pred::EQ, low, zero);
+        let fits = self.s.m.bin(self.cur, Bin::And, fits, aligned);
+        let byte = self.map_offset(location, fits);
         let byte = self.unless_guarded(guard, byte);
-        let h = self.s.heap_handle(self.cur, view, false, true, RAW_UAV);
+        let h = self
+            .s
+            .heap_handle(self.cur, location.view, false, true, RAW_UAV);
         let iu = self.s.m.undef(self.s.t.i32);
         let i32t = self.s.t.i32;
         let r = if op == u32::MAX {

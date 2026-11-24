@@ -10,11 +10,15 @@ $env:VICTORY_TABLE_TEST_ADAPTER = 'amd' # or nvidia, warp
 cargo test -p victory-gpu --features diagnostics --lib computed_map_supports_shared_and_shadow_backing -- --ignored --nocapture
 ```
 
-The correctness cases passed on AMD Radeon Graphics, NVIDIA RTX 5070 Laptop GPU, and WARP with full GPU-based validation. To check a distinct bounds problem, set `VICTORY_MAP_TEST_OVERLAP=1`. The extra vector spans two guest mappings, while the outer native view can fit all four words. Proper map-based resolution would return `[31, 47, 53, 59]` from both mappings. The current lowering uses the first dword's mapping for the entire vector.
+## Cross-piece access after #1198 `ad558cd`
 
-## Measured synthetic replay
+The expanded fixture includes overlapping source and destination mappings, a missing middle dword, an unaligned atomic, and an atomic for which only three bytes are mapped. Each complete dword uses the highest-priority mapping covering it. Missing dwords read zero and receive no store. An atomic requires four mapped bytes in one piece and a naturally aligned guest address. The synthetic overlap reads `[31, 47, 53, 59]` and checks that the destination split writes each value to its own native backing.
 
-In a fresh process set `VICTORY_MAP_TEST_BENCH=1`, `VICTORY_GPU_TIMING=1`, and `VICTORY_D3D12_DRED=1` before running the same command. Leave `VICTORY_MAP_TEST_OVERLAP` unset. This mode disables the debug layer and GPU-based validation. It uses a debug build, one recorded one-lane dispatch per submission, 10 warmups and 21 alternating-order samples per backing. The recorded list labels bracket the GPU dispatch. The CPU preparation counter is rounded down to microseconds, and submission wall time includes the fence wait. The initial PSO and recording costs are outside the measurement.
+Exact `ad558cd` used the first native view for the whole vector and failed the overlapping read/store fixture on NVIDIA and WARP. The straight-line per-dword candidate passed the expanded fixture on AMD Radeon Graphics and WARP with full GPU-based validation. On RTX 5070 Laptop GPU, the DXIL validator accepted the candidate but native compute pipeline creation failed. An earlier vector fast-path plus split fallback gave HRESULT `0x8007000E` on that adapter and also failed the WARP hole case. The straight-line candidate was refused on NVIDIA both with and without GPU-based validation. It remains a candidate pending a smaller driver-compatible lowering.
+
+## Earlier synthetic replay at `fe078c6`
+
+The measurements below are from the earlier `a920242` fixture. In a fresh process set `VICTORY_MAP_TEST_BENCH=1`, `VICTORY_GPU_TIMING=1`, and `VICTORY_D3D12_DRED=1` before running that revision. Leave `VICTORY_MAP_TEST_OVERLAP` unset. This mode disables the debug layer and GPU-based validation. It uses a debug build, one recorded one-lane dispatch per submission, 10 warmups and 21 alternating-order samples per backing. The recorded list labels bracket the GPU dispatch. The CPU preparation counter is rounded down to microseconds, and submission wall time includes the fence wait. The initial PSO and recording costs are outside the measurement.
 
 | Adapter | CPU prep, shadow → shared | GPU span, shadow → shared | Synchronous submit, shadow → shared |
 |---|---:|---:|---:|
