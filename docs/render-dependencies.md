@@ -47,6 +47,18 @@ geometry. Keep title assets, captures, shader binaries, and memory dumps local.
 If also collecting GPU census measurements from #509, run that separately
 with the same settings and report the matching present count and hashes.
 
+For an `R8_UINT` (format 62) intermediate with coherent geometry and a
+black final image, keep target preview off and select two nearby affected
+presents after warming the same shader cache. Record the scene marker and
+keep camera, settings, and the title build fixed. Follow the first observed
+static reader of that texture ID, if any, to its outputs. Independently
+walk back from the normal presentation source to the first unresolved
+input. Report the producer and reader pass kinds, hashes, texture IDs and
+extents, and counts for refusals and host-resource mismatches. If no
+static reader appears, include the first candidate writer for the expected
+color target and the trace's omitted count. Across matched runs, compare
+hashes, extents and aggregate pixel statistics at the same threshold.
+
 ## Synthetic validation
 
 The Windows fixture uses an original one-pixel producer, a forward copy,
