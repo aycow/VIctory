@@ -81,15 +81,15 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-fn pipeline(host: &Host) -> (ID3D12RootSignature, ID3D12PipelineState) {
+fn pipeline(host: &Host, source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
     let mut blob: Option<ID3DBlob> = None;
     // SAFETY: compiler inputs and outputs are live; the root signature and
     // shader bytecode are borrowed through PSO creation.
     unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("shared-scratch-read"),
+            source.as_ptr().cast(),
+            source.len(),
+            s!("shared-buffer-test"),
             None,
             None,
             s!("main"),
@@ -147,7 +147,7 @@ fn shared_scratch_matches_shadow() {
     let title_address = title_data as usize;
     let shadow = crate::shadow::find(title_address as u64, BYTES).unwrap();
     let (output, output_data) = host.shared_buffer(BYTES).unwrap();
-    let (root, pso) = pipeline(host);
+    let (root, pso) = pipeline(host, SOURCE);
     let direct_list = host.new_list().unwrap();
     let baseline_list = host.new_list().unwrap();
     assert!(host.unified_buffer(UNIFIED_ALIGNMENT).is_some());
@@ -257,6 +257,10 @@ fn shared_scratch_matches_shadow() {
         17,
         9,
     );
+    check_validation(validation);
+}
+
+fn check_validation(validation: Option<ID3D12InfoQueue>) {
     if let Some(queue) = validation {
         // SAFETY: GetMessage is given suitably aligned, queried storage.
         unsafe {
@@ -277,4 +281,172 @@ fn shared_scratch_matches_shadow() {
             }
         }
     }
+}
+
+const BUDGET_SOURCE: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer budget : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main() {
+    uint previous;
+    budget.InterlockedAdd(0, 1, previous);
+}
+"#;
+
+fn timestamps(host: &Host) -> (ID3D12QueryHeap, ID3D12Resource) {
+    let mut heap = None;
+    let mut resource = None;
+    // SAFETY: valid descriptions for two GPU timestamps and their readback.
+    unsafe {
+        host.device
+            .CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC {
+                    Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                    Count: 2,
+                    NodeMask: 0,
+                },
+                &mut heap,
+            )
+            .unwrap();
+        host.device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 16,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut resource,
+            )
+            .unwrap();
+    }
+    (heap.unwrap(), resource.unwrap())
+}
+
+#[test]
+#[ignore = "requires a D3D12 adapter and uses native timestamp queries"]
+fn owned_uav_budget_uses_completed_leases() {
+    let host = host().expect("test host");
+    let validation = host.device.cast::<ID3D12InfoQueue>().ok();
+    let placed = std::env::var("VICTORY_SHARED_OWNED_UAV").as_deref() == Ok("1");
+    let (root, pso) = pipeline(host, BUDGET_SOURCE);
+    let (queries, readback) = timestamps(host);
+    // SAFETY: the live direct queue supports timestamps.
+    let frequency = unsafe { host.queue.GetTimestampFrequency().unwrap() };
+    let run = |list: &HostList, groups: u32| {
+        let address = list.budget().expect("runtime budget");
+        let budget = list.budget.get().unwrap().as_ref().unwrap();
+        assert_eq!(address % 256, 0);
+        // SAFETY: the open command list and all bindings belong to this host.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootUnorderedAccessView(0, address);
+            list.list.EndQuery(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            list.list.Dispatch(groups, 1, 1);
+            list.list.EndQuery(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            list.list
+                .ResolveQueryData(&queries, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &readback, 0);
+        }
+        list.close();
+        let before = SUBMISSION_US[0].load(Ordering::Relaxed);
+        host.execute(&[list]);
+        let prepare = SUBMISSION_US[0].load(Ordering::Relaxed) - before;
+        let mut stamps = std::ptr::null_mut();
+        // SAFETY: Host::execute returned after this list's native fence.
+        let ticks = unsafe {
+            assert_eq!((budget.data as *const u32).read_volatile(), groups * 64);
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE { Begin: 0, End: 16 }),
+                    Some(&mut stamps),
+                )
+                .unwrap();
+            let ticks = std::slice::from_raw_parts(stamps.cast::<u64>(), 2);
+            let elapsed = ticks[1].checked_sub(ticks[0]).unwrap();
+            readback.Unmap(0, Some(&D3D12_RANGE::default()));
+            elapsed
+        };
+        list.reset();
+        (prepare, ticks)
+    };
+
+    let first = host.new_list().unwrap();
+    let other = host.new_list().unwrap();
+    let first_va = first.budget().unwrap();
+    let other_va = other.budget().unwrap();
+    assert_ne!(first_va, other_va);
+    let buffer = |list: &HostList| list.budget.get().unwrap().as_ref().unwrap().data;
+    assert_ne!(buffer(&first), buffer(&other));
+    assert_ne!(first_va, buffer(&first) as u64);
+    let first_slot = first.budget.get().unwrap().as_ref().unwrap().slot_index();
+    assert_eq!(first_slot.is_some(), placed);
+    run(&first, 1);
+    run(&other, 2);
+    assert_eq!(first.budget().unwrap(), first_va);
+    let mut prep = Vec::new();
+    let mut gpu = Vec::new();
+    for n in 0..13 {
+        let groups = 16;
+        let (prepare, ticks) = run(&first, groups);
+        if n >= 3 {
+            prep.push(prepare);
+            gpu.push(ticks);
+        }
+    }
+    prep.sort_unstable();
+    gpu.sort_unstable();
+    let gpu_us = gpu[gpu.len() / 2] as f64 * 1e6 / frequency as f64;
+
+    drop(first);
+    let replacement = host.new_list().unwrap();
+    replacement.budget().unwrap();
+    assert_eq!(
+        replacement
+            .budget
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .slot_index(),
+        first_slot,
+    );
+    run(&replacement, 3);
+    drop(replacement);
+    drop(other);
+
+    // Fill the arena using the production allocator; leave its resources
+    // unsubmitted so their occupancy cannot change during the check.
+    let began = Instant::now();
+    let allocated = (0..64)
+        .map(|_| host.budget_buffer().unwrap())
+        .collect::<Vec<_>>();
+    let allocation_us = began.elapsed().as_micros();
+    assert!(allocated.iter().all(|b| b.is_placed() == placed));
+    let fallback = host.new_list().unwrap();
+    fallback.budget().unwrap();
+    assert!(!fallback.budget.get().unwrap().as_ref().unwrap().is_placed());
+    run(&fallback, 4);
+    assert!(gpu_us > 0.0);
+    eprintln!(
+        "placed={placed} allocations64_us={allocation_us} prepare_us={} gpu_dispatch_us={gpu_us:.3}",
+        prep[prep.len() / 2]
+    );
+    check_validation(validation);
 }

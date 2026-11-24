@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -33,6 +33,7 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 
 #[cfg(all(test, feature = "diagnostics"))]
 mod scratch_tests;
+mod uav_arena;
 
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
@@ -59,6 +60,7 @@ pub(crate) struct Host {
     /// Optional CPU-visible heap for placed buffers (the arena is probed lazily).
     unified: OnceLock<Option<UnifiedArena>>,
     scratch_arena_active: OnceLock<bool>,
+    budget_arena: OnceLock<Option<std::sync::Arc<uav_arena::Arena>>>,
 }
 
 /// A bump-allocated CPU-visible D3D12 heap. Allocations never overlap.
@@ -378,6 +380,7 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             unified: OnceLock::new(),
             scratch_arena_active: OnceLock::new(),
+            budget_arena: OnceLock::new(),
         })
     }
 }
@@ -597,7 +600,7 @@ pub(crate) struct HostList {
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<uav_arena::BudgetBuffer>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -799,6 +802,15 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // A placed budget can be handed back to the arena when its list
+        // is released. Do not return without completion for such a list.
+        let must_wait = self.budget_arena.get().is_some()
+            && runs.iter().any(|list| {
+                list.budget
+                    .get()
+                    .and_then(Option::as_ref)
+                    .is_some_and(uav_arena::BudgetBuffer::is_placed)
+            });
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -841,8 +853,14 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        let result = WaitForSingleObject(self.event, INFINITE);
+                        if must_wait && result != WAIT_OBJECT_0 {
+                            fail(format_args!("could not wait for a shared UAV submission: {result:?}"));
+                        }
                     }
+                    Err(e) if must_wait => fail(format_args!(
+                        "could not establish completion for a shared UAV submission: {e}"
+                    )),
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
@@ -1411,24 +1429,26 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
+        let buffer = self
             .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
+            .get_or_init(|| host()?.budget_buffer())
             .as_ref()?;
         let mut deferred = self.deferred();
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
+            if buffer.is_placed() {
+                // SAFETY: this recording owns the leased range. A barrier
+                // activates its resource before the first native access.
+                unsafe { self.list.ResourceBarrier(&[placed_activation(&buffer.resource)]) };
+            }
+            let at = buffer.data;
             // SAFETY: the list's own mapped word, written before it runs.
             deferred
                 .copies
                 .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
         }
         // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some(unsafe { buffer.resource.GetGPUVirtualAddress() })
     }
 
     /// Keeps `object` alive until the list is reset.
