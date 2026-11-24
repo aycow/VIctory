@@ -8,7 +8,10 @@ use crate::{Container, FourCC, ShaderError, io, ir, resource, structure};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ballot {
     None,
+    EntryOne,
     Entry,
+    EntryMismatch,
+    EntryReuse,
     Divergent,
 }
 
@@ -18,16 +21,22 @@ fn mesh(
     wave64: bool,
     lds_bytes: u32,
 ) -> Result<HostShader, ShaderError> {
+    let wave = if wave64 { 64 } else { 32 };
+    let last_wave = (threads - 1) / wave;
+    let tail = threads % wave;
     let mut words = vec![
         0xD765_0000,
         0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
         0x9004_9803, // s_lshr_b32 s4, s3, 24 (console wave in group)
     ];
+    if wave64 {
+        words.extend([0xD766_0000, 0x0002_00C1]); // v_mbcnt_hi_u32_b32 v0, -1, v0
+    }
     if lds_bytes != 0 {
         words.extend([
-            0x8F0E_8504, // s_lshl_b32 s14, s4, 5
-            0x4A08_000E, // v_add_nc_u32 v4, s14, v0
-            0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+            0x8F0E_8004 | (wave.trailing_zeros() << 8), // s_lshl_b32 s14, s4, log2(wave)
+            0x4A08_000E,                                // v_add_nc_u32 v4, s14, v0
+            0x3408_0882,                                // v_lshlrev_b32 v4, 2, v4
             0xD834_0000,
             0x0000_0004, // ds_write_b32 v4, v0 (separate from ballot scratch)
         ]);
@@ -54,12 +63,29 @@ fn mesh(
             0x4000_0182, // s_mov_b32 s10, mask 1
             0xBF06_8004, // s_cmp_eq_u32 s4, 0
             0x8505_0A09, // s_cselect_b32 s5, s9, s10
+        ]);
+        if !wave64 && tail != 0 {
+            words.extend([
+                0xBF06_8004 | (last_wave << 8), // s_cmp_eq_u32 s4, last_wave
+                0x850E_C1FF,
+                (1 << tail) - 1, // s_cselect_b32 s14, live_tail, -1
+            ]);
+        } else {
+            words.push(0xBE8E_03C1); // s_mov_b32 s14, -1
+        }
+        words.extend([
+            0x8705_0E05, // s_and_b32 s5, s5, s14 (mask out inactive tail lanes)
             0x7E02_0205, // v_mov_b32 v1, s5
             0x2C02_0300, // v_lshrrev_b32 v1, v0, v1
             0x3602_0281, // v_and_b32 v1, 1, v1
             0x7D84_0281, // v_cmp_eq_u32 vcc_lo, 1, v1
             0xBE86_036A, // s_mov_b32 s6, vcc_lo
             0xBE87_0F06, // s_bcnt1_i32_b32 s7, s6
+        ]);
+        if ballot == Ballot::EntryMismatch {
+            words.push(0x8905_8105); // s_xor_b32 s5, s5, 1 (perturb the oracle only)
+        }
+        words.extend([
             0xBF07_0506, // s_cmp_lg_u32 s6, s5
             0x850B_80FF,
             0x8000_0000, // s_cselect_b32 s11, cull, 0
@@ -67,12 +93,26 @@ fn mesh(
             0xBF07_0C07, // s_cmp_lg_u32 s7, s12
             0x850B_0BFF,
             0x8000_0000, // s_cselect_b32 s11, cull, s11
-            0xBE89_0705, // s_not_b32 s9, s5
-            0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
-            0xBF07_096A, // s_cmp_lg_u32 vcc_lo, s9
-            0x850B_0BFF,
-            0x8000_0000, // s_cselect_b32 s11, cull, s11
         ]);
+        if ballot != Ballot::EntryOne {
+            words.extend([
+                0xBE89_0705, // s_not_b32 s9, s5
+                0x8709_0E09, // s_and_b32 s9, s9, s14
+                0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+                0xBF07_096A, // s_cmp_lg_u32 vcc_lo, s9
+                0x850B_0BFF,
+                0x8000_0000, // s_cselect_b32 s11, cull, s11
+            ]);
+        }
+        if ballot == Ballot::EntryReuse {
+            words.extend([
+                0x7D88_0083, // v_cmp_gt_u32 vcc_lo, 3, v0 (third mask)
+                0x870A_870E, // s_and_b32 s10, s14, 7
+                0xBF07_0A6A, // s_cmp_lg_u32 vcc_lo, s10
+                0x850B_0BFF,
+                0x8000_0000, // s_cselect_b32 s11, cull, s11
+            ]);
+        }
     } else {
         words.push(0xBE8B_0380); // s_mov_b32 s11, 0
     }
@@ -80,12 +120,21 @@ fn mesh(
         words[branch] |= (words.len() - branch - 1) as u32;
         words.push(0x887E_0D7E); // s_or_b32 exec_lo, exec_lo, s13
     }
+    if (1..3).contains(&tail) {
+        words.extend([
+            0xBF06_8004 | (last_wave << 8), // s_cmp_eq_u32 s4, last_wave
+            0x850B_0BFF,
+            0x8000_0000, // s_cselect_b32 s11, cull, s11
+        ]);
+    }
     words.extend([
         0x7D84_0081, // v_cmp_eq_u32 vcc_lo, 1, v0
         0x7E1E_0280, // v_mov_b32 v15, 0
         0x0214_1EC1, // v_cndmask_b32 v10, -1, v15, vcc_lo
         0x4A14_1404, // v_add_nc_u32 v10, s4, v10
         0x7E14_0B0A, // v_cvt_f32_i32 v10, v10
+        0x1014_14F0, // v_mul_f32 v10, 0.5, v10
+        0x0614_14F1, // v_add_f32 v10, -0.5, v10
         0x7D84_0082, // v_cmp_eq_u32 vcc_lo, 2, v0
         0x7E1E_02F2, // v_mov_b32 v15, 1.0
         0x0216_1EF3, // v_cndmask_b32 v11, -1.0, v15, vcc_lo
@@ -94,18 +143,37 @@ fn mesh(
         0xF800_00CF,
         0x0D0C_0B0A, // exp pos0 v10, v11, v12, v13
         0x9308_FF04,
-        0x0200_8020, // s_mul_i32 s8, s4, 32 packed in three indices
+        wave * 0x0010_0401, // s_mul_i32 s8, s4, wave size packed in three indices
         0x8808_FF08,
         0x0020_0400, // s_or_b32 s8, s8, packed (0, 1, 2)
         0x8808_0B08, // s_or_b32 s8, s8, s11
         0x7E1C_0208, // v_mov_b32 v14, s8
-        0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
-        0xBE8D_3C6A, // s_and_saveexec_b32 s13, vcc_lo
-        0xF800_0941,
-        0x0000_000E, // exp prim v14, off, off, off done
-        0x887E_0D7E, // s_or_b32 exec_lo, exec_lo, s13
-        0xBF81_0000, // s_endpgm
     ]);
+    if wave64 {
+        words.extend([
+            0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE90_246A, // s_and_saveexec_b64 s[16:17], vcc
+            0xF800_0941,
+            0x0000_000E, // exp prim v14, off, off, off done
+            0x88FE_107E, // s_or_b64 exec, exec, s[16:17]
+        ]);
+    } else {
+        // Use an entry ballot after two nested EXEC branches. The all-lane
+        // scratch exchange must stay before either divergent branch.
+        words.extend([
+            0x7D88_0088, // v_cmp_gt_u32 vcc_lo, 8, v0
+            0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+            0xBF88_0006, // s_cbranch_execz restore_outer
+            0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+            0xBE8D_3C6A, // s_and_saveexec_b32 s13, vcc_lo
+            0xBF88_0002, // s_cbranch_execz restore_inner
+            0xF800_0941,
+            0x0000_000E, // exp prim v14, off, off, off done
+            0x887E_0D7E, // s_or_b32 exec_lo, exec_lo, s13
+            0x887E_0C7E, // s_or_b32 exec_lo, exec_lo, s12
+        ]);
+    }
+    words.push(0xBF81_0000); // s_endpgm
     let native = NativeProgram {
         stage: HwStage::Ms,
         wave64,
@@ -158,7 +226,7 @@ fn mesh(
 #[test]
 fn mesh_numeric_wave32_masks_translate_without_a_fixed_size() {
     mesh(64, Ballot::None, false, 0).expect("mesh without a numerical ballot");
-    for (threads, native_lds) in [(32, 0), (64, 1024), (128, 0)] {
+    for (threads, native_lds) in [(17, 0), (32, 0), (47, 0), (64, 1024), (128, 0)] {
         let shader =
             mesh(threads, Ballot::Entry, false, native_lds).expect("independent Wave32 ballots");
         let container = Container::parse(&shader.dxil).unwrap();
@@ -221,7 +289,7 @@ mod gpu {
     use windows::Win32::Graphics::Dxgi::*;
     use windows::core::{Interface, PCSTR};
 
-    fn device() -> (Host, String, ID3D12InfoQueue, bool) {
+    fn device(validation: bool) -> (Host, String, bool) {
         let sdk = std::env::var("VICTORY_MESH_MASK_TEST_SDK").expect("Agility 1.620.x path");
         let sdk = CString::new(format!("{}\\", sdk.trim_end_matches(['/', '\\']))).unwrap();
         let adapter = std::env::var("VICTORY_MESH_MASK_TEST_ADAPTER").expect("amd, nvidia or warp");
@@ -233,11 +301,13 @@ mod gpu {
                 .unwrap()
                 .CreateDeviceFactory(620, PCSTR(sdk.as_ptr().cast()))
                 .unwrap();
-            let debug: ID3D12Debug1 = factory
-                .GetConfigurationInterface(&CLSID_D3D12Debug)
-                .unwrap();
-            debug.EnableDebugLayer();
-            debug.SetEnableGPUBasedValidation(true);
+            if validation {
+                let debug: ID3D12Debug1 = factory
+                    .GetConfigurationInterface(&CLSID_D3D12Debug)
+                    .unwrap();
+                debug.EnableDebugLayer();
+                debug.SetEnableGPUBasedValidation(true);
+            }
             let dxgi: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
             let selected: IDXGIAdapter1 = if adapter == "warp" {
                 dxgi.EnumWarpAdapter().unwrap()
@@ -273,9 +343,13 @@ mod gpu {
                 .cast::<ID3D12DeviceConfiguration>()
                 .unwrap()
                 .GetDesc();
-            assert_ne!(
-                configured.Flags.0 & D3D12_DEVICE_FLAG_GPU_BASED_VALIDATION_ENABLED.0,
-                0
+            assert_eq!(
+                configured.Flags.0 & D3D12_DEVICE_FLAG_GPU_BASED_VALIDATION_ENABLED.0 != 0,
+                validation
+            );
+            assert_eq!(
+                configured.Flags.0 & D3D12_DEVICE_FLAG_DEBUG_LAYER_ENABLED.0 != 0,
+                validation
             );
             assert_eq!(
                 configured.GpuBasedValidationFlags
@@ -303,15 +377,14 @@ mod gpu {
             support!(model, D3D12_FEATURE_SHADER_MODEL);
             let supported = mesh.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            let info = device.cast().unwrap();
             eprintln!(
-                "{name}: mesh tier {:#x}, shader model {:#x}, wave range {}..{}",
+                "{name}: mesh tier {:#x}, shader model {:#x}, wave range {}..{}, GBV={validation}",
                 mesh.MeshShaderTier.0,
                 model.HighestShaderModel.0,
                 waves.WaveLaneCountMin,
                 waves.WaveLaneCountMax,
             );
-            (Host { device }, name, info, supported)
+            (Host { device }, name, supported)
         }
     }
 
@@ -377,7 +450,7 @@ mod gpu {
     #[test]
     #[ignore = "requires Agility 1.620.x, dxil.dll, a named adapter and Graphics Tools"]
     fn mesh_numeric_wave32_masks_control_two_triangles() {
-        let (host, name, info, supported) = device();
+        let (host, name, supported) = device(true);
         if !supported {
             eprintln!("{name}: mesh rasterization unavailable");
             return;
@@ -385,8 +458,25 @@ mod gpu {
         let pixel = white_pixel();
         let mut validator = Validator::load(Validator::default_path().as_deref()).unwrap();
         validator.validate(&mut pixel.dxil.clone()).unwrap();
-        for ballot in [Ballot::None, Ballot::Entry] {
-            let mesh = mesh(64, ballot, false, 0).unwrap();
+        let cases = [
+            (17, Ballot::Entry, false, 0),
+            (31, Ballot::Entry, false, 0),
+            (32, Ballot::None, false, 0),
+            (32, Ballot::EntryOne, false, 0),
+            (33, Ballot::Entry, false, 0),
+            (47, Ballot::Entry, false, 0),
+            (64, Ballot::None, false, 0),
+            (64, Ballot::Entry, false, 1024),
+            (64, Ballot::EntryMismatch, false, 0),
+            (64, Ballot::EntryReuse, false, 0),
+            (64, Ballot::EntryReuse, false, 28 * 1024 - 4 * 64),
+            (96, Ballot::Entry, false, 0),
+            (128, Ballot::Entry, false, 0),
+            (64, Ballot::None, true, 0),
+            (128, Ballot::None, true, 0),
+        ];
+        for (threads, ballot, wave64, lds_bytes) in cases {
+            let mesh = mesh(threads, ballot, wave64, lds_bytes).unwrap();
             validator.validate(&mut mesh.dxil.clone()).unwrap();
             let (root, pso) = host.mesh_pipeline(&mesh, &pixel).unwrap();
             let pixels = host
@@ -404,10 +494,77 @@ mod gpu {
                     },
                 )
                 .unwrap();
-            let probes = [pixels[13 * 16 + 2], pixels[13 * 16 + 10]];
-            assert_eq!(probes, [[1.; 4]; 2], "{name}, ballot={ballot:?}");
-            eprintln!("{name}: ballot={ballot:?}, independent triangle probes {probes:?}");
+            let probes = std::array::from_fn::<_, 4, _>(|index| pixels[13 * 16 + 4 * index + 1]);
+            let wave = if wave64 { 64 } else { 32 };
+            let want = std::array::from_fn(|index| {
+                let complete = index as u32 * wave + 3 <= threads;
+                if complete && ballot != Ballot::EntryMismatch {
+                    [1.; 4]
+                } else {
+                    [0.; 4]
+                }
+            });
+            assert_eq!(
+                probes, want,
+                "{name}, {threads} threads, {ballot:?}, wave {wave}"
+            );
+            eprintln!(
+                "{name}: {threads} threads, {ballot:?}, wave {wave}, LDS {lds_bytes}, probes {probes:?}"
+            );
         }
-        check_debug(&info);
+        check_debug(&host.device.cast().unwrap());
+    }
+
+    #[test]
+    #[ignore = "native benchmark, uses a named hardware adapter with validation off"]
+    fn mesh_wave32_ballot_gpu_cost() {
+        let (host, name, supported) = device(false);
+        assert!(supported, "{name}: mesh shaders unavailable");
+        let pixel = white_pixel();
+        let groups = 2048;
+        let repeats = 8;
+        let draws = Draw {
+            roots: vec![],
+            textures: &[],
+            samplers: &[],
+            vertices: &[],
+            stride: 0,
+            size: (16, 16),
+            mesh_groups: groups,
+        };
+        for threads in [32, 64, 128] {
+            let pipelines = [
+                Ballot::None,
+                Ballot::EntryOne,
+                Ballot::Entry,
+                Ballot::EntryReuse,
+            ]
+            .map(|kind| {
+                let ms = mesh(threads, kind, false, 0).unwrap();
+                host.mesh_pipeline(&ms, &pixel).unwrap()
+            });
+            let mut samples: [Vec<_>; 4] = std::array::from_fn(|_| Vec::new());
+            for pass in 0..18 {
+                // Rotate the trial order to spread GPU frequency/cache drift.
+                for offset in 0..pipelines.len() {
+                    let index = (pass + offset) % pipelines.len();
+                    let (root, pso) = &pipelines[index];
+                    let elapsed = host.time_mesh(root, pso, &draws, repeats).unwrap();
+                    if pass >= 3 {
+                        samples[index].push(elapsed);
+                    }
+                }
+            }
+            for (ballots, values) in samples.iter_mut().enumerate() {
+                values.sort_by(f64::total_cmp);
+                eprintln!(
+                    "{name}: threads={threads} groups={groups} ballots={ballots} samples={} GPU us/dispatch min={:.3} median={:.3} max={:.3}",
+                    values.len(),
+                    values[0],
+                    values[values.len() / 2],
+                    values[values.len() - 1]
+                );
+            }
+        }
     }
 }

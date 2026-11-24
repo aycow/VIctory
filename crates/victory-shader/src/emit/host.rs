@@ -573,6 +573,29 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_inner(root, pso, d, 0).map(|(pixels, _)| pixels)
+    }
+
+    /// GPU timestamp difference in microseconds per mesh dispatch, with
+    /// the target setup and readback commands outside the measured region.
+    pub fn time_mesh(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        repeats: u32,
+    ) -> Result<f64, String> {
+        assert!(d.mesh_groups > 0 && repeats > 0);
+        self.draw_inner(root, pso, d, repeats).map(|(_, time)| time)
+    }
+
+    fn draw_inner(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        timed_repeats: u32,
+    ) -> Result<(Vec<[f32; 4]>, f64), String> {
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -787,6 +810,7 @@ impl Host {
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.ClearRenderTargetView(rtv, &[0.0; 4], None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
                 Height: h as f32,
@@ -809,11 +833,39 @@ impl Host {
                     }]),
                 );
             }
+            let timestamps = if timed_repeats > 0 {
+                let mut heap: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: 2,
+                        NodeMask: 0,
+                    },
+                    &mut heap,
+                ).map_err(err)?;
+                let heap = heap.ok_or("no timestamp query heap")?;
+                let readback = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buf_desc(16),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                )?;
+                list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                Some((heap, readback))
+            } else {
+                None
+            };
             if d.mesh_groups > 0 {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
-                list6.DispatchMesh(d.mesh_groups, 1, 1);
+                for _ in 0..timed_repeats.max(1) {
+                    list6.DispatchMesh(d.mesh_groups, 1, 1);
+                }
             } else {
                 list.DrawInstanced(3, 1, 0, 0);
+            }
+            if let Some((heap, readback)) = &timestamps {
+                list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, readback, 0);
             }
             list.ResourceBarrier(&[transition(
                 &target,
@@ -879,7 +931,18 @@ impl Host {
             }
             readback.Unmap(0, None);
             drop(keep);
-            Ok(out)
+            let mut time = 0.0;
+            if let Some((_, readback)) = timestamps {
+                let hz = queue.GetTimestampFrequency().map_err(err)?;
+                assert!(hz > 0);
+                let mut p = std::ptr::null_mut();
+                readback.Map(0, None, Some(&mut p)).map_err(err)?;
+                let times = std::slice::from_raw_parts(p.cast::<u64>(), 2);
+                time = times[1].wrapping_sub(times[0]) as f64 * 1e6
+                    / (hz as f64 * f64::from(timed_repeats));
+                readback.Unmap(0, None);
+            }
+            Ok((out, time))
         }
     }
 }
