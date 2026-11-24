@@ -5,13 +5,15 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at};
+use super::{VIEW_TAG, View, Views, with_live_views, with_view_at};
 use crate::host::host;
+use crate::shadow::Shadow;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -23,8 +25,7 @@ pub(crate) struct HostHeap {
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    slots: Mutex<Slots>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -38,6 +39,26 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+}
+
+struct Slots {
+    /// The record (view index and generation) each slot was last made from.
+    made: Vec<u64>,
+    /// Mirrored SRV slots and their associated shadow, once materialized.
+    direct: BTreeMap<u32, (u64, Option<SrvRange>)>,
+    /// Slots still awaiting native SRV creation. Failures can be retried
+    /// without enumerating slots already materialized.
+    pending_srvs: BTreeSet<u32>,
+    srv_ranges: Option<SrvCache>,
+    shadow_retirements: u64,
+}
+
+struct SrvCache {
+    retired_srvs: u64,
+    /// Resource-backed views used by these ranges. Their packed keys do
+    /// not retain the title objects when their generation is retired.
+    object_views: Vec<u64>,
+    ranges: Arc<[SrvRange]>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -148,7 +169,13 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            slots: Mutex::new(Slots {
+                made: vec![0; count as usize],
+                direct: BTreeMap::new(),
+                pending_srvs: BTreeSet::new(),
+                srv_ranges: None,
+                shadow_retirements: crate::shadow::retirement_revision(),
+            }),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             kept_copy: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
@@ -371,17 +398,67 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
-        let Some(view) = view else {
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let Slots {
+            made,
+            direct,
+            pending_srvs,
+            srv_ranges,
+            ..
+        } = &mut *slots;
+        let view = (tag == VIEW_TAG)
+            .then(|| {
+                with_view_at(i, generation, |view| {
+                    let Some(parts) = buffer_srv_parts(view) else {
+                        return (view.clone(), false);
+                    };
+                    let (previous, range) = direct.entry(index).or_insert((0, None));
+                    if *previous != key {
+                        *previous = key;
+                        *range = None;
+                        *srv_ranges = None;
+                        pending_srvs.insert(index);
+                        made[index as usize] = 0;
+                        null_for(view, self.cpu(index));
+                        self.keep(index, None, None);
+                    }
+                    if for_draw
+                        && range.as_ref().is_none_or(|r| r.shadow.superseded())
+                        && self.bind_srv(index, parts, matches!(view, View::Placed(..)), range)
+                    {
+                        *srv_ranges = None;
+                        if range.is_some() {
+                            pending_srvs.remove(&index);
+                            made[index as usize] = key;
+                        } else {
+                            pending_srvs.insert(index);
+                            made[index as usize] = 0;
+                        }
+                    }
+                    (view.clone(), true)
+                })
+            })
+            .flatten();
+        let Some((view, is_direct_srv)) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
             }
+            if direct.remove(&index).is_some() {
+                pending_srvs.remove(&index);
+                *srv_ranges = None;
+            }
             return None;
         };
+        if is_direct_srv {
+            return Some(view);
+        }
+        if direct.remove(&index).is_some() {
+            pending_srvs.remove(&index);
+            *srv_ranges = None;
+        }
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
@@ -404,16 +481,174 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Creates or replaces a native buffer SRV, keeping the previous buffer
+    /// alive until the native slot has been rewritten.
+    fn bind_srv(
+        &self,
+        index: u32,
+        parts: (u64, u64, D3D12_SHADER_RESOURCE_VIEW_DESC),
+        placed: bool,
+        range: &mut Option<SrvRange>,
+    ) -> bool {
+        let replacement = buffer_srv(parts, self.cpu(index), placed);
+        if range.is_some() && replacement.is_none() {
+            null_buffer_view(self.cpu(index));
+        }
+        let changed = range.is_some() || replacement.is_some();
+        *range = replacement;
+        changed
+    }
+
+    fn srv_slot<'a>(
+        &self,
+        slots: &'a mut Slots,
+        views: &Views,
+        index: u32,
+    ) -> Option<&'a SrvRange> {
+        let (key, range) = slots.direct.get_mut(&index)?;
+        let Some(view) = views.live(*key) else {
+            slots.pending_srvs.remove(&index);
+            return None;
+        };
+        if range.as_ref().is_none_or(|r| r.shadow.superseded()) {
+            if let Some(parts) = buffer_srv_parts(view)
+                && self.bind_srv(index, parts, matches!(view, View::Placed(..)), range)
+            {
+                slots.srv_ranges = None;
+            }
+            if range.is_some() {
+                slots.made[index as usize] = *key;
+                slots.pending_srvs.remove(&index);
+            } else {
+                slots.made[index as usize] = 0;
+                slots.pending_srvs.insert(index);
+            }
+        }
+        range.as_ref().filter(|r| r.address != r.end)
+    }
+
+    fn srv_ranges(
+        &self,
+        slots: &mut Slots,
+        views: &Views,
+        selection: SrvSelection<'_>,
+    ) -> Arc<[SrvRange]> {
+        #[cfg(feature = "diagnostics")]
+        use crate::copystat::{C, add};
+        if let SrvSelection::Exact(indices) = selection {
+            #[cfg(feature = "diagnostics")]
+            {
+                add(C::DirectEligibleSlots, indices.len() as u64);
+                add(C::DirectSlots, indices.len() as u64);
+            }
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            let ranges = merge_srv_ranges(
+                indices
+                    .iter()
+                    .filter_map(|&index| self.srv_slot(slots, views, index).cloned())
+                    .collect(),
+            );
+            #[cfg(feature = "diagnostics")]
+            add(C::DirectRangeBuildUs, started.elapsed().as_micros() as u64);
+            return ranges.into();
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            add(C::DirectEligibleSlots, slots.direct.len() as u64);
+            add(C::DirectSlots, slots.pending_srvs.len() as u64);
+        }
+        for index in std::mem::take(&mut slots.pending_srvs) {
+            self.srv_slot(slots, views, index);
+        }
+        let shadow_retirements = crate::shadow::retirement_revision();
+        if slots.shadow_retirements != shadow_retirements {
+            slots.shadow_retirements = shadow_retirements;
+            // A raw placed view keeps the same descriptor key when its
+            // title address is reused. Only walk this heap's slots if a
+            // cached live range pointed to a superseded registration.
+            if slots
+                .srv_ranges
+                .as_ref()
+                .is_none_or(|cache| cache.ranges.iter().any(|range| range.shadow.superseded()))
+            {
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
+                #[cfg(feature = "diagnostics")]
+                add(C::DirectSlots, slots.direct.len() as u64);
+                let retired: Vec<_> = slots
+                    .direct
+                    .iter()
+                    .filter_map(|(&index, (_, range))| {
+                        range
+                            .as_ref()
+                            .is_some_and(|range| range.shadow.superseded())
+                            .then_some(index)
+                    })
+                    .collect();
+                #[cfg(feature = "diagnostics")]
+                add(C::DirectSlots, retired.len() as u64);
+                for index in retired {
+                    self.srv_slot(slots, views, index);
+                }
+                #[cfg(feature = "diagnostics")]
+                add(C::DirectRangeBuildUs, started.elapsed().as_micros() as u64);
+            }
+        }
+        if let Some(cache) = &mut slots.srv_ranges
+            && (cache.retired_srvs == views.retired_srvs
+                || cache
+                    .object_views
+                    .iter()
+                    .all(|&key| views.live(key).is_some()))
+        {
+            cache.retired_srvs = views.retired_srvs;
+            return cache.ranges.clone();
+        }
+        #[cfg(feature = "diagnostics")]
+        add(C::DirectSlots, slots.direct.len() as u64);
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let mut object_views = Vec::new();
+        let ranges: Vec<_> = slots
+            .direct
+            .values()
+            .filter_map(|(key, range)| {
+                let range = range.as_ref().filter(|range| range.address != range.end)?;
+                if matches!(views.live(*key)?, View::Shader(..)) {
+                    object_views.push(*key);
+                }
+                Some(range.clone())
+            })
+            .collect();
+        object_views.sort_unstable();
+        object_views.dedup();
+        let ranges: Arc<[_]> = merge_srv_ranges(ranges).into();
+        #[cfg(feature = "diagnostics")]
+        add(C::DirectRangeBuildUs, started.elapsed().as_micros() as u64);
+        slots.srv_ranges = Some(SrvCache {
+            retired_srvs: views.retired_srvs,
+            object_views,
+            ranges: ranges.clone(),
+        });
+        ranges
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let key = *self
+            .slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .made
+            .get(index as usize)?;
         if key == 0 {
             return Some("null".into());
         }
-        let view = view_at(key as u32, (key >> 32) as u32)?;
+        let view = super::view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
         if let Some((address, len)) = buffer_range(&view) {
             let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
@@ -674,13 +909,84 @@ fn nulled_stride(stride: u32) -> bool {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct SrvRange {
+    pub(crate) shadow: Arc<Shadow>,
+    pub(crate) address: usize,
+    pub(crate) end: usize,
+}
+
+/// Which mirrored slots the submitted shaders may read from a heap.
+#[derive(Clone, Copy)]
+pub(crate) enum SrvSelection<'a> {
+    All,
+    Exact(&'a [u32]),
+}
+
+/// Holds live title views during refresh and returns the native shadows to
+/// retain through execution. The submitting host passes distinct heaps
+/// under its submission lock. Mirroring also locks slots before views.
+pub(crate) fn with_srv_ranges(
+    heaps: &[(&HostHeap, SrvSelection<'_>)],
+    refresh: impl FnOnce(&[Arc<[SrvRange]>]),
+) -> Vec<Arc<[SrvRange]>> {
+    if heaps.is_empty() {
+        return Vec::new();
+    }
+    let mut slots: Vec<_> = heaps
+        .iter()
+        .map(|(heap, _)| heap.slots.lock().unwrap_or_else(|e| e.into_inner()))
+        .collect();
+    with_live_views(|views| {
+        let ranges: Vec<_> = heaps
+            .iter()
+            .zip(&mut slots)
+            .map(|(&(heap, selection), slots)| heap.srv_ranges(slots, views, selection))
+            .collect();
+        drop(slots);
+        refresh(&ranges);
+        ranges
+    })
+}
+
+pub(crate) fn merge_srv_ranges(mut ranges: Vec<SrvRange>) -> Vec<SrvRange> {
+    ranges.sort_unstable_by_key(|range| (Arc::as_ptr(&range.shadow), range.address));
+    ranges.dedup_by(|next, current| {
+        if Arc::ptr_eq(&next.shadow, &current.shadow) && next.address <= current.end {
+            current.end = current.end.max(next.end);
+            true
+        } else {
+            false
+        }
+    });
+    ranges
+}
+
+fn buffer_srv_parts(view: &View) -> Option<(u64, u64, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
+    match view {
+        View::Shader(resource, Some(desc)) => {
+            let (data, len) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+            Some((data as u64, len, srv_desc(desc)))
+        }
+        View::Placed(false, resource, desc) if resource[0] == 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            Some((address, len, srv_desc(desc[..10].try_into().ok()?)))
+        }
+        _ => None,
+    }
+}
+
 fn buffer_srv(
-    address: u64,
-    len: u64,
-    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    (address, len, mut desc): (u64, u64, D3D12_SHADER_RESOURCE_VIEW_DESC),
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     placed: bool,
-) -> Option<Kept> {
+) -> Option<SrvRange> {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let stride = unsafe { desc.Anonymous.Buffer }.StructureByteStride;
@@ -691,7 +997,15 @@ fn buffer_srv(
         );
         return None;
     }
-    let (shadow, first, own) = view_copy(address, len, shader_extent(address, &desc))
+    // SAFETY: a buffer view's union member after checking the dimension.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let from = buffer.FirstElement.checked_mul(element)?;
+    let bytes = u64::from(buffer.NumElements).checked_mul(element)?;
+    if from.checked_add(bytes)? > len {
+        return None;
+    }
+    let from = address.checked_add(from)?;
+    let (shadow, first, _) = view_copy(address, len, (from, bytes, element))
         .map_err(|why| {
             once!(
                 view = kind(placed),
@@ -704,22 +1018,28 @@ fn buffer_srv(
             );
         })
         .ok()?;
-    // SAFETY: a buffer view's union member.
-    let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    // `first` is the element the view's own start is from the copy's start,
-    // so it replaces the title's first element rather than adding to it: on a
-    // copy of just the view's bytes that is 0, since the copy starts there.
-    buffer.FirstElement = if own { 0 } else { first };
+    let range = SrvRange {
+        shadow,
+        address: usize::try_from(from).ok()?,
+        end: usize::try_from(from.checked_add(bytes)?).ok()?,
+    };
+    buffer.FirstElement = first;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+            .CreateShaderResourceView(&range.shadow.buffer, Some(&desc), at)
     };
-    Some(Kept::Resource {
-        resource: shadow.buffer.clone(),
-        copy: own.then(|| shadow.clone()),
-    })
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::SrvMaterializations, 1);
+        add(
+            C::SrvMaterializationUs,
+            started.elapsed().as_micros() as u64,
+        );
+    }
+    Some(range)
 }
 
 /// How a buffer view was placed, as its warning names it: a registered
@@ -833,6 +1153,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    if let Some(parts) = buffer_srv_parts(view) {
+        return buffer_srv(parts, at, matches!(view, View::Placed(..))).map(|range| {
+            Kept::Resource {
+                resource: range.shadow.buffer.clone(),
+                copy: Some(range.shadow),
+            }
+        });
+    }
     let host = host()?;
     let device = &host.device;
     match view {
@@ -876,12 +1204,6 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     resource: texture.clone(),
                     copy: None,
                 })
-            } else if let (Some((data, len)), Some(desc)) =
-                (crate::resource::buffer_bytes(resource), desc)
-            {
-                // A registered resource's copy starts at the resource, so its
-                // views always start on an element.
-                buffer_srv(data as u64, len, srv_desc(desc), at, false)
             } else {
                 None
             }
@@ -951,7 +1273,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if *unordered {
                 buffer_uav(address, len, uav_desc(words), at, true)
             } else {
-                buffer_srv(address, len, srv_desc(words), at, true)
+                None
             }
         }
     }

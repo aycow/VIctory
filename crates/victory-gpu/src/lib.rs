@@ -15,6 +15,8 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(all(test, victory_test_agility))]
+mod agility;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -55,4 +57,6 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::{
+    title_memory_allocation_changed, title_memory_remapped, writing as kernel_will_write,
+};

@@ -8,10 +8,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::{HeapBufferSrvUsage, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub heap_buffer_srvs: HeapBufferSrvUsage,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -902,10 +903,12 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        let heap_buffer_srvs = self.s.heap_buffer_srv_usage();
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            heap_buffer_srvs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]

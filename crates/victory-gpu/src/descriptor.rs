@@ -56,7 +56,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
 }
@@ -76,7 +76,7 @@ impl Heap {
     /// Made late because a host view heap the size of Grand Theft Auto VI's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
-    pub(crate) fn host(&self) -> Option<&host::HostHeap> {
+    pub(crate) fn host(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
         if let Some(h) = self.host.get() {
             return h.as_ref();
         }
@@ -94,7 +94,7 @@ impl Heap {
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
-                Some(h)
+                Some(std::sync::Arc::new(h))
             })
             .as_ref()
     }
@@ -117,23 +117,20 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
-/// The shader-visible heap holding `handle`, and the descriptor's index.
-#[cfg(windows)]
-fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let &(_, _, at) = heaps
-        .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))?;
-    // SAFETY: registered heaps are live (removed when dropped).
-    let heap = unsafe { &*(at as *const Heap) };
-    Some((heap, heap.index(handle)?))
-}
-
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap.
 #[cfg(windows)]
 fn mirror(handle: u64) {
-    let Some((heap, index)) = shader_slot(handle) else {
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(&(_, _, at)) = heaps
+        .iter()
+        .find(|&&(start, end, _)| (start..end).contains(&handle))
+    else {
+        return;
+    };
+    // SAFETY: the registry lock prevents this heap from finishing Drop.
+    let heap = unsafe { &*(at as *const Heap) };
+    let Some(index) = heap.index(handle) else {
         return;
     };
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -328,6 +325,9 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
+    /// Changes when a resource-backed buffer SRV stops naming live title memory.
+    #[cfg(windows)]
+    retired_srvs: u64,
 }
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
@@ -335,6 +335,8 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
+    #[cfg(windows)]
+    retired_srvs: 0,
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
@@ -395,6 +397,10 @@ pub(crate) fn forget(resource: usize) {
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
+        #[cfg(windows)]
+        if matches!(&view, View::Shader(_, Some(words)) if words[1] == 1) {
+            views.retired_srvs = views.retired_srvs.wrapping_add(1);
+        }
         views.index.remove(&view);
         views.list[i as usize].1 = generation.wrapping_add(1).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
@@ -404,11 +410,32 @@ pub(crate) fn forget(resource: usize) {
 }
 
 /// The view of entry `i` if `generation` is still its own.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 fn view_at(i: u32, generation: u32) -> Option<View> {
+    with_view_at(i, generation, View::clone)
+}
+
+#[cfg(windows)]
+fn with_view_at<T>(i: u32, generation: u32, f: impl FnOnce(&View) -> T) -> Option<T> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    (*current == generation).then(|| f(view))
+}
+
+#[cfg(windows)]
+impl Views {
+    fn live(&self, key: u64) -> Option<&View> {
+        let (view, generation) = self.list.get(key as u32 as usize)?;
+        (*generation == (key >> 32) as u32).then_some(view)
+    }
+}
+
+/// Protect object-backed title memory from release during CPU refresh.
+/// Callers also using heap slot locks acquire them before this lock.
+#[cfg(windows)]
+fn with_live_views<T>(f: impl FnOnce(&Views) -> T) -> T {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    f(&views)
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -670,6 +697,10 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[cfg(windows)]
+    #[path = "coherency.rs"]
+    mod coherency;
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.

@@ -153,15 +153,18 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
-    if base.is_null() {
-        tracing::debug!(
-            size,
-            kind = format_args!("{kind:#x}"),
-            flags = format_args!("{flags:#x}"),
-            at = format_args!("{at:p}"),
-            "XMemVirtualAlloc"
-        );
-    }
+    super::memory::preserve_last_error(|| {
+        super::memory::allocation_completed(base, at, size, kind);
+        if base.is_null() {
+            tracing::debug!(
+                size,
+                kind = format_args!("{kind:#x}"),
+                flags = format_args!("{flags:#x}"),
+                at = format_args!("{at:p}"),
+                "XMemVirtualAlloc"
+            );
+        }
+    });
     at
 }
 
@@ -318,7 +321,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            super::memory::VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -806,9 +809,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
-        victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        let unmapped = unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -817,6 +819,17 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        if unmapped == 0 {
+            tracing::warn!(
+                address = format_args!("{at:#x}"),
+                len = size,
+                error = %std::io::Error::last_os_error(),
+                "unmapping physical pages failed"
+            );
+            physical.views.insert(at, (size, slice));
+            continue;
+        }
+        victory_gpu::title_memory_remapped(at, size);
         if at < base {
             map(physical, at, base - at, slice.clone());
         }

@@ -100,6 +100,35 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_translated_shader(
+    stage: &'static str,
+    host: victory_shader::emit::HostShader,
+) -> Arc<Shader> {
+    Arc::new(Shader {
+        stage,
+        hash: "synthetic".into(),
+        container: Vec::new(),
+        translated: OnceLock::from(Some(Translated {
+            host,
+            used: Vec::new(),
+        })),
+    })
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_compute_shader_with_used(
+    host: victory_shader::emit::HostShader,
+    used: Vec<victory_shader::UsedResource>,
+) -> Arc<Shader> {
+    Arc::new(Shader {
+        stage: "compute",
+        hash: "synthetic".into(),
+        container: Vec::new(),
+        translated: OnceLock::from(Some(Translated { host, used })),
+    })
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
