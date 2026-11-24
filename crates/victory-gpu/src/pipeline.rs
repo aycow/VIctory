@@ -100,6 +100,19 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
+#[cfg(all(windows, test, feature = "diagnostics"))]
+pub(crate) fn address_map_test_shader(host: victory_shader::emit::HostShader) -> Arc<Shader> {
+    Arc::new(Shader {
+        stage: "compute",
+        hash: blake3::hash(&host.dxil).to_hex()[..16].to_owned(),
+        container: Vec::new(),
+        translated: OnceLock::from(Some(Translated {
+            host,
+            used: Vec::new(),
+        })),
+    })
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not

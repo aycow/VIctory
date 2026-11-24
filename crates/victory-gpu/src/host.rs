@@ -117,10 +117,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -183,7 +184,13 @@ fn create() -> windows::core::Result<Host> {
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+        create_with_device(device.ok_or_else(windows::core::Error::empty)?, debug)
+    }
+}
+
+fn create_with_device(device: ID3D12Device, debug: bool) -> windows::core::Result<Host> {
+    // SAFETY: the device is live and creation uses complete descriptions.
+    unsafe {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -224,6 +231,27 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
         })
     }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn install_address_map_test_device(device: ID3D12Device) -> &'static Host {
+    let instance = create_with_device(device, false).unwrap();
+    assert!(HOST.set(Some(instance)).is_ok());
+    host().unwrap()
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn address_map_test_prepare_us() -> u64 {
+    SUBMISSION_US[0].swap(0, Ordering::Relaxed)
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn address_map_test_dispatch_us(list: &HostList) -> f64 {
+    // SAFETY: a plain query on the queue that executed this test list.
+    let frequency = unsafe { host().unwrap().queue.GetTimestampFrequency().unwrap() };
+    let [(time, name)] = list.slowest(frequency, 1).try_into().unwrap();
+    assert_eq!(name, "address-map dispatch");
+    time * 1_000.0
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).

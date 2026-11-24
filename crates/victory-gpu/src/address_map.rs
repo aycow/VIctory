@@ -12,6 +12,8 @@
 
 use std::sync::Arc;
 
+use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+
 use victory_shader::emit::address_map::{ENTRY, HEADER, Range, encode};
 
 use crate::descriptor::host::HostHeap;
@@ -86,36 +88,70 @@ fn entries(
     out
 }
 
+/// The guest interval and the native resource that implements it. A
+/// mapped allocation has no separate shadow to refresh.
+struct Backing<'a> {
+    span: (u64, u64),
+    resource: &'a ID3D12Resource,
+    shadow: Option<&'a Arc<Shadow>>,
+}
+
 /// The address map for draws of `list` while `heap` is its view heap: its
 /// host GPU address, and the dynamic slots its views take (to give back
 /// when the list is reset). Each copy is brought up to date when the list
 /// is submitted.
 pub(crate) fn make(list: &HostList, heap: &HostHeap) -> Option<(u64, (u32, u32))> {
     let copies: Vec<Arc<Shadow>> = crate::shadow::all();
-    let spans: Vec<(u64, u64)> = copies.iter().map(|c| c.span()).collect();
+    let backings: Vec<_> = copies
+        .iter()
+        .map(|copy| Backing {
+            span: copy.span(),
+            resource: &copy.buffer,
+            shadow: Some(copy),
+        })
+        .collect();
+    make_backed(list, heap, &backings)
+}
+
+fn make_backed(
+    list: &HostList,
+    heap: &HostHeap,
+    backings: &[Backing<'_>],
+) -> Option<(u64, (u32, u32))> {
+    let spans: Vec<_> = backings.iter().map(|backing| backing.span).collect();
     let pieces = pieces(&spans);
     let entries = entries(&spans, &pieces);
     let mut views: Vec<(usize, u64)> = entries.iter().map(|e| e.2).collect();
     views.sort_unstable();
     views.dedup();
     // At least one view: shaders read the entry their search lands on.
-    let n = views.len().max(1) as u32;
+    let n = u32::try_from(views.len().max(1)).ok()?;
+    // Allocate upload backing before reserving descriptor slots. Failure
+    // must not leave a reservation owned by no recorded command list.
+    let bytes = u64::from(HEADER) + u64::from(ENTRY) * entries.len().max(1) as u64;
+    let (gpu, to) = list.scratch(bytes)?;
     let first = heap.dynamic(n)?;
     if views.is_empty() {
         heap.raw_uav_at(first, None, 0, 0);
     }
     for (k, &(span, view)) in views.iter().enumerate() {
-        let copy = &copies[span];
+        let backing = &backings[span];
         let offset = view * VIEW_BYTES;
-        let bytes = (copy.span().1 - offset).min(VIEW_BYTES).next_multiple_of(4);
+        let bytes = (backing.span.1 - offset)
+            .min(VIEW_BYTES)
+            .next_multiple_of(4);
         heap.raw_uav_at(
             first + k as u32,
-            Some(&copy.buffer),
+            Some(backing.resource),
             offset / 4,
             (bytes / 4) as u32,
         );
     }
-    for c in &copies {
+    for backing in backings {
+        let Some(c) = backing.shadow else {
+            list.keep(backing.resource);
+            continue;
+        };
         if list.first_use(Arc::as_ptr(c) as usize ^ MAP_KEY) {
             let (start, len) = c.span();
             c.refresh(list, start, len);
@@ -140,8 +176,6 @@ pub(crate) fn make(list: &HostList, heap: &HostHeap) -> Option<(u64, (u32, u32))
         });
     }
     let words = encode(&ranges);
-    let bytes = u64::from(HEADER) + u64::from(ENTRY) * ranges.len() as u64;
-    let (gpu, to) = list.scratch(bytes)?;
     // SAFETY: `bytes` of the list's upload memory, which outlives the
     // list's run; the words fit.
     unsafe {
@@ -205,3 +239,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod backing_tests;
