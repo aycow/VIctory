@@ -407,9 +407,10 @@ fn aliases() -> MutexGuard<'static, Aliases> {
 
 /// Notes `[base, base + len)` as showing `slice` and the slices after it
 /// (`shown`), or as no longer showing them.
-fn note_aliases(base: usize, len: usize, slice: &Slice, shown: bool) {
+fn note_aliases(base: usize, len: usize, slice: &Slice, shown: bool) -> Vec<usize> {
     let section = Arc::as_ptr(&slice.section) as usize;
     let mut a = aliases();
+    let mut existing = Vec::new();
     for k in 0..len / PAGE {
         let (at, key) = (base + k * PAGE, (section, slice.index + k));
         if shown {
@@ -418,7 +419,9 @@ fn note_aliases(base: usize, len: usize, slice: &Slice, shown: bool) {
             {
                 list.retain(|&x| x != at);
             }
-            a.by_page.entry(key).or_default().push(at);
+            let views = a.by_page.entry(key).or_default();
+            existing.extend(views.iter().copied());
+            views.push(at);
         } else if a.by_address.get(&at) == Some(&key) {
             a.by_address.remove(&at);
             if let Some(list) = a.by_page.get_mut(&key) {
@@ -429,6 +432,7 @@ fn note_aliases(base: usize, len: usize, slice: &Slice, shown: bool) {
             }
         }
     }
+    existing
 }
 
 /// The other addresses showing the physical page mapped at page address
@@ -789,7 +793,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     static LOOKUP: std::sync::Once = std::sync::Once::new();
     LOOKUP.call_once(|| victory_gpu::set_alias_lookup(other_views));
-    note_aliases(base, len, &slice, true);
+    let existing = note_aliases(base, len, &slice, true);
+    victory_gpu::reopen_guarded_aliases(&existing);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -869,7 +874,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
-        note_aliases(at, size, &slice, false);
+        let _ = note_aliases(at, size, &slice, false);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(

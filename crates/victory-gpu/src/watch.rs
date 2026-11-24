@@ -267,6 +267,20 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     !blocks.is_empty()
 }
 
+/// A new mapping can be written through immediately. Open guards on the
+/// existing views so the next read rearms them and includes the new alias.
+pub fn reopen_guarded_aliases(addresses: &[usize]) {
+    if addresses.is_empty() {
+        return;
+    }
+    let mut g = guards();
+    for &address in addresses {
+        if g.protected.contains(&(address / BLOCK)) {
+            open(&mut g, address, address.saturating_add(BLOCK));
+        }
+    }
+}
+
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
@@ -459,14 +473,14 @@ mod tests {
         fn lookup(at: usize, out: &mut Vec<usize>) {
             let (a, b) = (A.load(Ordering::Relaxed), B.load(Ordering::Relaxed));
             let page = at - at % BLOCK;
-            if page == a {
+            if page == a && b != 0 {
                 out.push(b);
             } else if page == b {
                 out.push(a);
             }
         }
         // SAFETY: one pagefile section of a block, mapped twice read-write.
-        let (a, b) = unsafe {
+        let (section, a, b) = unsafe {
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
@@ -477,6 +491,7 @@ mod tests {
             );
             assert!(!section.is_null());
             (
+                section,
                 MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize,
                 MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize,
             )
@@ -499,12 +514,40 @@ mod tests {
         assert_eq!(guard(b, b + BLOCK), Some(vec![]));
         writing(a + 16, 4);
         assert_eq!(guard(b, b + BLOCK), Some(vec![b / PAGE]));
+        // Remove the alias, then guard a on its own before adding an alias back.
+        writing(a, BLOCK);
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: b as *mut _ }) };
+        title_memory_remapped(b, BLOCK);
+        B.store(0, Ordering::Relaxed);
+        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
+        assert_eq!(guard(a, a + BLOCK), Some(vec![]), "clean before mapping an alias");
+
+        let late = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK) }.Value as usize;
+        assert_ne!(late, 0);
+        title_memory_remapped(late, BLOCK);
+        B.store(late, Ordering::Relaxed);
+        reopen_guarded_aliases(&[a]);
+
+        // The real bytes are shared. The original guarded observer must refresh.
+        unsafe { ((late + 16) as *mut u8).write_volatile(19) };
+        let observed = unsafe { ((a + 16) as *const u8).read_volatile() };
+        let dirty = guard(a, a + BLOCK);
+        assert_eq!(guard(a, a + BLOCK), Some(vec![]), "rearmed after mapping an alias");
+
+        // A second write now has to fault through the newly guarded view.
+        unsafe { ((late + 16) as *mut u8).write_volatile(20) };
+        let rearmed = guard(a, a + BLOCK);
+
         A.store(0, Ordering::Relaxed);
         B.store(0, Ordering::Relaxed);
-        for v in [a, b] {
+        for v in [a, late] {
             // SAFETY: our views.
             unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v as *mut _ }) };
             title_memory_remapped(v, BLOCK);
         }
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(section) };
+        assert_eq!(observed, 19);
+        assert_eq!(dirty, Some(vec![a / PAGE]), "write through an alias mapped after the guard");
+        assert_eq!(rearmed, Some(vec![a / PAGE]), "new view rearmed with the existing guard");
     }
 }
