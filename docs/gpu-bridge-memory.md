@@ -4,12 +4,12 @@ Set `VICTORY_MEMORY_STATS=1` in a Windows diagnostics build. After device creati
 
 The sampler combines process private commit, working set, cumulative page faults, system commit and its limit, node-zero DXGI local and non-local usage, and capacities of tracked owners. The DXGI fields are optional because the selected adapter might not expose them. These measurements overlap and cannot be added together.
 
-- `shadow_bytes` counts backing extents held by live shadow owners.
+- `shadow_bytes` counts the rounded buffer widths held by live shadow owners. `cached_shadow_guest_bytes` sums the logical guest extents of cached shadows. `cached_shadow_guest_unique_bytes` takes their union in guest virtual address space. The difference measures overlap at the same guest addresses. The sample cannot identify aliases mapped at different virtual addresses and excludes uncached shadows still held by recordings.
 - `snapshot_bytes` counts CPU snapshot capacity in active snapshots, including both allocations while one grows. `idle_snapshot_bytes` covers the separate retained snapshot pool from #602.
 - `list_scratch_bytes` counts chunks kept for command-list reuse, including after reset. `list_upload_bytes` counts dedicated uploads retained by the recording.
 - `texture_upload_bytes` covers live staging owners. `cached_texture_upload_bytes` is a subset, and the separate texture read capacity belongs to the existing #602 counter.
 
-Each tracked owner's high-water counter measures peak capacity during the process. The categories can peak at different times. Sampling uses atomic reads and the existing nonblocking retained-pool queries. A skipped retained-pool sample is missing data. Requested buffer capacities are distinct from private commit and driver residency. The current instrumentation does not attribute descriptor heap reservation, compiler allocations, pipeline-library blobs, readback pools, DirectStorage intermediates or async retirement.
+Each tracked owner's high-water counter measures peak capacity during the process. The categories can peak at different times. Sampling uses atomic reads and nonblocking registry and retained-pool queries. A skipped sample is missing data. Requested buffer capacities are distinct from private commit and driver residency. The instrumentation covers the observable coexistence of snapshot buffers during growth. It does not track allocator-internal retention or resolve private commit by allocator, descriptor heap reservation, compiler allocation, pipeline-library blobs, readback pools, DirectStorage intermediates or async retirement.
 
 ## Synthetic validation
 

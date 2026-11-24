@@ -154,7 +154,10 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             #[cfg(feature = "diagnostics")]
-            _capacity: crate::memstat::Charge::new(&crate::memstat::SHADOW, len),
+            _capacity: crate::memstat::Charge::new(
+                &crate::memstat::SHADOW,
+                len.next_multiple_of(1 << 16),
+            ),
         }
     }
 
@@ -484,6 +487,23 @@ const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// Counts cached shadow extents and the guest virtual ranges they overlap.
+/// Existing recordings may also hold shadows removed from these registries.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cached_shadow_ranges() -> Option<crate::memstat::ShadowRanges> {
+    let buffers = BUFFERS.try_lock().ok()?;
+    let loose = LOOSE.try_lock().ok()?;
+    let ranges = buffers
+        .values()
+        .filter_map(|entry| entry.shadow.as_deref())
+        .chain(loose.values().map(Arc::as_ref))
+        .map(|shadow| (shadow.start, shadow.start + shadow.len))
+        .collect();
+    drop(loose);
+    drop(buffers);
+    Some(crate::memstat::ShadowRanges::from_extents(ranges))
+}
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);

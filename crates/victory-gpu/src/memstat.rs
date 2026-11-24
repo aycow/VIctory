@@ -131,6 +131,28 @@ fn commit() -> Option<(u64, u64)> {
     ))
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ShadowRanges {
+    pub(crate) count: usize,
+    pub(crate) described_bytes: u64,
+    pub(crate) unique_virtual_bytes: u64,
+}
+
+impl ShadowRanges {
+    pub(crate) fn from_extents(mut extents: Vec<(u64, u64)>) -> Self {
+        extents.sort_unstable();
+        let mut ranges = Self::default();
+        let mut accounted_until = 0;
+        for (start, end) in extents {
+            ranges.count += 1;
+            ranges.described_bytes += end - start;
+            ranges.unique_virtual_bytes += end.saturating_sub(start.max(accounted_until));
+            accounted_until = accounted_until.max(end);
+        }
+        ranges
+    }
+}
+
 fn sample(elapsed_s: u64, adapter: Option<&IDXGIAdapter3>) {
     let mem = crate::copystat::process_memory();
     let commit = commit();
@@ -148,6 +170,7 @@ fn sample(elapsed_s: u64, adapter: Option<&IDXGIAdapter3>) {
     let (list_upload_bytes, list_upload_peak) = UPLOAD.sample();
     let (texture_upload_bytes, texture_upload_peak) = TEXTURE_UPLOAD.sample();
     let cached = crate::texture::cached_staging_bytes();
+    let shadow_ranges = crate::shadow::cached_shadow_ranges();
     tracing::info!(
         target: "victory_gpu::memory", frame = crate::frame::current(), elapsed_s,
         private_bytes = ?mem.as_ref().map(|m| m.private_usage),
@@ -157,6 +180,9 @@ fn sample(elapsed_s: u64, adapter: Option<&IDXGIAdapter3>) {
         gpu_local_usage = ?local.map(|m| m.CurrentUsage), gpu_local_budget = ?local.map(|m| m.Budget),
         gpu_non_local_usage = ?non_local.map(|m| m.CurrentUsage),
         shadow_bytes, shadow_peak, snapshot_bytes, snapshot_peak,
+        cached_shadows = ?shadow_ranges.as_ref().map(|r| r.count),
+        cached_shadow_guest_bytes = ?shadow_ranges.as_ref().map(|r| r.described_bytes),
+        cached_shadow_guest_unique_bytes = ?shadow_ranges.as_ref().map(|r| r.unique_virtual_bytes),
         list_scratch_bytes, list_scratch_peak, list_upload_bytes, list_upload_peak,
         texture_upload_bytes, texture_upload_peak,
         idle_snapshot_bytes = ?crate::shadow::idle_snapshot_bytes(),
@@ -169,6 +195,20 @@ fn sample(elapsed_s: u64, adapter: Option<&IDXGIAdapter3>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_shadow_extents_count_overlap_and_ignore_gaps() {
+        let extents = vec![(40, 50), (18, 27), (10, 26), (10, 12), (27, 30)];
+        assert_eq!(
+            ShadowRanges::from_extents(extents),
+            ShadowRanges {
+                count: 5,
+                described_bytes: 40,
+                unique_virtual_bytes: 30,
+            }
+        );
+        assert_eq!(ShadowRanges::from_extents(Vec::new()), ShadowRanges::default());
+    }
 
     #[test]
     fn simultaneous_owners_contribute_to_peak_and_release_capacity() {
