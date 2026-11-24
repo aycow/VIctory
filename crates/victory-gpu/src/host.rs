@@ -1740,7 +1740,7 @@ impl Host {
             {
                 let black = probe.map(|b| crate::capture::black(&b));
                 crate::dependencies::presentation_result(frame, source, black, shown.is_ok());
-                return Some(black.unwrap_or(false));
+                Some(black.unwrap_or(false))
             }
             #[cfg(not(feature = "diagnostics"))]
             {

@@ -36,6 +36,14 @@ admitted write. `state` on an access is the latest observed state at that
 point in the trace. State events distinguish submission prelude barriers
 from in-list transitions.
 
+The frame summary's `reachable_refused` counts refusal operations in that
+report that the graph reaches from the present. Each `render refused producer`
+row groups those operations by pipeline, shader set and reason, with the count and earliest
+sequence. Several output edges can reach one operation and it counts once.
+The frame summary's `refused` count covers the whole captured interval.
+Prior-frame edges may refer to sequences whose operation records are in an
+earlier report.
+
 For a matched #530 reproduction, share only the build revision, adapter
 and driver, selected present number, whether the existing final probe
 flagged black, the aggregate missing-writer/unresolved/refusal counts, and
@@ -69,7 +77,10 @@ source. The complete chain returns RGBA `[255, 0, 0, 255]` and a
 same-present writer. Omitting the producer leaves the explicitly seeded
 black texture, returns RGBA `[0, 0, 0, 255]`, and resolves to the preceding
 present's writer. A separate graph test covers a resource with no observed
-writer and a distinct refused-writer edge.
+writer and a distinct refused-writer edge. The GPU test also records a
+candidate refusal for the input and a second refusal for an unrelated
+resource. The black case reports only the reachable refusal. The red
+case's later copy replaces it.
 
 Use the Windows Graphics Tools optional component and the runtime directory
 from the D3D12 Agility SDK 1.620.x package. Run each selected adapter in a
@@ -78,6 +89,7 @@ validation and checks for validation warnings or errors.
 
 ```powershell
 cargo test -p victory-gpu --features diagnostics lineage_distinguishes_absent_previous_and_refused_writers
+cargo test -p victory-gpu --features diagnostics refused_producers_count_only_reachable_operations_once
 $env:VICTORY_RENDER_DEPENDENCIES = '1-4'
 $env:VICTORY_RENDER_TEST_AGILITY = 'C:\path\to\agility\build\native\bin\x64'
 foreach ($vendor in 'amd', 'nvidia', 'warp') {

@@ -244,6 +244,22 @@ fn render(host: &Host, frame: u64, producer: bool) {
         consumer.close();
 
         let prepare = host.new_list().unwrap();
+        prepare.note_dependency(|| {
+            refuse(
+                "synthetic producer",
+                "synthetic cs",
+                "not admitted",
+                vec![access(target_id, Role::Uav)],
+            )
+        });
+        prepare.note_dependency(|| {
+            refuse(
+                "synthetic producer",
+                "synthetic cs",
+                "not admitted",
+                vec![access(target_id + 3, Role::Uav)],
+            )
+        });
         let mut intermediate_state = targets;
         if let Some(texture) = producer_texture.as_ref() {
             let producer_id = target_id + 2;
@@ -286,6 +302,7 @@ fn render(host: &Host, frame: u64, producer: bool) {
                     &node.event,
                     Event::Pass {
                         kind: "dispatch",
+                        refusal: None,
                         ..
                     }
                 )
@@ -297,11 +314,33 @@ fn render(host: &Host, frame: u64, producer: bool) {
             .find(|input| matches!(input.access.role, Role::Srv))
             .unwrap();
         let writer = source.writer.unwrap();
+        let lineage = report.lineage();
+        let groups = report.refused_producers(&lineage);
         assert_eq!(source.state, Some(shader_read.0 as u32));
         assert_eq!(writer.frame, if producer { frame } else { frame - 1 });
-        assert!(report.lineage().contains(&writer.sequence));
-        assert!(report.lineage().contains(&dispatch.point.sequence));
-        assert!(source.refused_writer.is_none());
+        assert!(lineage.contains(&writer.sequence));
+        assert!(lineage.contains(&dispatch.point.sequence));
+        if producer {
+            assert!(source.refused_writer.is_none());
+            assert!(groups.is_empty());
+        } else {
+            let refusal = source.refused_writer.unwrap();
+            let producer = RefusedProducer {
+                pipeline: "synthetic producer",
+                shaders: "synthetic cs",
+                reason: "not admitted",
+            };
+            assert_eq!(
+                groups,
+                BTreeMap::from([(
+                    producer,
+                    RefusalCount {
+                        count: 1,
+                        earliest_sequence: refusal.sequence,
+                    },
+                )]),
+            );
+        }
         assert_eq!(report.omitted, 0);
         let mut pixel = std::ptr::null_mut();
         readback
@@ -311,8 +350,8 @@ fn render(host: &Host, frame: u64, producer: bool) {
         readback.Unmap(0, Some(&D3D12_RANGE::default()));
         assert_eq!(actual, [if producer { 255 } else { 0 }, 0, 0, 255]);
         println!(
-            "producer={producer} frame={frame} source_writer_frame={} pixel={actual:?}",
-            writer.frame
+            "producer={producer} frame={frame} source_writer_frame={} refused_groups={} pixel={actual:?}",
+            writer.frame, groups.len()
         );
     }
 }

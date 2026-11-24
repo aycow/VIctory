@@ -678,6 +678,7 @@ extern "system" fn resolve(
                     D3D12_RESOLVE_MODE_AVERAGE,
                 );
             } else {
+                #[cfg(feature = "diagnostics")]
                 return;
             }
         }

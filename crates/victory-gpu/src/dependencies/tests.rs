@@ -36,6 +36,16 @@ fn operation(kind: &'static str, refusal: Option<&str>, accesses: Vec<Access>) -
     event
 }
 
+fn refuse(pipeline: &str, shaders: &str, reason: &str, accesses: Vec<Access>) -> Event {
+    Event::Pass {
+        kind: "dispatch",
+        key: pipeline.into(),
+        shaders: shaders.into(),
+        refusal: Some(reason.into()),
+        accesses,
+    }
+}
+
 fn present(frame: u64, source: Resource) -> Event {
     Event::Present {
         frame,
@@ -89,6 +99,65 @@ fn lineage_distinguishes_absent_previous_and_refused_writers() {
     assert_eq!(
         report.lineage().into_iter().collect::<Vec<_>>(),
         [1, 3, 5, 6, 7]
+    );
+}
+
+#[test]
+fn refused_producers_count_only_reachable_operations_once() {
+    let mut record = Recorded::default();
+    let output = |id| access(id, Role::Uav);
+    let refusals: [(_, _, _, &[_]); 8] = [
+        ("lighting", "cs:a", "translation", &[12]),
+        ("lighting", "cs:a", "translation", &[10, 11]),
+        ("unrelated", "cs:z", "translation", &[13]),
+        ("lighting", "cs:a", "translation", &[14]),
+        ("lighting", "cs:a", "descriptor", &[15]),
+        ("lighting", "cs:b", "translation", &[16]),
+        ("lighting-other", "cs:a", "translation", &[17]),
+        ("lighting", "cs:a", "translation", &[18]),
+    ];
+    for (pipeline, shaders, reason, outputs) in refusals {
+        record.push(refuse(
+            pipeline,
+            shaders,
+            reason,
+            outputs.iter().copied().map(output).collect(),
+        ));
+    }
+    record.push(Event::transfer("replaced", vec![access(18, Role::Clear)]));
+    record.push(Event::transfer(
+        "compose",
+        [10, 11, 14, 15, 16, 17, 18]
+            .into_iter()
+            .map(|id| access(id, Role::Srv))
+            .chain([output(19)])
+            .collect(),
+    ));
+    record.push(present(1, 19));
+
+    let report = record.replay(&mut Tracker::default()).pop().unwrap();
+    let groups = report.refused_producers(&report.lineage());
+    let summary = |pipeline, shaders, reason, count, earliest_sequence| {
+        (
+            RefusedProducer {
+                pipeline,
+                shaders,
+                reason,
+            },
+            RefusalCount {
+                count,
+                earliest_sequence,
+            },
+        )
+    };
+    assert_eq!(
+        groups,
+        BTreeMap::from([
+            summary("lighting", "cs:a", "translation", 2, 2),
+            summary("lighting", "cs:a", "descriptor", 1, 5),
+            summary("lighting", "cs:b", "translation", 1, 6),
+            summary("lighting-other", "cs:a", "translation", 1, 7),
+        ]),
     );
 }
 

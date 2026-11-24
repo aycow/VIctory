@@ -316,6 +316,19 @@ pub(crate) struct Report {
     omitted: usize,
 }
 
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RefusedProducer<'a> {
+    pipeline: &'a str,
+    shaders: &'a str,
+    reason: &'a str,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RefusalCount {
+    count: usize,
+    earliest_sequence: u64,
+}
+
 impl Report {
     pub(crate) fn publish(self) {
         self.log();
@@ -345,8 +358,42 @@ impl Report {
         lineage
     }
 
+    fn refused_producers(
+        &self,
+        lineage: &BTreeSet<u64>,
+    ) -> BTreeMap<RefusedProducer<'_>, RefusalCount> {
+        let mut groups = BTreeMap::new();
+        for node in &self.nodes {
+            if let Event::Pass {
+                key,
+                shaders,
+                refusal: Some(reason),
+                ..
+            } = &node.event
+                && lineage.contains(&node.point.sequence)
+            {
+                // Nodes are in ascending sequence, and one producer can be
+                // reachable through several of its outputs.
+                groups
+                    .entry(RefusedProducer {
+                        pipeline: key,
+                        shaders,
+                        reason,
+                    })
+                    .or_insert(RefusalCount {
+                        count: 0,
+                        earliest_sequence: node.point.sequence,
+                    })
+                    .count += 1;
+            }
+        }
+        groups
+    }
+
     fn log(&self) {
         let lineage = self.lineage();
+        let refused_producers = self.refused_producers(&lineage);
+        let reachable_refused = refused_producers.values().map(|group| group.count).sum::<usize>();
         let no_prior_writer = self
             .nodes
             .iter()
@@ -376,8 +423,17 @@ impl Report {
             .count();
         tracing::info!(
             target: "victory_gpu::dependencies", frame = self.frame, operations = self.nodes.len(),
-            no_prior_writer, unresolved_shader_bindings, refused, omitted = self.omitted, "render dependencies"
+            no_prior_writer, unresolved_shader_bindings, refused, reachable_refused,
+            omitted = self.omitted, "render dependencies"
         );
+        for (producer, group) in refused_producers {
+            tracing::info!(
+                target: "victory_gpu::dependencies", frame = self.frame,
+                pipeline = producer.pipeline, shaders = producer.shaders, reason = producer.reason,
+                count = group.count, earliest_sequence = group.earliest_sequence,
+                "render refused producer"
+            );
+        }
         for node in &self.nodes {
             let sequence = node.point.sequence;
             let on_path = lineage.contains(&sequence);
