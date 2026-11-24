@@ -73,11 +73,11 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
 
 /// A process-wide memory snapshot for the diagnostics line. PrivateUsage
 /// is the process commit charge; WorkingSetSize is the resident physical set.
+#[derive(Clone, Copy)]
 struct ProcessMemory {
     page_faults: u64,
     private_usage: u64,
     working_set: u64,
-    pagefile: u64,
 }
 
 fn process_memory() -> Option<ProcessMemory> {
@@ -108,7 +108,6 @@ fn process_memory() -> Option<ProcessMemory> {
         page_faults: u64::from(counters.PageFaultCount),
         private_usage: counters.PrivateUsage as u64,
         working_set: counters.WorkingSetSize as u64,
-        pagefile: counters.PagefileUsage as u64,
     })
 }
 
@@ -160,7 +159,6 @@ pub(crate) fn log(frames: f64) {
         tracing::info!(
             private_gib = memory.private_usage as f64 / GIB,
             working_set_gib = memory.working_set as f64 / GIB,
-            pagefile_gib = memory.pagefile as f64 / GIB,
             "process memory"
         );
     }
