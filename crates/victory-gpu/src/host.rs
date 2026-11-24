@@ -176,7 +176,13 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        #[cfg(all(test, feature = "diagnostics"))]
+        if let Ok(which) = std::env::var("VICTORY_TEST_RAW_VIEW_ADAPTER") {
+            device = Some(raw_view_test_device(&which)?);
+        }
+        if device.is_some() {
+            // The synthetic test device already selected its adapter.
+        } else if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -223,6 +229,57 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn raw_view_test_device(which: &str) -> windows::core::Result<ID3D12Device> {
+    use windows::core::s;
+
+    // SAFETY: the test configures the D3D12 runtime before creating a device.
+    unsafe {
+        let mut settings: Option<ID3D12SDKConfiguration1> = None;
+        D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut settings)?;
+        let factory: ID3D12DeviceFactory = settings
+            .unwrap()
+            .CreateDeviceFactory(620, s!(".\\D3D12\\"))?;
+        let debug: ID3D12Debug1 = factory.GetConfigurationInterface(&CLSID_D3D12Debug)?;
+        debug.EnableDebugLayer();
+        debug.SetEnableGPUBasedValidation(true);
+        let dxgi: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let adapter: IDXGIAdapter1 = if which == "warp" {
+            dxgi.EnumWarpAdapter()?
+        } else {
+            let vendor = match which {
+                "amd" => 0x1002,
+                "nvidia" => 0x10de,
+                _ => panic!("unsupported test adapter {which}"),
+            };
+            (0..)
+                .map_while(|i| dxgi.EnumAdapters1(i).ok())
+                .find(|a| a.GetDesc1().is_ok_and(|d| d.VendorId == vendor))
+                .ok_or_else(windows::core::Error::empty)?
+        };
+        let desc = adapter.GetDesc1()?;
+        let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+        assert_eq!(software, which == "warp");
+        let name = String::from_utf16_lossy(&desc.Description);
+        let mut device: Option<ID3D12Device> = None;
+        factory.CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        let device = device.ok_or_else(windows::core::Error::empty)?;
+        let configuration = device.cast::<ID3D12DeviceConfiguration>()?.GetDesc();
+        assert_ne!(
+            configuration.Flags.0 & D3D12_DEVICE_FLAG_GPU_BASED_VALIDATION_ENABLED.0,
+            0
+        );
+        assert_eq!(configuration.SDKVersion, 620);
+        assert_eq!(configuration.GpuBasedValidationFlags, 0);
+        eprintln!(
+            "raw view fixture on {} SDK {} full GBV",
+            name.trim_end_matches('\0'),
+            configuration.SDKVersion
+        );
+        Ok(device)
     }
 }
 

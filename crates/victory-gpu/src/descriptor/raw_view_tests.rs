@@ -204,6 +204,18 @@ fn dispatch(
     user_data: u32,
 ) -> windows::core::Result<()> {
     let zeros = vec![0u32; user_data as usize];
+    dispatch_with_args(device, heap, root, pso, &zeros, 2)
+}
+
+fn dispatch_with_args(
+    device: &ID3D12Device,
+    heap: &HostHeap,
+    root: &ID3D12RootSignature,
+    pso: &ID3D12PipelineState,
+    data: &[u32],
+    groups: u32,
+) -> windows::core::Result<()> {
+    let samplers = HostHeap::new(true, 1).ok_or_else(windows::core::Error::empty)?;
     // SAFETY: an open list with every root argument set; the heap, its
     // table and the buffers its views read outlive the wait.
     unsafe {
@@ -215,11 +227,11 @@ fn dispatch(
             device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
         let list: ID3D12GraphicsCommandList =
             device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, pso)?;
-        list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+        list.SetDescriptorHeaps(&[Some(heap.heap.clone()), Some(samplers.heap.clone())]);
         list.SetComputeRootSignature(root);
-        list.SetComputeRoot32BitConstants(0, user_data, zeros.as_ptr().cast(), 0);
+        list.SetComputeRoot32BitConstants(0, data.len() as u32, data.as_ptr().cast(), 0);
         list.SetComputeRootShaderResourceView(1, heap.stride_table_gpu().expect("a table"));
-        list.Dispatch(2, 1, 1);
+        list.Dispatch(groups, 1, 1);
         list.Close()?;
         queue.ExecuteCommandLists(&[Some(list.cast()?)]);
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
@@ -382,4 +394,171 @@ fn retiring_slot_is_unavailable_until_its_alias_is_cleared() {
     assert_eq!(during_cleanup, Some(None), "slot reusable before cleanup");
     assert_eq!(heap.dynamic(1), Some(last), "cleared slot was not returned");
     eprintln!("Verified descriptor lease during and after alias cleanup");
+}
+
+/// Exercise the two remaining raw declarations, an unindexed vector read
+/// and a scalar buffer read, against a raw descriptor at the byte window
+/// of an original structured or typed view. The production translator
+/// currently leaves table indexing at the input's original slot.
+#[test]
+#[ignore = "requires Agility SDK 1.620.2 and explicit GPU adapter"]
+fn translated_unindexed_reads_choose_the_table_slot_without_a_stride_entry() {
+    assert!(std::env::var_os("VICTORY_TEST_RAW_VIEW_ADAPTER").is_some());
+    let heap = HostHeap::new(false, 8).expect("view heap");
+    let host = host().expect("adapter");
+    let device = &host.device;
+    let queue: ID3D12InfoQueue = device.cast().expect("active debug layer");
+    let memory = vec![0u8; 2 * WINDOW as usize + 0x1_0000];
+    let src = (memory.as_ptr() as u64).next_multiple_of(WINDOW) + 0xf000;
+    let dst = src + WINDOW - 0xf000;
+    let mapped = |address| {
+        let shadow = crate::shadow::find(address, u64::from(WIDTH)).unwrap();
+        let mut p = std::ptr::null_mut();
+        // SAFETY: the fixture keeps a live host copy for each address.
+        unsafe { shadow.buffer.Map(0, None, Some(&mut p)).unwrap() };
+        // SAFETY: the title memory is within the registered loose window.
+        unsafe {
+            p.cast::<u8>()
+                .add(shadow.offset(address) as usize)
+                .cast::<u32>()
+        }
+    };
+    let input = mapped(src);
+    let output = mapped(dst);
+    // SAFETY: the input is a mapped copy of WIDTH bytes with no GPU work in flight.
+    unsafe {
+        for i in 0..64 {
+            input.add(i).write(100 + i as u32);
+        }
+    }
+    let raw = (R32_TYPELESS, 0, RAW);
+    heap.make_at(1, &placed(true, dst, raw, (0, 16)));
+
+    for scalar in [false, true] {
+        let mut words = vec![
+            0xbe81_0380u32, // s_mov_b32 s1, 0
+            0xbe83_0380,    // s_mov_b32 s3, 0
+            0xf408_0200,
+            0xfa00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0
+            0xf408_0301,
+            0xfa00_0000, // s_load_dwordx4 s[12:15], s[2:3], 0
+        ];
+        if scalar {
+            words.extend([
+                0xbe87_0384, // s_mov_b32 s7, 4
+                0xf420_0184,
+                0x0e00_0000, // s_buffer_load_dword s6, s[8:11], s7
+                0x7e04_0206, // v_mov_b32 v2, s6
+            ]);
+        } else {
+            words.extend([0xe030_0004, 0x8002_0200]); // unindexed buffer_load_dword v2, 4
+        }
+        words.extend([0xe070_0000, 0x8003_0200, 0xbf81_0000]); // store v2; s_endpgm
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: [0, 2]
+                .into_iter()
+                .map(|user_data| RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data,
+                    slot: user_data / 2,
+                })
+                .collect(),
+            used: [(ResourceType::Srv, 0), (ResourceType::Uav, 2)]
+                .into_iter()
+                .map(|(kind, user_data)| UsedResource {
+                    kind,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data,
+                    slot: user_data / 2,
+                })
+                .collect(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+        };
+        let p = victory_shader::ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = victory_shader::structure::structure(&p).unwrap();
+        let res =
+            victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = victory_shader::io::raise(&p, &native).unwrap();
+        let c = victory_shader::Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let mut cs = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert!(
+            !cs.stride_table,
+            "the unindexed form currently chooses no alias"
+        );
+        victory_shader::emit::validator::Validator::load(
+            victory_shader::emit::validator::Validator::default_path().as_deref(),
+        )
+        .expect("DXIL validator")
+        .validate(&mut cs.dxil)
+        .unwrap();
+        let (root, pso) = pipeline(device, &cs).expect("validated pipeline");
+        for (label, shape, first, expected) in [
+            ("raw", raw, 8, 109),
+            ("structured x12", (0, 12, 0), 4, 113),
+            ("structured x16", (0, 16, 0), 2, 109),
+            ("typed float4", (R32G32B32A32_FLOAT, 0, 0), 2, 109),
+        ] {
+            heap.make_at(0, &placed(false, src, shape, (first, 4)));
+            let raw_slot = (shape != raw).then(|| heap.alias_base() + 2);
+            let stride = if shape == raw {
+                4
+            } else {
+                shape.1.max(if shape.0 == 0 { 0 } else { 16 })
+            };
+            assert_eq!(
+                heap.entry_words(0),
+                StrideEntry {
+                    stride,
+                    raw_slot,
+                    bias: 0
+                }
+                .words()
+            );
+            let slot = raw_slot.unwrap_or(0);
+            let mut args = vec![0u32; cs.user_data_dwords() as usize];
+            args[0] = slot * 32;
+            args[2] = 32; // store through table rooted at native slot 1
+            // SAFETY: reset and then read the mapped destination either side of the completed dispatch.
+            unsafe {
+                output.write(u32::MAX);
+                dispatch_with_args(device, &heap, &root, &pso, &args, 1).unwrap();
+                assert_eq!(output.read(), expected, "{label}, scalar={scalar}");
+            }
+        }
+    }
+    // SAFETY: read-only queries of the active debug layer's live message queue.
+    unsafe {
+        for i in 0..queue.GetNumStoredMessages() {
+            let mut len = 0;
+            queue.GetMessage(i, None, &mut len).unwrap();
+            let mut bytes = vec![0u64; len.div_ceil(8)];
+            let msg = bytes.as_mut_ptr().cast::<D3D12_MESSAGE>();
+            queue.GetMessage(i, Some(msg), &mut len).unwrap();
+            let msg = &*msg;
+            assert!(
+                msg.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0,
+                "{}",
+                std::ffi::CStr::from_ptr(msg.pDescription.cast()).to_string_lossy()
+            );
+        }
+    }
+    eprintln!("unindexed vector + scalar: raw and three matching raw aliases pass");
 }
