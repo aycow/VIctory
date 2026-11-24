@@ -23,6 +23,9 @@ use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
+#[cfg(all(test, feature = "diagnostics"))]
+mod stride_tests;
+
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
 enum Root {
@@ -347,7 +350,9 @@ impl State {
             );
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -406,7 +411,25 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let stride = if let Some((param, stage)) = p
+            .stages
+            .iter()
+            .find_map(|stage| stage.stride_table.map(|param| (param, stage)))
+        {
+            let Some(gpu) = compute
+                .then(|| self.runtime_aliases(list, &stage.translated().host.stride_views))
+                .flatten()
+            else {
+                once!(
+                    "a dispatch with an unsupported runtime structured-buffer binding was dropped"
+                );
+                return false;
+            };
+            Some((param, gpu))
+        } else {
+            None
+        };
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -491,25 +514,40 @@ impl State {
                     }
                 }
             }
-            if let Some(param) = stage.stride_table {
-                let gpu = (self.heaps[0] != 0)
-                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-                    .flatten()
-                    .and_then(|h| h.stride_table_gpu());
-                if let Some(gpu) = gpu {
-                    // SAFETY: an open list; the stride table buffer lives with the host heap.
-                    unsafe {
-                        if compute {
-                            l.SetComputeRootShaderResourceView(param, gpu);
-                        } else {
-                            l.SetGraphicsRootShaderResourceView(param, gpu);
-                        }
-                    }
-                } else {
-                    once!("a shader reads the runtime stride table without a host view heap");
-                }
-            }
         }
+        if let Some((param, gpu)) = stride {
+            // SAFETY: runtime aliases are compute-only and the metadata
+            // range lives with the list.
+            unsafe { l.SetComputeRootShaderResourceView(param, gpu) };
+        }
+        true
+    }
+
+    fn runtime_aliases(
+        &self,
+        list: &HostList,
+        entries: &[victory_shader::emit::StrideView],
+    ) -> Option<u64> {
+        use crate::descriptor::host::RuntimeAlias;
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This))?;
+        let host = heap.host()?;
+        let mut aliases = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let Root::Table(base) = self.compute.get(usize::from(entry.slot))? else {
+                return None;
+            };
+            let at = base.checked_add(u64::from(entry.table_offset_dwords) * 4)?;
+            if !heap.exact_slot(*base) || !heap.exact_slot(at) {
+                return None;
+            }
+            let view = crate::descriptor::view(at)?;
+            let alias = RuntimeAlias::new(&view, entry.uav)?;
+            if aliases.iter().any(|other| !alias.compatible(other)) {
+                return None;
+            }
+            aliases.push(alias);
+        }
+        host.bind_aliases(list, &aliases)
     }
 
     /// Runs a dispatch on the host.
@@ -534,7 +572,12 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -1009,10 +1052,7 @@ impl State {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => {
-                    self.bind(list, p, true);
-                    true
-                }
+                Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,

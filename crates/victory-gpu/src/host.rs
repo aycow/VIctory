@@ -135,9 +135,16 @@ fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
-        if debug {
+        #[cfg(all(test, feature = "diagnostics"))]
+        let mut device = std::env::var("VICTORY_TEST_STRIDE_ADAPTER")
+            .ok()
+            .map(|which| stride_test_device(&which))
+            .transpose()?;
+        #[cfg(not(all(test, feature = "diagnostics")))]
+        let mut device: Option<ID3D12Device> = None;
+        let debug = device.is_some()
+            || (cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some());
+        if debug && device.is_none() {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
                 Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
@@ -172,15 +179,17 @@ fn create() -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
-        let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if device.is_none()
+            && cfg!(feature = "diagnostics")
+            && std::env::var_os("VICTORY_D3D12_WARP").is_some()
+        {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
-        } else {
+        } else if device.is_none() {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
@@ -223,6 +232,56 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn stride_test_device(which: &str) -> windows::core::Result<ID3D12Device> {
+    use windows::core::s;
+
+    // SAFETY: the test configures the D3D12 runtime before creating a device.
+    unsafe {
+        let mut settings: Option<ID3D12SDKConfiguration1> = None;
+        D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut settings)?;
+        let factory: ID3D12DeviceFactory = settings
+            .unwrap()
+            .CreateDeviceFactory(620, s!(".\\D3D12\\"))?;
+        let debug: ID3D12Debug1 = factory.GetConfigurationInterface(&CLSID_D3D12Debug)?;
+        debug.EnableDebugLayer();
+        debug.SetEnableGPUBasedValidation(true);
+        let dxgi: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let adapter: IDXGIAdapter1 = if which == "warp" {
+            dxgi.EnumWarpAdapter()?
+        } else {
+            let vendor = match which {
+                "amd" => 0x1002,
+                "nvidia" => 0x10de,
+                _ => panic!("unsupported test adapter {which}"),
+            };
+            (0..)
+                .map_while(|i| dxgi.EnumAdapters1(i).ok())
+                .find(|a| a.GetDesc1().is_ok_and(|d| d.VendorId == vendor))
+                .ok_or_else(windows::core::Error::empty)?
+        };
+        let desc = adapter.GetDesc1()?;
+        let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+        assert_eq!(software, which == "warp");
+        let name = String::from_utf16_lossy(&desc.Description);
+        let mut device: Option<ID3D12Device> = None;
+        factory.CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        let device = device.ok_or_else(windows::core::Error::empty)?;
+        let configuration = device.cast::<ID3D12DeviceConfiguration>()?.GetDesc();
+        assert_ne!(
+            configuration.Flags.0 & D3D12_DEVICE_FLAG_GPU_BASED_VALIDATION_ENABLED.0,
+            0
+        );
+        assert_eq!(configuration.GpuBasedValidationFlags, 0);
+        eprintln!(
+            "runtime stride fixture on {} SDK {} full GBV",
+            name.trim_end_matches('\0'),
+            configuration.SDKVersion
+        );
+        Ok(device)
     }
 }
 
@@ -399,6 +458,7 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    alias_slots: Vec<crate::descriptor::host::AliasSlots>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -1133,6 +1193,10 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    pub(crate) fn keep_alias_slots(&self, slots: crate::descriptor::host::AliasSlots) {
+        self.deferred().alias_slots.push(slots);
     }
 
     /// Whether this is the first time since the reset that the list asks

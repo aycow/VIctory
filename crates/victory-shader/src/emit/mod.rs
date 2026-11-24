@@ -156,7 +156,16 @@ pub struct HostShader {
     pub root_srvs: Vec<u8>,
     /// True when the shader reads the runtime stride table (`t0` in
     /// [`STRIDE_SPACE`]).
-    pub stride_table: bool,
+    pub stride_views: Vec<StrideView>,
+}
+
+/// Descriptor-table entries with an unknown native stride. The host binds a
+/// raw alias index, byte stride and record count for each entry, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrideView {
+    pub slot: u8,
+    pub table_offset_dwords: u32,
+    pub uav: bool,
 }
 
 impl HostShader {
@@ -299,7 +308,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
-        stride_table: l.stride_table,
+        stride_views: l.stride_views,
     })
 }
 
@@ -494,7 +503,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
-            stride_table: false,
+            stride_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -505,7 +514,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
-                stride_table: false,
+                stride_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -610,20 +619,17 @@ mod tests {
             0xF408_0302,
             0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
             0x7E00_0282, // v_mov_b32 v0, 2
-            0x7E02_0284, // v_mov_b32 v1, 4
-            0xE030_3000,
-            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+            0xE030_2004,
+            0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen offset:4
             0x7E00_0281, // v_mov_b32 v0, 1
-            0x7E02_0288, // v_mov_b32 v1, 8
-            0xE070_3000,
-            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+            0xE070_2008,
+            0x8003_0200, // buffer_store_dword v2, v0, s[12:15], 0 idxen offset:8
             0x7E00_0282, // v_mov_b32 v0, 2
-            0x7E02_0280, // v_mov_b32 v1, 0
             0x7E06_028A, // v_mov_b32 v3, 10
-            0xE0C8_3000,
-            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
-            0xE0C8_3000,
-            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
+            0xE0C8_2000,
+            0x8003_0300, // buffer_atomic_add v3, v0, s[12:15], 0 idxen
+            0xE0C8_2000,
+            0x8003_0300, // buffer_atomic_add v3, v0, s[12:15], 0 idxen
             0xBF81_0000, // s_endpgm
         ];
         let native = super::NativeProgram {
@@ -692,7 +698,7 @@ mod tests {
             mesh_stride: 0,
         })
         .unwrap();
-        assert!(l.stride_table);
+        assert_eq!(l.stride_views.len(), 2);
         let mut dxil = l.dxil;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
@@ -710,7 +716,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
-                stride_table: l.stride_table,
+                stride_views: l.stride_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let srv_data: Vec<u32> = (100..112).collect();
@@ -725,7 +731,7 @@ mod tests {
                                 1,
                                 super::host::Root::View {
                                     srv: true,
-                                    data: vec![12, 12],
+                                    data: vec![0, 12, 4, 0, 1, 12, 5, 0],
                                 },
                             ),
                         ],

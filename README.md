@@ -124,9 +124,19 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
+| `VICTORY_RUNTIME_STRIDE_ALIASES=1` | opt in to bounded structured-buffer accesses with a stride supplied at dispatch time |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+
+Runtime stride aliases currently support compute shaders with exact descriptor
+table entries, ordinary structured SRVs and counter-free UAVs, and dword
+operations with a dword-aligned immediate byte offset. Each dispatch owns a
+raw view of the same checked buffer window and its stride and record count
+until the list resets. Typed views, dynamically selected descriptors, and
+windows that cannot be represented by a correctly aligned raw view are
+refused. Pipelines that require runtime stride aliases are refused by
+default. The option applies to release builds as well as diagnostics builds.
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.

@@ -334,7 +334,12 @@ impl HostPipeline {
             );
         }
         for (s, _) in &stages {
-            s.translated()?;
+            if !s.translated()?.host.stride_views.is_empty() && !runtime_stride_aliases_enabled() {
+                return refuse(
+                    "runtime structured-buffer aliases require VICTORY_RUNTIME_STRIDE_ALIASES=1",
+                    shaders,
+                );
+            }
         }
         let host = host()?;
 
@@ -393,7 +398,7 @@ impl HostPipeline {
                     });
                 }
             }
-            if t.stride_table {
+            if !t.stride_views.is_empty() {
                 stage.stride_table = Some(params.len() as u32);
                 params.push(D3D12_ROOT_PARAMETER1 {
                     ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
@@ -581,6 +586,11 @@ impl HostPipeline {
             inputs: g.elements(),
         })
     }
+}
+
+pub(crate) fn runtime_stride_aliases_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_RUNTIME_STRIDE_ALIASES").as_deref() == Ok("1"))
 }
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state

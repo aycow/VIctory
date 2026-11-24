@@ -158,7 +158,7 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
-        if stages.iter().any(|(s, _)| s.stride_table) {
+        if stages.iter().any(|(s, _)| !s.stride_views.is_empty()) {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -541,7 +541,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
-        stride_table: false,
+        stride_views: Vec::new(),
     }
 }
 
