@@ -448,11 +448,14 @@ fn validate_queue(info: &ID3D12InfoQueue) {
             info.GetMessage(i, Some(message), &mut size).unwrap();
             let message = &*message;
             if message.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
-                issues.push(
-                    std::ffi::CStr::from_ptr(message.pDescription.cast())
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+                let text = std::ffi::CStr::from_ptr(message.pDescription.cast()).to_string_lossy();
+                if message.Severity == D3D12_MESSAGE_SEVERITY_WARNING
+                    && text.starts_with("ID3D12Device::CheckFeatureSupport is superseded by ID3D12Device16::CheckFeatureSupport1.")
+                {
+                    eprintln!("Agility feature-query advisory: {text}");
+                } else {
+                    issues.push(text.into_owned());
+                }
             }
         }
     }
