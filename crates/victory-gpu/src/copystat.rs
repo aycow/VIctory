@@ -85,12 +85,19 @@ pub(crate) enum C {
     /// the time.
     CompareBytes,
     CompareUs,
+    TexHashUs,
+    TexUntrackedDetileUs,
 }
-const COUNTERS: usize = 52;
+const COUNTERS: usize = C::TexUntrackedDetileUs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+pub(crate) fn texture_hash_timing() -> bool {
+    static TIMING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TIMING.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HASH_TIMING").is_some())
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -291,6 +298,15 @@ pub(crate) fn log(frames: f64) {
         .map(|((start, len), bytes)| format!("{start:#x}+{len:#x} {:.1} MB", *bytes as f64 / 1e6 / frames))
         .collect();
     tracing::info!("  snapshots per frame by copy: {}", snapshots.join(", "));
+    if texture_hash_timing() {
+        tracing::info!(
+            hash_ms = ms(c[C::TexHashUs as usize]),
+            detile_ms = ms(c[C::TexUntrackedDetileUs as usize]),
+            hashed_mb = mb(c[C::TexHashed as usize]),
+            changed_mb = mb(c[C::TexChanged as usize]),
+            "untracked texture refresh per frame"
+        );
+    }
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
