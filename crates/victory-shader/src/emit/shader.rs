@@ -75,6 +75,7 @@ pub(crate) struct Shader {
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
+    mesh_mask_scratch: Option<(V, u32)>,
     main: V,
     pub entry: usize,
 }
@@ -126,6 +127,7 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             lds: None,
+            mesh_mask_scratch: None,
             main,
             entry,
         }
@@ -141,6 +143,21 @@ impl Shader {
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
         g
+    }
+
+    /// Scratch is separate from the native LDS addressing domain.
+    pub fn mesh_mask_scratch(&mut self, threads: u32) -> Option<V> {
+        if let Some((scratch, _)) = self.mesh_mask_scratch {
+            return Some(scratch);
+        }
+        // D3D12 permits up to 28 KiB of groupshared memory in a mesh shader.
+        if self.lds_dwords.checked_add(threads)? > 28 * 1024 / 4 {
+            return None;
+        }
+        let array = self.m.array(threads, self.t.i32);
+        let scratch = self.m.global("mesh.mask", array, 3);
+        self.mesh_mask_scratch = Some((scratch, threads));
+        Some(scratch)
     }
 
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
@@ -598,7 +615,10 @@ impl Shader {
             inputs: &self.inputs,
             outputs: &self.outputs,
             prims: &self.prims,
-            mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            mesh: self.mesh.map(|m| {
+                let scratch = self.mesh_mask_scratch.map_or(0, |(_, dwords)| dwords);
+                (m, (self.lds_dwords + scratch) * 4)
+            }),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
