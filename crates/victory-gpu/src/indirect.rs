@@ -247,21 +247,29 @@ fn make() -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
+    let force_dxc = cfg!(test) && std::env::var_os("VICTORY_TEST_FORCE_INDIRECT_DXC").is_some();
+    let compiled = if force_dxc {
+        eprintln!("forcing the indirect clamp through DXC");
+        Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_FAIL,
+        ))
+    } else {
+        // SAFETY: the source and names live through the call; out pointers ours.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("clamp"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        }
     };
     // Wine's d3dcompiler_47 (vkd3d-shader) rejects RWByteAddressBuffer loads:
     // then DXC (dxcompiler.dll; see `dxc_library` for where it is looked for) compiles
@@ -542,7 +550,7 @@ mod tests {
         assert_eq!(byte_len(1, 24, 2), Some(44));
     }
 
-    /// The clamp compiles with the system's compiler and the host takes it.
+    /// The selected compiler makes a clamp the host can load.
     #[test]
     fn argument_clamp_builds() {
         use windows::Win32::Graphics::Dxgi::*;
