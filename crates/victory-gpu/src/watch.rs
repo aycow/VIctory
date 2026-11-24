@@ -131,6 +131,88 @@ fn private_from_basic(address: usize, start: usize) -> Option<bool> {
 /// and protection. Resolve this optionally so older Win32 providers still
 /// use the non-reset GetWriteWatch preflight.
 pub(crate) fn allocation(address: usize) -> Option<Allocation> {
+    // Inside a refresh pass, reservations already looked up in it: a world
+    // frame's refresh asks for hundreds of thousands of ranges'
+    // reservations, each a system call (two under Wine), and the title's
+    // allocations elsewhere change the revision so often that an answer is
+    // rarely still live for the next range. A mapping change removes the
+    // entries its range overlaps (`record_mapping_change`); an entry no
+    // change has touched is still live at the current revision. Entries
+    // last one pass only, so a change that is not reported can't outlive it.
+    if PASS.with(|depth| depth.get()) == 0 {
+        return query_allocation(address);
+    }
+    let revision = MAPPING_REVISION.load(Ordering::Acquire);
+    {
+        let cache = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, &found)) = cache.range(..=address).next_back()
+            && address < found.end
+        {
+            return Some(Allocation { revision, ..found });
+        }
+    }
+    let found = query_allocation(address)?;
+    let mut cache = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    // Not if the mapping changed while the system was asked.
+    if found.revision == MAPPING_REVISION.load(Ordering::Acquire) {
+        cache.insert(found.start, found);
+    }
+    Some(found)
+}
+
+thread_local! {
+    /// How many refresh passes this thread is inside.
+    static PASS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One refresh pass: while it lives, this thread's reservation lookups are
+/// answered from the reservations already looked up since it began.
+pub(crate) struct ReservationPass(());
+
+impl ReservationPass {
+    pub(crate) fn begin() -> Self {
+        if PASS.with(|depth| depth.replace(depth.get() + 1)) == 0 {
+            ALLOCATIONS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
+        ReservationPass(())
+    }
+}
+
+impl Drop for ReservationPass {
+    fn drop(&mut self) {
+        PASS.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
+/// Reservations looked up in the current pass, less those a mapping change
+/// has touched since.
+static ALLOCATIONS: Mutex<BTreeMap<usize, Allocation>> = Mutex::new(BTreeMap::new());
+
+/// Drops the looked-up reservations overlapping `[at, end)`.
+fn forget_allocations(at: usize, end: usize) {
+    let mut cache = ALLOCATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let stale: Vec<usize> = cache
+        .range(..end)
+        .rev()
+        .take_while(|(_, a)| a.end > at)
+        .map(|(&start, _)| start)
+        .collect();
+    for start in stale {
+        cache.remove(&start);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ALLOCATION_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn query_allocation(address: usize) -> Option<Allocation> {
+    #[cfg(test)]
+    ALLOCATION_QUERIES.with(|calls| calls.set(calls.get() + 1));
     use std::{ffi::c_void, sync::OnceLock};
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::{
@@ -584,6 +666,7 @@ fn forget_views(guards: &mut Guards, first: usize, last: usize) {
 }
 
 fn record_mapping_change(journal: &mut Journal, at: usize, end: usize) {
+    forget_allocations(at, end);
     MAPPING_REVISION.fetch_add(1, Ordering::Release);
     journal.asked += 1;
     Journal::record(
@@ -658,6 +741,59 @@ pub(crate) mod tests {
 
     /// A private reservation is reported private, a mapped view is not
     /// (Wine fills no region flags, so this checks the fallback there).
+    /// Within a refresh pass, a reservation is asked about once until a
+    /// mapping change over it.
+    #[test]
+    fn allocation_lookups_are_cached_within_a_pass_until_a_mapping_change() {
+        // SAFETY: a fresh reservation of ours.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let asked = || ALLOCATION_QUERIES.with(|calls| calls.get());
+        let outside = asked();
+        allocation(p);
+        allocation(p);
+        assert_eq!(asked(), outside + 2, "no cache outside a refresh pass");
+        let _pass = ReservationPass::begin();
+        let Some(first) = allocation(p) else {
+            return;
+        };
+        let before = asked();
+        assert_eq!(allocation(p + PAGE).map(|a| a.start), Some(first.start));
+        assert_eq!(asked(), before, "answered from the cache");
+        title_memory_allocation_changed(p, PAGE);
+        assert!(allocation(p).is_some());
+        assert_eq!(asked(), before + 1, "asked again after a mapping change");
+        // A change elsewhere leaves the entry, and it is still live.
+        // SAFETY: another fresh reservation of ours.
+        let q = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(q, 0);
+        title_memory_allocation_changed(q, PAGE);
+        let still = allocation(p).unwrap();
+        assert!(still.is_live(), "live at the new revision");
+        assert_eq!(asked(), before + 1, "a change elsewhere keeps the entry");
+        // Nothing survives the pass, reported or not.
+        drop(_pass);
+        let _next = ReservationPass::begin();
+        allocation(p);
+        assert_eq!(asked(), before + 2, "asked again in the next pass");
+        // Not freed: the journal keeps the changes, and a later test given
+        // the same addresses would see them.
+    }
+
     #[test]
     fn allocation_tells_private_memory_from_views() {
         use windows_sys::Win32::Foundation::CloseHandle;
