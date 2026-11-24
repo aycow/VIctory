@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HeapBufferSrvUsage, HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -131,7 +131,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -210,6 +210,17 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    match &s.heap_buffer_srvs {
+        HeapBufferSrvUsage::None => word(&mut out, 0),
+        HeapBufferSrvUsage::All => word(&mut out, 1),
+        HeapBufferSrvUsage::Exact(slots) => {
+            word(&mut out, 2);
+            word(&mut out, slots.len() as u32);
+            for &slot in slots {
+                word(&mut out, slot);
+            }
+        }
+    }
     out
 }
 
@@ -266,6 +277,22 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let heap_buffer_srvs = match r.word()? {
+        0 => HeapBufferSrvUsage::None,
+        1 => HeapBufferSrvUsage::All,
+        2 => {
+            let len = r.word()? as usize;
+            if len == 0 || len > r.0.len() / size_of::<u32>() {
+                return None;
+            }
+            let slots = (0..len).map(|_| r.word()).collect::<Option<Vec<_>>>()?;
+            if !slots.windows(2).all(|p| p[0] < p[1]) {
+                return None;
+            }
+            HeapBufferSrvUsage::Exact(slots)
+        }
+        _ => return None,
+    };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -274,6 +301,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        heap_buffer_srvs,
     })
 }
 
@@ -300,7 +328,23 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            heap_buffer_srvs: HeapBufferSrvUsage::Exact(vec![4, 19]),
         }
+    }
+
+    #[test]
+    fn heap_buffer_srv_usage_round_trips() {
+        let mut shader = shader();
+        for usage in [
+            HeapBufferSrvUsage::None,
+            HeapBufferSrvUsage::Exact(vec![0, 17, 99]),
+            HeapBufferSrvUsage::All,
+        ] {
+            shader.heap_buffer_srvs = usage;
+            assert_eq!(decode(&encode(&shader)), Some(shader.clone()));
+        }
+        shader.heap_buffer_srvs = HeapBufferSrvUsage::Exact(vec![4, 2]);
+        assert_eq!(decode(&encode(&shader)), None);
     }
 
     #[test]

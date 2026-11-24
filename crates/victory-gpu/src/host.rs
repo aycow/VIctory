@@ -11,6 +11,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use victory_shader::emit::HeapBufferSrvUsage;
 
 use crate::timeline::{Timeline, Touches};
 
@@ -197,7 +198,22 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            #[cfg(test)]
+            let adapter = if std::env::var_os("VICTORY_TEST_SRV_NVIDIA").is_some() {
+                let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+                Some(
+                    (0..)
+                        .map_while(|i| factory.EnumAdapters1(i).ok())
+                        .find(|a| a.GetDesc1().is_ok_and(|d| d.VendorId == 0x10de))
+                        .ok_or_else(windows::core::Error::empty)?
+                        .cast::<windows::core::IUnknown>()?,
+                )
+            } else {
+                None
+            };
+            #[cfg(not(test))]
+            let adapter: Option<windows::core::IUnknown> = None;
+            D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -266,6 +282,55 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_copies_preserve_islands_and_observe_remaps() {
+        use windows_sys::Win32::System::Memory::*;
+        const N: usize = 5 << 16;
+        // SAFETY: we reserve a private region, commit selected pages inside it,
+        // and only directly access the pages while they are writable.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let mut expected = vec![0; N];
+            for (offset, value) in [(0, 9), (2 << 16, 37), (N - 4096, 85)] {
+                let at = base.add(offset);
+                assert_eq!(
+                    VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE),
+                    at.cast()
+                );
+                at.write_bytes(value, 4096);
+                expected[offset..offset + 4096].fill(value);
+            }
+            for remap in [false, true] {
+                if remap {
+                    let mut old = 0;
+                    assert_ne!(
+                        VirtualProtect(base.cast(), 4096, PAGE_NOACCESS, &mut old),
+                        0
+                    );
+                    expected[..4096].fill(0);
+                    let at = base.add(1 << 16);
+                    assert_eq!(
+                        VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE),
+                        at.cast()
+                    );
+                    at.write_bytes(0xc7, 4096);
+                    expected[1 << 16..(1 << 16) + 4096].fill(0xc7);
+                }
+                let mut out = vec![0xee; N];
+                assert!(!super::copy_mapped(
+                    out.as_mut_ptr().add(27),
+                    base.add(27),
+                    N - 54,
+                    false
+                ));
+                assert_eq!(out[27..N - 27], expected[27..N - 27]);
+                assert!(out[..27].iter().chain(&out[N - 27..]).all(|&v| v == 0xee));
+            }
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -478,6 +543,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Bound view heaps and buffer SRV usage. Retain every heap because it
+    /// also owns backing for descriptor types outside the SRV refresh.
+    view_heaps: Vec<ViewHeapUse>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -576,6 +644,43 @@ thread_local! {
     /// Null if it could not be made: the fence wait then blocks by itself.
     // SAFETY: plain event creation.
     static EVENT: Event = Event(unsafe { CreateEventW(None, false, false, None) }.unwrap_or_default());
+}
+
+struct ViewHeapUse {
+    heap: std::sync::Arc<crate::descriptor::host::HostHeap>,
+    usage: HeapBufferSrvUsage,
+}
+
+impl ViewHeapUse {
+    fn include(
+        heaps: &mut Vec<Self>,
+        heap: &std::sync::Arc<crate::descriptor::host::HostHeap>,
+        usage: &HeapBufferSrvUsage,
+    ) {
+        use HeapBufferSrvUsage::{All, Exact, None};
+        let Some(known) = heaps
+            .iter_mut()
+            .find(|known| std::sync::Arc::ptr_eq(&known.heap, heap))
+        else {
+            heaps.push(Self {
+                heap: heap.clone(),
+                usage: usage.clone(),
+            });
+            return;
+        };
+        match (&mut known.usage, usage) {
+            (current, All) => *current = All,
+            (current @ None, Exact(_)) => *current = usage.clone(),
+            (Exact(merged), Exact(new)) => {
+                for &slot in new {
+                    if let Err(at) = merged.binary_search(&slot) {
+                        merged.insert(at, slot);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Host {
@@ -721,9 +826,25 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        let mut view_heaps = Vec::new();
+        for list in runs {
+            for usage in &list.deferred().view_heaps {
+                if !matches!(usage.usage, HeapBufferSrvUsage::None) {
+                    ViewHeapUse::include(&mut view_heaps, &usage.heap, &usage.usage);
+                }
+            }
+        }
+        // Mirrored native descriptors and their backing can be rematerialized
+        // during preparation. Keep the direct-SRV path synchronous until it
+        // gets immutable per-submission descriptor and upload versions.
+        let direct = !view_heaps.is_empty();
+        if direct {
+            self.drain();
+        }
         let mut batch = Batch {
             host: Some(self),
-            ..Batch::default()
+            sampled: (!view_heaps.is_empty()).then(SampledRanges::default),
+            ..Default::default()
         };
         for list in runs {
             list.run_deferred(&mut batch);
@@ -734,6 +855,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        let _direct_srvs = refresh_direct_srvs(&view_heaps, batch.sampled.as_ref());
         let (pending, touches) = Pending::of(runs);
         let prepared = std::time::Instant::now();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
@@ -795,6 +917,9 @@ impl Host {
             list.last.store(*submitted, Ordering::Release);
         }
         self.timeline.push(*submitted, touches, pending);
+        if direct {
+            self.settle(*submitted);
+        }
         #[cfg(feature = "diagnostics")]
         if groups.len() > 1 {
             self.settle(*submitted);
@@ -935,11 +1060,19 @@ impl Host {
         // it (the world's passes declare the same big ranges dozens of
         // times).
         let copying = std::time::Instant::now();
+        let mut copied_back = 0u64;
         for (shadow, address, len) in &p.back {
-            let written = shadow.copy_back(*address, *len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            copied_back += shadow.copy_back(*address, *len) as u64;
         }
-        COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let copyback_us = copying.elapsed().as_micros() as u64;
+        COPY_BACK[1].fetch_add(copied_back, Ordering::Relaxed);
+        COPY_BACK[0].fetch_add(copyback_us, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::CopyBackBytes, copied_back);
+            add(C::CopyBackUs, copyback_us);
+        }
         for &(at, what, bytes) in &p.writes {
             what.write(at as *mut u8, bytes);
         }
@@ -1545,6 +1678,14 @@ impl HostList {
         }
     }
 
+    pub(crate) fn use_view_heap(
+        &self,
+        heap: &std::sync::Arc<crate::descriptor::host::HostHeap>,
+        usage: &HeapBufferSrvUsage,
+    ) {
+        ViewHeapUse::include(&mut self.deferred().view_heaps, heap, usage);
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -1666,6 +1807,140 @@ impl HostList {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn test_submission_counters() -> (u64, u64) {
+    (
+        SUBMISSION_US[0].load(Ordering::Relaxed),
+        COPY_BACK[1].load(Ordering::Relaxed),
+    )
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+pub(crate) fn test_submission_copy_bytes() -> u64 {
+    PREPARING[1].load(Ordering::Relaxed)
+}
+
+/// Refresh live mirrored SRVs after deferred title writes and before
+/// GPU work. Retain the resources until the submission has finished.
+fn refresh_direct_srvs(
+    heaps: &[ViewHeapUse],
+    sampled: Option<&SampledRanges>,
+) -> Vec<std::sync::Arc<[crate::descriptor::host::SrvRange]>> {
+    use crate::descriptor::host::{SrvSelection, with_srv_ranges};
+    use std::sync::Arc;
+
+    let Some(sampled) = sampled else {
+        return Vec::new();
+    };
+    let started = std::time::Instant::now();
+    let selection: Vec<_> = heaps
+        .iter()
+        .map(|heap| {
+            let selection = match &heap.usage {
+                HeapBufferSrvUsage::Exact(slots) => SrvSelection::Exact(slots),
+                _ => SrvSelection::All,
+            };
+            (heap.heap.as_ref(), selection)
+        })
+        .collect();
+    let mut copied = 0usize;
+    #[cfg(feature = "diagnostics")]
+    use crate::copystat::{C, add};
+    #[cfg(feature = "diagnostics")]
+    add(C::DirectHeaps, selection.len() as u64);
+    let snapshots = with_srv_ranges(&selection, |snapshots| {
+        let mut current: Option<&Arc<crate::shadow::Shadow>> = None;
+        let mut uncovered = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let (mut requested, mut visits, mut remaining) = (0usize, 0u64, 0usize);
+        visit_direct_ranges(snapshots, |shadow, from, to| {
+            if let Some(previous) = current
+                && !Arc::ptr_eq(previous, shadow)
+            {
+                copied += previous.update_ranges(&uncovered);
+                uncovered.clear();
+            }
+            current = Some(shadow);
+            #[cfg(feature = "diagnostics")]
+            let first = uncovered.len();
+            sampled.uncovered(Arc::as_ptr(shadow) as usize, from, to, &mut uncovered);
+            #[cfg(feature = "diagnostics")]
+            {
+                visits += 1;
+                requested += to - from;
+                remaining += uncovered[first..]
+                    .iter()
+                    .map(|&(from, to)| to - from)
+                    .sum::<usize>();
+            }
+        });
+        if let Some(shadow) = current {
+            copied += shadow.update_ranges(&uncovered);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            add(C::DirectRanges, visits);
+            add(C::DirectRequested, requested as u64);
+            add(C::DirectOverlapBytes, (requested - remaining) as u64);
+        }
+    });
+    let elapsed = started.elapsed().as_micros() as u64;
+    #[cfg(feature = "diagnostics")]
+    {
+        add(C::DirectBytes, copied as u64);
+        add(C::DirectUs, elapsed);
+    }
+    PREPARING[0].fetch_add(elapsed, Ordering::Relaxed);
+    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    snapshots
+}
+
+/// Walk the union of already-sorted heap snapshots without cloning ranges
+/// or sorting the combined heap contents on every submission.
+fn visit_direct_ranges<'a>(
+    snapshots: &'a [std::sync::Arc<[crate::descriptor::host::SrvRange]>],
+    mut visit: impl FnMut(&'a std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+) {
+    use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
+
+    if let [only] = snapshots {
+        for range in only.iter() {
+            visit(&range.shadow, range.address, range.end);
+        }
+        return;
+    }
+
+    let key = |heap: usize, at: usize| {
+        snapshots[heap]
+            .get(at)
+            .map(|range| Reverse((Arc::as_ptr(&range.shadow) as usize, range.address, heap, at)))
+    };
+    let mut positions: BinaryHeap<_> = (0..snapshots.len())
+        .filter_map(|heap| key(heap, 0))
+        .collect();
+    let mut pending: Option<(&Arc<crate::shadow::Shadow>, usize, usize)> = None;
+    while let Some(Reverse((_, _, heap, at))) = positions.pop() {
+        let range = &snapshots[heap][at];
+        if let Some(next) = key(heap, at + 1) {
+            positions.push(next);
+        }
+        if let Some((shadow, _, end)) = &mut pending
+            && Arc::ptr_eq(shadow, &range.shadow)
+            && range.address <= *end
+        {
+            *end = (*end).max(range.end);
+            continue;
+        }
+        if let Some((shadow, from, to)) = pending.replace((&range.shadow, range.address, range.end))
+        {
+            visit(shadow, from, to);
+        }
+    }
+    if let Some((shadow, from, to)) = pending {
+        visit(shadow, from, to);
+    }
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -1677,10 +1952,55 @@ impl HostList {
 #[derive(Default)]
 struct Batch<'a> {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    sampled: Option<SampledRanges>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
     /// The host, whose earlier submissions may still be in flight.
     host: Option<&'a Host>,
+}
+
+/// Conventional reads prepared since the last deferred title-memory write.
+/// GPUs have yet to run, and their pending write exclusions only grow during
+/// preparation, so a direct read can reuse these already-sampled intervals.
+#[derive(Default)]
+struct SampledRanges(std::collections::HashMap<usize, Vec<(usize, usize)>>);
+
+impl SampledRanges {
+    fn add(&mut self, shadow: usize, from: usize, to: usize) {
+        let intervals = self.0.entry(shadow).or_default();
+        let first = intervals.partition_point(|&(_, end)| end < from);
+        let last = intervals.partition_point(|&(start, _)| start <= to);
+        let span = if first < last {
+            (from.min(intervals[first].0), to.max(intervals[last - 1].1))
+        } else {
+            (from, to)
+        };
+        intervals.splice(first..last, [span]);
+    }
+
+    fn uncovered(
+        &self,
+        shadow: usize,
+        mut from: usize,
+        to: usize,
+        output: &mut Vec<(usize, usize)>,
+    ) {
+        if let Some(intervals) = self.0.get(&shadow) {
+            let first = intervals.partition_point(|&(_, end)| end <= from);
+            for &(start, end) in &intervals[first..] {
+                if start >= to {
+                    break;
+                }
+                if from < start {
+                    output.push((from, start));
+                }
+                from = from.max(end);
+            }
+        }
+        if from < to {
+            output.push((from, to));
+        }
+    }
 }
 
 impl Batch<'_> {
@@ -1738,15 +2058,34 @@ impl Batch<'_> {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        if let Some(sampled) = &mut self.sampled {
+            sampled.0.clear();
+        }
     }
 
     fn flush(&mut self) {
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
+            if let Some(sampled) = &mut self.sampled {
+                sampled.add(std::sync::Arc::as_ptr(&shadow) as usize, from, to);
+            }
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
+            {
+                use crate::copystat::{C, add, range};
+                range(
+                    std::sync::Arc::as_ptr(&shadow) as usize,
+                    from,
+                    to - from,
+                    copied,
+                    us,
+                );
+                add(C::ConventionalRanges, 1);
+                add(C::ConventionalRequested, (to - from) as u64);
+                add(C::ConventionalBytes, copied as u64);
+                add(C::ConventionalUs, us);
+            }
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
@@ -1762,19 +2101,42 @@ impl Batch<'_> {
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
-pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+///
+/// Returns whether all bytes were copied from the source. Unreadable bytes
+/// are zero-filled as before, but those fills cannot establish validity.
+pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) -> bool {
+    try_copy_mapped(dst, src, len, title_dst).unwrap_or_else(|| {
+        if !title_dst && len >= 64 << 10 {
+            read_sparse(dst, src, len)
+        } else {
+            read_pieces(dst, src, len)
+        }
+    })
+}
+
+/// Attempts the bulk copy. None requests a sparse fallback. Some(false)
+/// means the copy was skipped.
+pub(crate) fn try_copy_mapped(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+) -> Option<bool> {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
             // SAFETY: timing only: the caller vouches for the source.
             unsafe { std::ptr::copy(src, dst, len) };
-            return;
+            return Some(true);
         }
-        2 => return,
+        2 => return Some(false),
         _ => {}
     }
-    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
-        return;
+    if len == 0 {
+        return Some(true);
+    }
+    if title_dst && !crate::texture::committed(dst, len) {
+        return Some(false);
     }
     if title_dst {
         // The kernel writes the destination: it must not be guarded.
@@ -1784,20 +2146,66 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+    crate::copystat::add(
+        crate::copystat::C::MoveUs,
+        moved.elapsed().as_micros() as u64,
+    );
     if whole {
-        return;
+        return Some(true);
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+    None
+}
+
+/// After a failed bulk read into host memory, skip contiguous holes. Never
+/// cache the query across copies: the title may remap the same address.
+fn read_sparse(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    let mut offset = 0;
+    let mut complete = true;
+    while offset < len {
+        let at = src.wrapping_add(offset);
+        let to = dst.wrapping_add(offset);
+        let remaining = len - offset;
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: the query inspects an address and fills this sized structure.
+        let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        let n = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .saturating_sub(at as usize)
+            .min(remaining);
+        if size != size_of_val(&info) || n == 0 {
+            return complete & read_pieces(to, at, remaining);
+        }
+        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
+            complete = false;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: this path is only used with a writable host destination.
+            unsafe { to.write_bytes(0, n) };
+        } else if !read(at, to, n) {
+            // A mapping may change between query and read.
+            complete &= read_pieces(to, at, n);
+        }
+        offset += n;
+    }
+    complete
+}
+
+pub(crate) fn read_pieces(dst: *mut u8, src: *const u8, len: usize) -> bool {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read.
+    let mut complete = true;
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
         if !read(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
                 if !read(at as *const u8, to, n) {
+                    complete = false;
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
                     // SAFETY: inside the destination, which is mapped.
@@ -1806,6 +2214,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
             });
         }
     });
+    complete
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1940,6 +2349,9 @@ struct Meter {
     frames: u32,
     drawn: u64,
     logged: std::time::Instant,
+    /// Frame denominator for diagnostics retained between log lines.
+    #[cfg(feature = "diagnostics")]
+    diagnostic_frames: u64,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -1952,6 +2364,8 @@ impl Meter {
             frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            #[cfg(feature = "diagnostics")]
+            diagnostic_frames: 0,
             caption: None,
         }
     }
@@ -1970,6 +2384,10 @@ impl Meter {
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.diagnostic_frames += u64::from(self.frames);
+        }
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
         // Of a frame, ms preparing submissions and ms waiting for the GPU.
         let [cpu, gpu] = [0, 1].map(|i| {
@@ -1999,7 +2417,7 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(frames);
+                crate::copystat::log(std::mem::take(&mut self.diagnostic_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -2451,9 +2869,39 @@ fn pump() {
 }
 
 #[cfg(test)]
-mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+mod batch {
+    // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
+    use super::{Batch, SampledRanges};
     use std::sync::Arc;
+
+    #[test]
+    fn direct_refresh_reuses_only_sampled_intervals_of_the_same_shadow() {
+        let mut sampled = SampledRanges::default();
+        sampled.add(1, 40, 60);
+        sampled.add(1, 20, 30);
+        sampled.add(1, 55, 70);
+        sampled.add(2, 10, 80);
+        let mut gaps = Vec::new();
+        sampled.uncovered(1, 10, 80, &mut gaps);
+        assert_eq!(gaps, [(10, 20), (30, 40), (70, 80)]);
+    }
+
+    #[test]
+    fn deferred_title_write_discards_sampled_intervals() {
+        let mut batch = Batch {
+            sampled: Some(SampledRanges::default()),
+            ..Default::default()
+        };
+        batch.sampled.as_mut().unwrap().add(1, 10, 20);
+        batch.title_written();
+        let mut gaps = Vec::new();
+        batch
+            .sampled
+            .as_ref()
+            .unwrap()
+            .uncovered(1, 10, 20, &mut gaps);
+        assert_eq!(gaps, [(10, 20)]);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
@@ -2595,3 +3043,6 @@ mod submissions {
         first.reset();
     }
 }
+#[cfg(test)]
+#[path = "host/tests/shader_usage.rs"]
+mod shader_usage_tests;

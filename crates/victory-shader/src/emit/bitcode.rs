@@ -5,7 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -264,6 +264,114 @@ impl Module {
         let t = self.int(32);
         self.int_const(t, i64::from(v as i32))
     }
+    /// A small conservative set of possible i32 values, or unknown.
+    /// Unsupported operations, cycles, and large sets need no proof.
+    pub fn finite_i32_values(&self, values: &[V], limit: usize) -> Option<Vec<u32>> {
+        let mut output = BTreeSet::new();
+        let mut budget = 4096usize;
+        for &value in values {
+            output.extend(self.finite_i32(value, limit, 32, &mut budget)?);
+            if output.len() > limit {
+                return None;
+            }
+        }
+        Some(output.into_iter().collect())
+    }
+
+    fn i32_const(&self, value: V) -> Option<u32> {
+        let V::Const(id) = value else { return None };
+        let (ty, Const::Int(i)) = self.consts.get(id as usize)? else {
+            return None;
+        };
+        (self.types[ty.0 as usize] == TypeDef::Int(32)).then_some(*i as u32)
+    }
+
+    fn finite_i32(
+        &self,
+        value: V,
+        limit: usize,
+        depth: u32,
+        budget: &mut usize,
+    ) -> Option<BTreeSet<u32>> {
+        let depth = depth.checked_sub(1)?;
+        *budget = budget.checked_sub(1)?;
+        if let Some(value) = self.i32_const(value) {
+            return Some(BTreeSet::from([value]));
+        }
+        let V::Inst(id) = value else { return None };
+        let inst = self.insts.get(id as usize)?;
+        if self.types[inst.ty.0 as usize] != TypeDef::Int(32) {
+            return None;
+        }
+        let mut output = BTreeSet::new();
+        match &inst.op {
+            Op::Bin(op, a, b) => {
+                let left = self.finite_i32(*a, limit, depth, budget);
+                let right = self.finite_i32(*b, limit, depth, budget);
+                if let (Some(left), Some(right)) = (left, right) {
+                    for a in left {
+                        for &b in &right {
+                            output.insert(match op {
+                                Bin::Add => a.wrapping_add(b),
+                                Bin::Sub => a.wrapping_sub(b),
+                                Bin::Mul => a.wrapping_mul(b),
+                                Bin::UDiv => a.checked_div(b)?,
+                                Bin::SDiv => (a as i32).checked_div(b as i32)? as u32,
+                                Bin::URem => a.checked_rem(b)?,
+                                Bin::Shl => a.checked_shl(b)?,
+                                Bin::LShr => a.checked_shr(b)?,
+                                Bin::AShr => (a as i32).checked_shr(b)? as u32,
+                                Bin::And => a & b,
+                                Bin::Or => a | b,
+                                Bin::Xor => a ^ b,
+                            });
+                            if output.len() > limit {
+                                return None;
+                            }
+                        }
+                    }
+                } else if *op == Bin::And {
+                    let mask = self.i32_const(*a).or_else(|| self.i32_const(*b))?;
+                    if 1usize.checked_shl(mask.count_ones())? > limit {
+                        return None;
+                    }
+                    // Every submask is a possible result even if the
+                    // other operand could not be analyzed.
+                    let mut part = mask;
+                    loop {
+                        output.insert(part);
+                        if part == 0 {
+                            break;
+                        }
+                        part = (part - 1) & mask;
+                    }
+                } else if *op == Bin::URem {
+                    let divisor = self.i32_const(*b)?;
+                    if divisor == 0 || divisor as usize > limit {
+                        return None;
+                    }
+                    output.extend(0..divisor);
+                } else {
+                    return None;
+                }
+            }
+            Op::Select(_, a, b) => {
+                output = self.finite_i32(*a, limit, depth, budget)?;
+                output.extend(self.finite_i32(*b, limit, depth, budget)?);
+            }
+            Op::Phi(incoming) => {
+                for &(v, _) in incoming {
+                    output.extend(self.finite_i32(v, limit, depth, budget)?);
+                    if output.len() > limit {
+                        return None;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        (!output.is_empty() && output.len() <= limit).then_some(output)
+    }
+
     pub fn i8(&mut self, v: u8) -> V {
         let t = self.int(8);
         self.int_const(t, i64::from(v as i8))

@@ -2,6 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
+use super::HeapBufferSrvUsage;
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
@@ -64,6 +65,7 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    heap_buffer_srv_indices: Vec<V>,
     pub flags: u64,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
@@ -117,6 +119,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            heap_buffer_srv_indices: Vec::new(),
             flags: 0,
             threads: None,
             wave_size: None,
@@ -279,6 +282,13 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
+        // DXIL ResourceProperties uses the low byte for ResourceKind
+        // (typed, raw, structured buffer are 10, 11, 12) and bit 12 for UAV.
+        const KIND: u32 = 0xff;
+        const IS_UAV: u32 = 1 << 12;
+        if !sampler && props.0 & IS_UAV == 0 && matches!(props.0 & KIND, 10..=12) {
+            self.heap_buffer_srv_indices.push(index);
+        }
         let (s, n) = (self.m.bool(sampler), self.m.bool(false));
         let h = self.op(
             block,
@@ -289,6 +299,18 @@ impl Shader {
             &[index, s, n],
         );
         self.annotate(block, h, props.0, props.1)
+    }
+
+    /// The heap slots read by the emitted buffer SRV handles. Run after
+    /// the module's phis have been filled so every incoming edge counts.
+    pub fn heap_buffer_srv_usage(&self) -> HeapBufferSrvUsage {
+        if self.heap_buffer_srv_indices.is_empty() {
+            return HeapBufferSrvUsage::None;
+        }
+        const SLOT_LIMIT: usize = 64;
+        self.m
+            .finite_i32_values(&self.heap_buffer_srv_indices, SLOT_LIMIT)
+            .map_or(HeapBufferSrvUsage::All, HeapBufferSrvUsage::Exact)
     }
 
     /// The finished container.
@@ -641,5 +663,76 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emit::bitcode::Bin;
+
+    #[test]
+    fn heap_buffer_srv_usage_excludes_unrelated_handles() {
+        let mut s = Shader::new(false);
+        let index = s.m.undef(s.t.i32);
+        s.heap_handle(s.entry, index, true, (14, 0));
+        s.heap_handle(s.entry, index, false, (2, 0));
+        s.heap_handle(s.entry, index, false, (13, 0));
+        s.heap_handle(s.entry, index, false, (0x100b, 0));
+        s.root_srv_handle(0);
+        assert_eq!(s.heap_buffer_srv_usage(), HeapBufferSrvUsage::None);
+    }
+
+    #[test]
+    fn heap_buffer_srv_usage_proves_wrapping_offset_and_shift() {
+        let mut s = Shader::new(false);
+        let part = s.m.i32(u32::MAX);
+        let offset = s.m.i32(545);
+        let bytes = s.m.bin(s.entry, Bin::Add, part, offset);
+        let shift = s.m.i32(5);
+        let slot = s.m.bin(s.entry, Bin::LShr, bytes, shift);
+        s.heap_handle(s.entry, slot, false, (11, 0));
+        assert_eq!(
+            s.heap_buffer_srv_usage(),
+            HeapBufferSrvUsage::Exact(vec![17])
+        );
+    }
+
+    #[test]
+    fn heap_buffer_srv_usage_unions_bounded_and_branch_selected_slots() {
+        let mut s = Shader::new(false);
+        let unknown = s.m.undef(s.t.i32);
+        let mask = s.m.i32(3);
+        let low = s.m.bin(s.entry, Bin::And, unknown, mask);
+        let base = s.m.i32(30);
+        let bounded = s.m.bin(s.entry, Bin::Add, low, base);
+        let other = s.m.i32(47);
+        let choose = s.m.new_block();
+        let join = s.m.new_block();
+        let phi = s.m.phi(join, s.t.i32);
+        s.heap_handle(join, phi, false, (12, 32));
+        s.m.set_phi(phi, vec![(bounded, s.entry), (other, choose)]);
+        s.heap_handle(s.entry, base, false, (10, 0));
+        assert_eq!(
+            s.heap_buffer_srv_usage(),
+            HeapBufferSrvUsage::Exact(vec![30, 31, 32, 33, 47])
+        );
+    }
+
+    #[test]
+    fn heap_buffer_srv_usage_falls_back_for_unbounded_values() {
+        let mut s = Shader::new(false);
+        let unknown = s.m.undef(s.t.i32);
+        let mask = s.m.i32(127);
+        let broad = s.m.bin(s.entry, Bin::And, unknown, mask);
+        s.heap_handle(s.entry, broad, false, (11, 0));
+        assert_eq!(s.heap_buffer_srv_usage(), HeapBufferSrvUsage::All);
+
+        let mut s = Shader::new(false);
+        let unknown = s.m.undef(s.t.i32);
+        let fixed = s.m.i32(7);
+        s.heap_handle(s.entry, fixed, false, (11, 0));
+        s.heap_handle(s.entry, unknown, false, (11, 0));
+        assert_eq!(s.heap_buffer_srv_usage(), HeapBufferSrvUsage::All);
     }
 }

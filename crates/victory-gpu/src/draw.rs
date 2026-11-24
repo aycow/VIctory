@@ -403,22 +403,41 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let l = &list.list;
+        let pipeline_changed = self.host_pipeline != p.pso.as_raw() as usize;
+        let heaps = self.heaps.map(|title| {
+            (title != 0)
+                .then(|| crate::descriptor::heap(title as This).host())
+                .flatten()
+        });
+        // A new title heap can reuse the address of a released one. The
+        // list keeps the old native heap alive, so its identity stays distinct.
+        let heap_ids = heaps.map(|heap| heap.map_or(0, |heap| heap.heap.as_raw() as usize));
+        let heaps_changed = self.host_heaps != heap_ids;
+        if (pipeline_changed || heaps_changed)
+            && let Some(heap) = heaps[0]
+        {
+            if p.stages.is_empty() {
+                // Native test pipelines have no translated usage metadata.
+                list.use_view_heap(heap, &victory_shader::emit::HeapBufferSrvUsage::All);
+            }
+            for stage in &p.stages {
+                list.use_view_heap(heap, &stage.translated().host.heap_buffer_srvs);
+            }
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
+        if heaps_changed {
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = heaps
+                .into_iter()
+                .flatten()
+                .map(|heap| Some(heap.heap.clone()))
                 .collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = heap_ids;
             self.host_roots = [0; 2];
         }
         let root = p.root.as_raw() as usize;
@@ -435,7 +454,7 @@ impl State {
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        if pipeline_changed {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;

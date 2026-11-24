@@ -62,6 +62,15 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+The host SRV binding tests on Windows 10 may need the app-local
+[DirectX Agility SDK](https://devblogs.microsoft.com/directx/directx12agility/).
+Copy the x64 `D3D12Core.dll` and `d3d12SDKLayers.dll` from Microsoft.Direct3D.D3D12
+1.620.2 into `target/debug/D3D12/` (or the equivalent Cargo target/profile
+directory). Cargo detects them on the first build of `victory-gpu`. If the
+crate has already been built, set `$env:VICTORY_TEST_AGILITY = '1'` before
+running `cargo test -p victory-gpu --features diagnostics shader_usage_tests`.
+Set `$env:VICTORY_TEST_AGILITY = '0'` to use the inbox runtime.
+
 Run the title:
 
 ```powershell

@@ -135,6 +135,17 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Which CBV/SRV/UAV heap slots can be read through buffer SRV handles.
+/// Descriptor-table ranges also use heap handles on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeapBufferSrvUsage {
+    None,
+    /// A sorted, deduplicated conservative set of absolute heap slots.
+    Exact(Vec<u32>),
+    /// There is no sufficiently small proven slot set.
+    All,
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -154,6 +165,7 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    pub heap_buffer_srvs: HeapBufferSrvUsage,
 }
 
 impl HostShader {
@@ -296,6 +308,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        heap_buffer_srvs: l.heap_buffer_srvs,
     })
 }
 
@@ -490,6 +503,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            heap_buffer_srvs: super::HeapBufferSrvUsage::None,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -500,6 +514,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                heap_buffer_srvs: super::HeapBufferSrvUsage::All,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
