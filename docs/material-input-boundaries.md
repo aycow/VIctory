@@ -12,6 +12,10 @@ The table shows the consumer readback across AMD Radeon Graphics, NVIDIA RTX 507
 
 The scratch routes both prepare their fill before the native producer runs in this case. The aligned root route addresses the producer's live native shadow, so normal resource ordering lets it see 29. The test uses two closed lists for the same-submission case. A dependency within one native list has a different recording boundary.
 
+The same fixture produced the same matrix on #387 `709647f` with all three adapters. At that revision, `Host::execute` invokes its title-byte dependency checker only for submissions containing buffer-copy continuations. The fixture's ordinary two-list submission has no continuations.
+
+The candidate `0899b7d` invokes the existing checker when recorded GPU writes can feed a later list's title bytes. Both staged routes then returned 29 in the ordinary two-list case on all three adapters. The permanent #387 regression measures two native queue calls when the ranges overlap and one when they are unrelated. This fixture models one cause of incorrect input values. The title capture has yet to identify the source of the red colour operand.
+
 ## Reproduce
 
 Use Windows, Agility SDK 1.620.x, and one fresh process for each adapter. Run with these environment variables in PowerShell.
