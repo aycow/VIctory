@@ -50,19 +50,18 @@ pub(crate) struct Staging {
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
     tracked: Option<crate::watch::Tracked>,
-    last: Mutex<Last>,
+    last_hash: Mutex<Option<blake3::Hash>>,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not tracked), with room to read tracked memory into.
-#[derive(Default)]
-struct Last {
-    hash: Option<blake3::Hash>,
-    read: Vec<u8>,
-}
+/// Tracked inputs are needed only until detiling completes. The upload
+/// buffer read by the GPU remains local to each texture.
+static READ_SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+mod read_scratch_tests;
 
 // SAFETY: the staging mapping is written only at submission, under
-// `last`'s lock; the title memory is only read.
+// `last_hash`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
@@ -301,17 +300,24 @@ impl Staging {
     fn refresh_now(&self) -> (usize, bool) {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
-        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        let last = &mut *last;
+        let mut last_hash = self.last_hash.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = &self.tracked {
             if t.take(start, start + size).is_empty() {
                 return (0, false);
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            let mut scratch = READ_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+            if scratch.len() < size {
+                scratch.resize(size, 0);
+            }
+            let tiled = &mut scratch[..size];
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::mode() == 2 {
+                tiled.fill(0);
+            }
+            crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+            self.detile(tiled);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
@@ -331,10 +337,10 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if *last_hash == Some(hash) {
             return (size, false);
         }
-        last.hash = Some(hash);
+        *last_hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -455,7 +461,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         mips: u32::from(d.MipLevels),
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
-        last: Mutex::default(),
+        last_hash: Mutex::default(),
     });
     *held = Some(s.clone());
     Some(s)
