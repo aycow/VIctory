@@ -1279,30 +1279,40 @@ fn wave64_scan_drives_divergent_scatter() {
         return;
     }
     let validation: ID3D12InfoQueue = host.device.cast().expect("D3D12 debug layer");
-    let mut shader = emit_for(&p, target).unwrap();
-    super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
-        .expect("DXIL validator")
-        .validate(&mut shader.dxil)
-        .unwrap();
-    let (root, pso) = host.compute_pipeline(&shader).unwrap();
-    let data = vec![0; (shader.user_data_dwords() as usize).max(1)];
-    let views = [View::RawUav(GROUP_WORDS * 2)];
-    let out = host
-        .dispatch(
-            &root,
-            &pso,
-            &Dispatch {
-                roots: vec![(0, Root::Constants(data))],
-                views: &views,
-                samplers: &[],
-                groups: [2, 1, 1],
-            },
-        )
-        .unwrap();
     let mut expect: Vec<u32> = (0..64)
         .flat_map(|lane| std::iter::repeat_n(lane + 1, (lane as usize & 3) + 1))
         .collect();
     expect.resize(GROUP_WORDS as usize, 0);
+    let mut targets = vec![target];
+    if target.runs(32) && target.runs(64) {
+        targets.push(super::Target { lanes_min: 32, lanes_max: 32 });
+    }
+    for selected in targets {
+        let mut shader = emit_for(&p, selected).unwrap();
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+            .expect("DXIL validator")
+            .validate(&mut shader.dxil)
+            .unwrap();
+        let lanes = if selected.runs(64) { 64 } else { 32 };
+        assert_eq!(wave_size(&shader.dxil), Some(lanes));
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let data = vec![0; (shader.user_data_dwords() as usize).max(1)];
+        let views = [View::RawUav(GROUP_WORDS * 2)];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(data))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [2, 1, 1],
+                },
+            )
+            .unwrap();
+        assert_eq!(out, [expect.repeat(2)], "{name}: {selected:?}");
+        eprintln!("{name}: Wave{lanes}, 2 groups match the reference");
+    }
     // SAFETY: read-only query of the debug layer's message queue.
     let messages = unsafe { validation.GetNumStoredMessages() };
     for index in 0..messages {
@@ -1322,10 +1332,7 @@ fn wave64_scan_drives_divergent_scatter() {
             );
         }
     }
-    assert_eq!(out, [expect.repeat(2)], "{name}: {target:?}");
-    eprintln!("{name}: {target:?}, 2 groups match the reference");
 }
-
 
 fn scatter_test_device(which: &str) -> Host {
     use windows::Win32::Graphics::Direct3D12::*;
