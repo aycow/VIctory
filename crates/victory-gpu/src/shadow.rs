@@ -526,6 +526,41 @@ mod copy_back_tests {
         unsafe { (at as *const u8).read_volatile() }
     }
 
+    #[test]
+    #[ignore = "native Windows CPU copyback comparison"]
+    fn copyback_dense_sparse_and_fragmented() {
+        let bytes = PAGES * PAGE;
+        for (pattern, stride) in [("dense", 1), ("sparse", PAGE), ("fragmented", 32)] {
+            let mut times = Vec::new();
+            for run in 0..7 {
+                let title = Title::new();
+                let shadow = submitted(title.0).expect("D3D12 host");
+                for i in (0..bytes).step_by(stride) {
+                    // SAFETY: the test owns the mapped bytes and models completed GPU writes.
+                    unsafe { shadow.data.add(i).write(1) };
+                }
+                let began = std::time::Instant::now();
+                shadow.copy_back(title.0, bytes);
+                let elapsed = began.elapsed();
+                if run > 1 {
+                    times.push(elapsed);
+                }
+                for i in (0..bytes).step_by(stride) {
+                    assert_eq!(peek(title.0 + i), 1);
+                }
+                if stride > 1 {
+                    assert!((0..PAGES).all(|page| peek(title.0 + page * PAGE + 1) == 0));
+                }
+            }
+            times.sort_unstable();
+            eprintln!(
+                "{pattern}: {} changed bytes in {bytes}, median {:?}",
+                bytes.div_ceil(stride),
+                times[2]
+            );
+        }
+    }
+
     /// The title's threads keep writing words no shader writes, in every
     /// page shaders wrote, while the copy-back runs: none goes back to an
     /// older value.
