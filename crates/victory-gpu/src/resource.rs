@@ -761,6 +761,7 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    pub(crate) host_written: std::sync::atomic::AtomicBool,
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -941,6 +942,7 @@ fn hand_out_resource(
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
+                host_written: false.into(),
             })
         }),
     });

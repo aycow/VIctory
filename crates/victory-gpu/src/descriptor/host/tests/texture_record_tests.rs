@@ -284,7 +284,7 @@ fn unsubmitted_first_recording_does_not_consume_a_bindless_texture_upload() {
 
 #[test]
 #[ignore = "requires DXC, Agility SDK 1.620.x and a selected adapter"]
-fn a_recorded_bindless_upload_can_overwrite_a_later_submitted_gpu_producer() {
+fn a_bound_bindless_upload_preserves_an_earlier_submitted_gpu_producer() {
     let (device, name) = device();
     let info = device.cast::<ID3D12InfoQueue>().unwrap();
     let host = install_bindless_test_device(device);
@@ -322,7 +322,7 @@ fn a_recorded_bindless_upload_can_overwrite_a_later_submitted_gpu_producer() {
             crate::list::ensure_state(&producer, target, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
             // SAFETY: equal-format, distinct textures in native copy states.
             unsafe { producer.list.CopyResource(target_host, source_host) };
-            crate::texture::host_written(target);
+            crate::texture::defer_host_write(&producer, target);
             crate::list::ensure_state(&producer, target, READ_STATE);
             producer.close();
             host.execute(&[&producer]);
@@ -331,11 +331,10 @@ fn a_recorded_bindless_upload_can_overwrite_a_later_submitted_gpu_producer() {
             host.execute(&[&consumer]);
             // SAFETY: the synchronous submission completed the single result word.
             let observed = unsafe { mapped.cast::<u32>().read() };
-            let expected = if early { INPUT_NEW } else { INPUT_GPU };
             eprintln!(
                 "{name} placed={placed} upload_recorded_before_producer={early}: {observed:#x}"
             );
-            assert_eq!(observed, expected);
+            assert_eq!(observed, INPUT_GPU);
             for resource in [source, title_heap] {
                 slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
             }
