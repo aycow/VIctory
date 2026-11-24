@@ -996,11 +996,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             for buffer in 0..CONVENTIONAL {
                 for local in [0, 3, 64, 127] {
                     let index = slot(buffer, local);
-                    let view = native.mirror(index, heap.handle(index), true).unwrap();
+                    let (view, copy) = native.mirror(index, heap.handle(index), true).unwrap();
                     let (address, len) = crate::descriptor::host::buffer_range(&view).unwrap();
-                    crate::shadow::find(address, len)
-                        .unwrap()
-                        .refresh(&list, address, len);
+                    copy.unwrap().refresh(&list, address, len);
                 }
             }
             if !control {

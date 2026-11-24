@@ -26,16 +26,13 @@ pub(crate) struct HostHeap {
     dynamic: u32,
     sampler: bool,
     slots: Mutex<Slots>,
-    /// The host resource each slot views, held while the slot does: shaders
-    /// index heaps directly, so a slot the title has not rewritten since it
-    /// released the resource may still be read, and a freed host resource
-    /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// The copy of just its view's bytes each slot reads instead of its
-    /// buffer's copy, held while the slot does (the map only finds it):
-    /// dropping it would leave the descriptor reading a copy nothing
-    /// refreshes. `None` for a slot that reads its buffer's copy.
-    kept_copy: Mutex<Vec<Option<std::sync::Arc<crate::shadow::Shadow>>>>,
+    /// What each slot views, held while the slot does: shaders index heaps
+    /// directly, so a slot the title has not rewritten since it released the
+    /// resource may still be read, and a freed host resource read there is
+    /// a GPU page fault (the console reads stale memory). A buffer slot's
+    /// copy is also the one its draws bring up to date and copy back
+    /// ([`HostHeap::copy_at`]).
+    kept: Mutex<Vec<Kept>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -176,8 +173,7 @@ impl HostHeap {
                 srv_ranges: None,
                 shadow_retirements: crate::shadow::retirement_revision(),
             }),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
-            kept_copy: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: Mutex::new(vec![Kept::Nothing; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -311,17 +307,28 @@ impl HostHeap {
         }
     }
 
-    /// Makes slot `index` (a dynamic one) from `view`; a null view if the
-    /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
-        match make(view, self.cpu(index)) {
-            Some(Kept::Nothing) => self.keep(index, None, None),
-            Some(Kept::Resource { resource, copy }) => self.keep(index, Some(resource), copy),
-            None => {
-                null_for(view, self.cpu(index));
-                self.keep(index, None, None);
-            }
-        }
+    /// Makes slot `index` (a dynamic one) from `view`, a null view if the
+    /// host cannot, and returns the copy of title buffer memory it views.
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> Option<Arc<Shadow>> {
+        let kept = make(view, self.cpu(index)).unwrap_or_else(|| {
+            null_for(view, self.cpu(index));
+            Kept::Nothing
+        });
+        let copy = kept.copy();
+        self.keep(index, kept);
+        copy
+    }
+
+    /// The copy of title buffer memory slot `index` views, if any: the one
+    /// to bring up to date for it and to copy its writes back from. Looking
+    /// a copy up again from the view's range can find another, overlapping
+    /// title buffer's, or the buffer's copy where the view has its own.
+    pub(crate) fn copy_at(&self, index: u32) -> Option<Arc<Shadow>> {
+        self.kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)?
+            .copy()
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -331,32 +338,21 @@ impl HostHeap {
         } else {
             null_view(self.cpu(index));
         }
-        self.keep(index, None, None);
+        self.keep(index, Kept::Nothing);
     }
 
-    /// Slot `index` now views `resource` (or nothing of the host's) and, if
-    /// it reads a copy of just its view's bytes, keeps `copy` alive.
-    fn keep(
-        &self,
-        index: u32,
-        resource: Option<ID3D12Resource>,
-        copy: Option<std::sync::Arc<crate::shadow::Shadow>>,
-    ) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            *slot = resource;
-        }
-        drop(kept);
-        let mut held = self.kept_copy.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = held.get_mut(index as usize) {
-            *slot = copy;
+    /// Slot `index` now views `kept`.
+    fn keep(&self, index: u32, kept: Kept) {
+        let mut slots = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = slots.get_mut(index as usize) {
+            *slot = kept;
         }
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, None, None);
+        self.keep(index, Kept::Nothing);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -376,10 +372,16 @@ impl HostHeap {
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
-    /// if it changed since, and returns the view recorded there. Buffer
-    /// views are made only for draws (`for_draw`), which also copy their
-    /// data: a host copy of a buffer is made on first use.
-    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+    /// if it changed since, and returns the view recorded there and, for
+    /// draws, the copy of title buffer memory the slot views. Buffer views
+    /// are made only for draws (`for_draw`), which also copy their data: a
+    /// host copy of a buffer is made on first use.
+    pub(crate) fn mirror(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+    ) -> Option<(View, Option<Arc<Shadow>>)> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -420,7 +422,7 @@ impl HostHeap {
                         pending_srvs.insert(index);
                         made[index as usize] = 0;
                         null_for(view, self.cpu(index));
-                        self.keep(index, None, None);
+                        self.keep(index, Kept::Nothing);
                     }
                     if for_draw
                         && range.as_ref().is_none_or(|r| r.shadow.superseded())
@@ -453,13 +455,14 @@ impl HostHeap {
             return None;
         };
         if is_direct_srv {
-            return Some(view);
+            let copy = if for_draw { self.copy_at(index) } else { None };
+            return Some((view, copy));
         }
         if direct.remove(&index).is_some() {
             pending_srvs.remove(&index);
             *srv_ranges = None;
         }
-        if made[index as usize] != key {
+        let copy = if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -467,18 +470,21 @@ impl HostHeap {
             } else {
                 make(&view, self.cpu(index))
             };
-            match kept {
-                Some(Kept::Nothing) => self.keep(index, None, None),
-                Some(Kept::Resource { resource, copy }) => self.keep(index, Some(resource), copy),
-                None => {
-                    if !self.sampler {
-                        null_for(&view, self.cpu(index));
-                    }
-                    self.keep(index, None, None);
+            let kept = kept.unwrap_or_else(|| {
+                if !self.sampler {
+                    null_for(&view, self.cpu(index));
                 }
-            }
-        }
-        Some(view)
+                Kept::Nothing
+            });
+            let copy = kept.copy();
+            self.keep(index, kept);
+            copy
+        } else if for_draw {
+            self.copy_at(index)
+        } else {
+            None
+        };
+        Some((view, copy))
     }
 
     /// Creates or replaces a native buffer SRV, keeping the previous buffer
@@ -495,6 +501,12 @@ impl HostHeap {
             null_buffer_view(self.cpu(index));
         }
         let changed = range.is_some() || replacement.is_some();
+        if changed {
+            let kept = replacement
+                .as_ref()
+                .map_or(Kept::Nothing, |range| Kept::Copy(range.shadow.clone()));
+            self.keep(index, kept);
+        }
         *range = replacement;
         changed
     }
@@ -651,7 +663,7 @@ impl HostHeap {
         let view = super::view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
         if let Some((address, len)) = buffer_range(&view) {
-            let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
+            let host = self.copy_at(index).map(|s| s.gpu(address));
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
         }
         Some(text)
@@ -768,28 +780,26 @@ fn unordered_extent(address: u64, desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> (u
     )
 }
 
-/// Whether [`make`] gave this buffer view a copy of just its bytes, because it
-/// starts off an element of its buffer's copy: the copy `readable` brings up
-/// to date for it, and the one its writes go back from.
-pub(crate) fn off_element(view: &View) -> bool {
-    let Some((address, len, unordered, words)) = buffer_parts(view) else {
-        return false;
-    };
-    let (from, bytes, element) = extent(address, unordered, words);
-    crate::shadow::find(address, len)
-        .is_some_and(|buffer| matches!(plan(bytes, element, buffer.offset(from)), Copy::OwnBytes))
+/// What a slot made by [`make`] views, kept while the slot is.
+#[derive(Clone)]
+pub(crate) enum Kept {
+    /// Nothing of the host's (a sampler, a null view, a list's memory).
+    Nothing,
+    /// A host resource: a texture, or the copy a constant buffer view is of.
+    Resource { _resource: ID3D12Resource },
+    /// A copy of title buffer memory a shader or unordered access view is
+    /// of: its buffer's copy, or a copy of just the view's bytes.
+    Copy(Arc<Shadow>),
 }
 
-/// What a slot made by [`make`] views keeps alive.
-pub(crate) enum Kept {
-    /// Made, and keeps nothing alive (a sampler slot).
-    Nothing,
-    /// Made, viewing `resource`; `copy` is the copy of just the view's bytes
-    /// it reads instead of its buffer's copy, if it made one.
-    Resource {
-        resource: ID3D12Resource,
-        copy: Option<std::sync::Arc<crate::shadow::Shadow>>,
-    },
+impl Kept {
+    /// The copy of title buffer memory, for a buffer view.
+    fn copy(&self) -> Option<Arc<Shadow>> {
+        match self {
+            Kept::Copy(copy) => Some(copy.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// The title memory a buffer shader view reads, from where its descriptor puts
@@ -819,7 +829,7 @@ fn view_copy(
     address: u64,
     len: u64,
     (from, bytes, element): (u64, u64, u64),
-) -> Result<(std::sync::Arc<crate::shadow::Shadow>, u64, bool), &'static str> {
+) -> Result<(Arc<Shadow>, u64, bool), &'static str> {
     // The view's own range is also the key `aligned` caches its copy by (the
     // one `buffer_range` gives `readable`).
     let buffer = crate::shadow::find(address, len).ok_or("no host copy of its buffer")?;
@@ -1091,10 +1101,7 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    Some(Kept::Resource {
-        resource: shadow.buffer.clone(),
-        copy: own.then(|| shadow.clone()),
-    })
+    Some(Kept::Copy(shadow))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -1154,12 +1161,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     if let Some(parts) = buffer_srv_parts(view) {
-        return buffer_srv(parts, at, matches!(view, View::Placed(..))).map(|range| {
-            Kept::Resource {
-                resource: range.shadow.buffer.clone(),
-                copy: Some(range.shadow),
-            }
-        });
+        return buffer_srv(parts, at, matches!(view, View::Placed(..)))
+            .map(|range| Kept::Copy(range.shadow));
     }
     let host = host()?;
     let device = &host.device;
@@ -1181,8 +1184,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
             Some(Kept::Resource {
-                resource: shadow.buffer.clone(),
-                copy: None,
+                _resource: shadow.buffer.clone(),
             })
         }
         View::Shader(resource, desc) => {
@@ -1201,8 +1203,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     )
                 };
                 Some(Kept::Resource {
-                    resource: texture.clone(),
-                    copy: None,
+                    _resource: texture.clone(),
                 })
             } else {
                 None
@@ -1232,8 +1233,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 )
             };
             Some(Kept::Resource {
-                resource: texture.clone(),
-                copy: None,
+                _resource: texture.clone(),
             })
         }
         View::Sampler(words) => {
@@ -1575,28 +1575,59 @@ mod tests {
             (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
             View::Placed(unordered, resource, desc)
         };
-        let made = |index: usize| heap.kept.lock().unwrap()[index].is_some();
-        let copy = |index: usize| heap.kept_copy.lock().unwrap()[index].clone();
-        heap.make_at(0, &placed(true, 112));
-        assert!(
-            made(0) && copy(0).is_none(),
-            "on an element: the buffer's copy"
-        );
-        assert!(!off_element(&placed(true, 112)));
+        let buffer = heap.make_at(0, &placed(true, 112));
+        let buffer = buffer.expect("on an element: the buffer's copy");
         // The hit-detection offset: 48 bytes in.
         heap.make_at(1, &placed(true, 48));
         heap.make_at(2, &placed(false, 48));
-        let uav = copy(1).expect("an unordered view off an element: its own copy");
-        let srv = copy(2).expect("a shader view off an element: its own copy");
-        assert!(
-            std::sync::Arc::ptr_eq(&uav, &srv),
-            "one copy of the same bytes"
-        );
-        assert!(off_element(&placed(true, 48)) && off_element(&placed(false, 48)));
+        let uav = heap.copy_at(1);
+        let uav = uav.expect("an unordered view off an element: its own copy");
+        let srv = heap.copy_at(2);
+        let srv = srv.expect("a shader view off an element: its own copy");
+        assert!(Arc::ptr_eq(&uav, &srv), "one copy of the same bytes");
+        assert!(!Arc::ptr_eq(&uav, &buffer), "not the buffer's copy");
         // SAFETY: a plain device query.
         let removed = unsafe { host.device.GetDeviceRemovedReason() };
         assert!(removed.is_ok(), "device removed: {removed:?}");
         crate::shadow::unregister(usize::MAX - 2, address);
+    }
+
+    /// A slot hands its draws the copy its view is of: a view of an outer
+    /// title buffer whose bytes lie in an inner registered one keeps the
+    /// outer buffer's copy, where looking the view's range up again finds
+    /// the inner one's.
+    #[test]
+    fn a_slot_keeps_the_copy_its_view_is_of() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let (outer, inner) = (0x7c00_0000_0000_u64, 0x7c00_0000_1000_u64);
+        crate::shadow::register(usize::MAX - 3, outer, 0x1_0000);
+        crate::shadow::register(usize::MAX - 4, inner, 0x100);
+        // A raw view of the outer buffer's memory: 64 elements from element
+        // 0x400, which are the inner buffer's bytes.
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // a buffer
+        resource[4] = 0x1_0000;
+        let mut desc = [0u32; 16];
+        desc[0] = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+        desc[1] = 1; // buffer dimension
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        // FirstElement, NumElements, Flags
+        (desc[4], desc[6], desc[8]) = (0x400, 64, D3D12_BUFFER_SRV_FLAG_RAW.0 as u32);
+        (desc[10], desc[11]) = (outer as u32, (outer >> 32) as u32);
+        let view = View::Placed(false, resource, desc);
+        let kept = heap.make_at(0, &view).expect("the slot's copy");
+        assert_eq!(buffer_range(&view), Some((inner, 0x100)));
+        let outer_copy = crate::shadow::find(outer, 0x1_0000).unwrap();
+        let inner_copy = crate::shadow::find(inner, 0x100).unwrap();
+        assert!(Arc::ptr_eq(&kept, &outer_copy), "the outer buffer's copy");
+        assert!(!Arc::ptr_eq(&kept, &inner_copy), "not the inner one's");
+        crate::shadow::unregister(usize::MAX - 4, inner);
+        crate::shadow::unregister(usize::MAX - 3, outer);
     }
 
     /// A nulled-stride list parses decimal and hex, and ignores junk.
