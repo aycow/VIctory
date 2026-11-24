@@ -14,7 +14,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::timeline::{Timeline, Touches};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -899,14 +899,23 @@ impl Host {
             }
             let started = std::time::Instant::now();
             let waited = EVENT.with(|e| {
-                self.fence
-                    .SetEventOnCompletion(value, e.0)
-                    .map(|()| WaitForSingleObject(e.0, INFINITE))
+                self.fence.SetEventOnCompletion(value, e.0).map(|()| {
+                    if e.0.is_invalid() {
+                        // With a null event, SetEventOnCompletion already waited.
+                        WAIT_OBJECT_0
+                    } else {
+                        WaitForSingleObject(e.0, INFINITE)
+                    }
+                })
             });
-            if let Err(e) = waited {
-                tracing::warn!(error = %e, "host fence wait failed; polling");
-                while self.fence.GetCompletedValue() < value {
+            let mut completed = self.fence.GetCompletedValue();
+            if !matches!(waited, Ok(WAIT_OBJECT_0)) || completed < value {
+                tracing::warn!(?waited, completed, value, "host fence wait did not confirm completion; polling");
+                // A removed device reports u64::MAX. The completion path
+                // handles device removal and its DRED data.
+                while completed < value {
                     std::thread::sleep(std::time::Duration::from_millis(1));
+                    completed = self.fence.GetCompletedValue();
                 }
             }
             if counted {
@@ -2753,12 +2762,13 @@ mod submissions {
         );
         let heap_ref = heap(title_heap);
         let host_heap = heap_ref.host().unwrap();
-        // Lease every dynamic slot (65,536) on `list`.
-        let first = host_heap.dynamic(1 << 16).unwrap();
+        // The portable fallback can have fewer slots than this host's first choice.
+        let capacity = host_heap.dynamic_capacity();
+        let first = host_heap.dynamic(capacity).unwrap();
         assert_eq!(host_heap.dynamic(1), None);
 
         let list = host.new_list().unwrap();
-        list.keep_dynamic(heap_ref.id(), first, 1 << 16);
+        list.keep_dynamic(heap_ref.id(), first, capacity);
         list.close();
 
         // Hold the host queue behind a private fence armed atomically inside
