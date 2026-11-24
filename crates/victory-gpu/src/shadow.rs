@@ -78,9 +78,7 @@ fn give_back(v: Vec<u8>) {
 const NOT_WATCHED: u8 = 2;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
-// written by the submitting thread, and by the thread finishing an earlier
-// submission only in ranges that one's shaders wrote (which the submitting
-// thread leaves alone until it has finished).
+// written only on the submitting thread.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
@@ -144,50 +142,25 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
-    /// At submission, after the range's refresh: a submitted list's shaders
-    /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    /// Prevent later CPU refreshes from replacing a pending GPU write.
+    pub(crate) fn queue_write(&self, address: usize, len: usize) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
+    }
+
+    /// Once all CPU refreshes are done, keep the bytes the GPU starts with.
+    /// Refreshes can still fill gaps between earlier queued writes.
+    pub(crate) fn snapshot(&self, address: usize, len: usize) {
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &mut *before
-            && (*at, *at + bytes.len()) == (start, end)
-        {
-            // Refresh `[from, to)` even when the hull did not grow: an earlier
-            // submission on this range may have copied back while a disjoint
-            // submission kept `before` alive (`settle` guarantees no writer of
-            // `[from, to)` is in flight).
-            bytes[from - *at..to - *at].copy_from_slice(host(from, to));
-            return;
-        }
-        // Parts newly covered and the new range itself come fresh from the
-        // copy; other already-covered parts belong to disjoint in-flight
-        // submissions and keep their original snapshot bytes.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                grown[from - start..to - start].copy_from_slice(host(from, to));
-                give_back(bytes);
-            }
-            None => grown.extend_from_slice(host(start, end)),
-        }
-        *before = Some((start, grown));
+        debug_assert!(before.is_none());
+        let mut bytes = pooled(to - from);
+        bytes.extend_from_slice(host);
+        *before = Some((from, bytes));
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -198,23 +171,24 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &mut *snapshot
+        if let Some((taken, before)) = &*snapshot
             && *taken <= from
-            && to <= *taken + before.len()
+            && to <= taken + before.len()
             && from < to
         {
-            // Sample the write-journal timestamp BEFORE reading title memory so
-            // any concurrent title write during `read_into` gets a later
-            // journal stamp and is never erroneously marked clean.
+            // Sample the write journal before reading title bytes. A title
+            // write during the merge must still be visible to the next refresh.
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            let mark_now = (first < last && self.watched.load(Ordering::Relaxed) != NOT_WATCHED)
-                .then(|| crate::watch::writes(first * PAGE, last * PAGE, true).map(|(now, _)| now))
-                .flatten();
-            let before_slice = &mut before[from - *taken..to - *taken];
+            let mark_now = if first < last && self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
+                crate::watch::writes(first * PAGE, last * PAGE, true).map(|(now, _)| now)
+            } else {
+                None
+            };
+            let before = &before[from - taken..to - taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -226,34 +200,36 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &mut before_slice[at - from..at - from + n];
+                let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old.iter()) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+                    let changed = if title == old {
+                        // No CPU changes in the sampled title piece. The
+                        // GPU's bytes are already the merged result.
+                        title.copy_from_slice(host);
+                        true
+                    } else {
+                        // Keep the title's bytes where the GPU made no change.
+                        // The shadow also takes the merged result.
+                        let mut changed = false;
+                        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                            if *h != *o && *t != *h {
+                                *t = *h;
+                                changed = true;
+                            }
+                            *h = *t;
                         }
-                        *h = *t;
-                    }
+                        changed
+                    };
                     if changed {
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
                     }
-                    // Keep the snapshot current for this range in case another
-                    // disjoint in-flight submission keeps `snapshot` alive.
-                    old.copy_from_slice(host);
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
-            // Pages made equal to title memory are current in the copy as of
-            // `mark_now` (before `read_into`); others keep what they had so a
-            // title write shows at the next refresh.
             if let Some(now) = mark_now
                 && !synced.is_empty()
             {
@@ -264,24 +240,30 @@ impl Shadow {
                 }
             }
         }
-        // Every submitted step that declared the range is done with it
-        // (submissions in flight do not declare overlapping ranges of a
-        // copy: a later one finishes the earlier first), and the snapshot
-        // with the last range.
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
+        written
+    }
+
+    /// After every range from this shadow has been copied back.
+    pub(crate) fn finish_writes(&self) {
+        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        if let Some((_, bytes)) = snapshot.take() {
             give_back(bytes);
         }
-        written
     }
 
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
-    pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+    pub(crate) fn update(
+        &self,
+        address: usize,
+        len: usize,
+        mut before_copy: impl FnMut(usize, usize),
+    ) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -303,52 +285,30 @@ impl Shadow {
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, &mut before_copy);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, &mut before_copy);
             }
             return bytes;
         }
-        self.update_free(from, to)
-    }
-
-    /// Whether the title may have written a page of `[from, to)` since the
-    /// copy last took it (always, for memory that is neither write-watched
-    /// nor guarded). Asks the write journal, which keeps the answer for the
-    /// refresh that follows.
-    pub(crate) fn stale(&self, from: usize, to: usize) -> bool {
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (from.max(start), to.min(end));
-        if from >= to {
-            return false;
-        }
-        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            return true;
-        }
-        let Some((_, written)) = crate::watch::writes(from, to, true) else {
-            return true;
-        };
-        let base = start / PAGE;
-        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        (from / PAGE..=(to - 1) / PAGE).any(|page| {
-            let at = copied[page - base];
-            let write = written
-                .binary_search_by_key(&page, |&(p, _)| p)
-                .map_or(0, |i| written[i].1);
-            at == 0 || write > at
-        })
+        self.update_free(from, to, &mut before_copy)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn update_free(
+        &self,
+        from: usize,
+        to: usize,
+        before_copy: &mut impl FnMut(usize, usize),
+    ) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, before_copy);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -359,14 +319,20 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
-        self.copy(from, to);
-        to - from
+        self.copy(from, to, before_copy)
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(
+        &self,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        before_copy: &mut impl FnMut(usize, usize),
+    ) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -390,20 +356,21 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to), before_copy);
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to), before_copy);
         }
         bytes
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
-    fn copy(&self, from: usize, to: usize) -> usize {
+    fn copy(&self, from: usize, to: usize, before_copy: &mut impl FnMut(usize, usize)) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        before_copy(from, to);
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -542,48 +509,4 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn snapshot_stays_fresh_across_disjoint_in_flight_submissions() {
-        let Some(h) = host() else { return };
-        let mut title = vec![0u8; 256];
-        let start = title.as_ptr() as u64;
-        let len = title.len() as u64;
-        let (buffer, data) = h.shared_buffer(1 << 16).unwrap();
-        // SAFETY: live host buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        let shadow = Shadow::new(buffer, data, gpu, start, len);
-
-        let range_a = start as usize;
-        let range_b = start as usize + 128;
-
-        // S1 declares range A, S2 declares disjoint range B while S1 is in flight.
-        shadow.writing(range_a, 64);
-        shadow.writing(range_b, 64);
-
-        // S1 writes byte 0 of A on the GPU and copies back while S2 is still in flight.
-        // SAFETY: offset 0 is inside the host shadow mapping.
-        unsafe { *shadow.data = 0x11 };
-        shadow.copy_back(range_a, 64);
-        assert_eq!(title[0], 0x11);
-
-        // S3 declares range A again while S2 is still keeping `before` alive.
-        shadow.writing(range_a, 64);
-
-        // While S3 runs (without touching byte 0), the title updates byte 0.
-        title[0] = 0x22;
-
-        // S3 copies back: byte 0 must keep the title's 0x22, not revert to S1's 0x11.
-        shadow.copy_back(range_a, 64);
-        assert_eq!(title[0], 0x22);
-
-        // S2 finishes last and releases the snapshot.
-        shadow.copy_back(range_b, 64);
-        assert!(shadow.before.lock().unwrap().is_none());
-    }
 }
