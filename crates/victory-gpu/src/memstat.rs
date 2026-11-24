@@ -42,6 +42,10 @@ pub(crate) static TEXTURE_UPLOAD: Gauge = Gauge {
     bytes: AtomicU64::new(0),
     peak: AtomicU64::new(0),
 };
+pub(crate) static TEXTURE_READ: Gauge = Gauge {
+    bytes: AtomicU64::new(0),
+    peak: AtomicU64::new(0),
+};
 
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -169,7 +173,9 @@ fn sample(elapsed_s: u64, adapter: Option<&IDXGIAdapter3>) {
     let (list_scratch_bytes, list_scratch_peak) = SCRATCH.sample();
     let (list_upload_bytes, list_upload_peak) = UPLOAD.sample();
     let (texture_upload_bytes, texture_upload_peak) = TEXTURE_UPLOAD.sample();
-    let cached = crate::texture::cached_staging_bytes();
+    let (texture_read_bytes, texture_read_peak) = TEXTURE_READ.sample();
+    let (native_textures, native_texture_bytes, native_used_bytes, _, _, _) =
+        crate::resource::texture_counts();
     let shadow_ranges = crate::shadow::cached_shadow_ranges();
     tracing::info!(
         target: "victory_gpu::memory", frame = crate::frame::current(), elapsed_s,
@@ -184,11 +190,14 @@ fn sample(elapsed_s: u64, adapter: Option<&IDXGIAdapter3>) {
         cached_shadow_guest_bytes = ?shadow_ranges.as_ref().map(|r| r.described_bytes),
         cached_shadow_guest_unique_bytes = ?shadow_ranges.as_ref().map(|r| r.unique_virtual_bytes),
         list_scratch_bytes, list_scratch_peak, list_upload_bytes, list_upload_peak,
-        texture_upload_bytes, texture_upload_peak,
+        texture_upload_bytes, texture_upload_peak, texture_read_bytes, texture_read_peak,
         idle_snapshot_bytes = ?crate::shadow::idle_snapshot_bytes(),
-        cached_texture_upload_bytes = ?cached.map(|m| m.0),
-        cached_texture_read_capacity_bytes = ?cached.map(|m| m.1),
         "GPU bridge capacity"
+    );
+    tracing::info!(
+        target: "victory_gpu::memory", frame = crate::frame::current(), elapsed_s,
+        native_textures, native_texture_bytes, native_used_bytes,
+        "native host texture capacity"
     );
 }
 
