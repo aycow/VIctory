@@ -651,6 +651,200 @@ fn masked_whole_wave_sum_straddles_the_halves() {
     });
 }
 
+/// An original four-class waterfall. Its EXEC starts as the remaining
+/// lanes, narrows to a class, then temporarily enters a whole-wave
+/// section with different literal masks in the two dwords.
+fn partial_section_waterfall(sum: bool) -> Vec<u32> {
+    // The reduction uses v1..v3 as scratch. Keep both its inputs to the
+    // next waterfall iteration and the previous classes' output separate.
+    let class = if sum { 6 } else { 1 };
+    let result = if sum { 7 } else { 2 };
+    let mut body = vec![
+        0x3600_0083 | (class << 17),  // v_and_b32 class, 3, v0
+        0x7E00_0280 | (result << 17), // v_mov_b32 result, 0
+        0xBE8C_047E,                  // s_mov_b64 s[12:13], exec
+        0xBE90_047E,                  // s_mov_b64 s[16:17], exec
+    ];
+    let header = body.len();
+    body.extend([
+        0xBE8E_1410, // s_ff1_i32_b64 s14, s[16:17]
+        0xD760_000F,
+        0x0000_1D00 | class,        // v_readlane_b32 s15, class, s14
+        0x7D24_000F | (class << 9), // v_cmpx_eq_i32 exec, s15, class
+    ]);
+    if sum {
+        body.push(0xBE92_047E); // s_mov_b64 s[18:19], exec
+        body.extend(reduction_scan(37, 0x80));
+        body.push(0x7E0E_020A); // v_mov_b32 v7, s10
+    } else {
+        body.extend([
+            0xBE92_25C1, // s_or_saveexec_b64 s[18:19], -1
+            0xBEFE_03FF,
+            0x0000_00F0, // s_mov_b32 exec_lo, 0xf0
+            0xBEFF_03FF,
+            0x0000_0F00, // s_mov_b32 exec_hi, 0xf00
+            0x7E0A_0300, // v_mov_b32 v5, v0
+            0xBEFE_0412, // s_mov_b64 exec, s[18:19]
+            0x4A04_0291, // v_add_nc_u32 v2, 17, v1
+        ]);
+    }
+    body.extend([
+        0x8A90_1210, // s_andn2_b64 s[16:17], s[16:17], s[18:19]
+        0xBEFE_0410, // s_mov_b64 exec, s[16:17]
+    ]);
+    let back = header as isize - body.len() as isize - 1;
+    body.push(0xBF89_0000 | u32::from(back as u16)); // s_cbranch_execnz header
+    body.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+    if sum {
+        body.push(0x7E04_0307); // v_mov_b32 v2, v7
+    }
+    body
+}
+
+#[test]
+fn masked_section_inside_waterfall_uses_the_full_wave() {
+    let body = partial_section_waterfall(false);
+    let p = program(&body, 64);
+    let native64 = super::Target {
+        lanes_min: 64,
+        lanes_max: 64,
+    };
+    let emitted = emit_for(&p, native64).expect("one Wave64 can retain all saved EXEC bits");
+    assert_eq!(wave_size(&emitted.dxil), Some(64));
+    let split32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let emitted = emit_for(&p, split32).expect("two Wave32 halves can exchange the mask");
+    assert_eq!(wave_size(&emitted.dxil), Some(32));
+    console_flow_case("partial section in scalar waterfall", &body, 64, |lane| {
+        17 + lane % 4
+    });
+}
+
+#[test]
+fn whole_wave_section_returns_each_waterfall_class_sum() {
+    console_flow_case(
+        "partial class sum in scalar waterfall",
+        &partial_section_waterfall(true),
+        64,
+        |lane| 480 + 16 * (lane % 4),
+    );
+}
+
+#[test]
+#[ignore = "requires the D3D12 Agility SDK 1.620.x and debug layer"]
+fn partial_waterfall_with_gpu_validation() {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::*;
+    use windows::core::{Interface, PCSTR};
+
+    let sdk = std::env::var("VICTORY_CULL_AGILITY").expect("Agility SDK x64 DLL directory");
+    let sdk = std::ffi::CString::new(format!("{}\\", sdk.trim_end_matches(['/', '\\']))).unwrap();
+    // SAFETY: SDK and DXGI queries with valid descriptions and output
+    // storage. The device factory configures validation before creation.
+    let hosts = unsafe {
+        let mut config: Option<ID3D12SDKConfiguration1> = None;
+        D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut config).unwrap();
+        let factory: ID3D12DeviceFactory = config
+            .unwrap()
+            .CreateDeviceFactory(620, PCSTR(sdk.as_ptr().cast()))
+            .unwrap();
+        let debug: ID3D12Debug1 = factory
+            .GetConfigurationInterface(&CLSID_D3D12Debug)
+            .unwrap();
+        debug.EnableDebugLayer();
+        debug.SetEnableGPUBasedValidation(true);
+        let dxgi: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let hardware: Vec<IDXGIAdapter1> = (0..)
+            .map_while(|i| dxgi.EnumAdapters1(i).ok())
+            .filter(|a| a.GetDesc1().unwrap().Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0)
+            .collect();
+        assert!(!hardware.is_empty(), "no hardware adapter");
+        let warp: IDXGIAdapter1 = dxgi.EnumWarpAdapter().expect("WARP adapter");
+        assert_ne!(
+            warp.GetDesc1().unwrap().Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32,
+            0
+        );
+        hardware
+            .into_iter()
+            .chain([warp])
+            .map(|adapter| {
+                let desc = adapter.GetDesc1().unwrap();
+                let name = String::from_utf16_lossy(&desc.Description)
+                    .trim_end_matches('\0')
+                    .to_owned();
+                let mut device = None;
+                factory
+                    .CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                    .unwrap();
+                (
+                    name,
+                    Host {
+                        device: device.unwrap(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for (name, host) in hosts {
+        let config: ID3D12DeviceConfiguration = host.device.cast().unwrap();
+        // SAFETY: read-only query on the live device configuration.
+        let config = unsafe { config.GetDesc() };
+        assert_ne!(
+            config.Flags.0 & D3D12_DEVICE_FLAG_GPU_BASED_VALIDATION_ENABLED.0,
+            0
+        );
+        assert_eq!(
+            config.GpuBasedValidationFlags
+                & D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING.0 as u32,
+            0,
+        );
+        let target = host.target();
+        for sum in [false, true] {
+            let p = program(&partial_section_waterfall(sum), 64);
+            if !target.runs(64) && !target.runs(32) {
+                assert!(emit_for(&p, target).is_err());
+                eprintln!("{name}: no Wave32 or Wave64 capability");
+                continue;
+            }
+            let values = run(&host, &p, 2).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let expected = (0..128)
+                .map(|lane| {
+                    if sum {
+                        480 + 16 * (lane % 4)
+                    } else {
+                        17 + lane % 4
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(values, expected, "{name}: sum={sum}");
+            eprintln!("{name}: full GPU validation, 128 exact words, sum={sum}");
+        }
+        let queue: ID3D12InfoQueue = host.device.cast().unwrap();
+        // SAFETY: each message buffer is aligned and sized by the queue.
+        unsafe {
+            assert_eq!(queue.GetNumMessagesDiscardedByMessageCountLimit(), 0);
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut size = 0;
+                queue.GetMessage(i, None, &mut size).unwrap();
+                let mut bytes = vec![0u64; size.div_ceil(8)];
+                let ptr = bytes.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                queue.GetMessage(i, Some(ptr), &mut size).unwrap();
+                let message = &*ptr;
+                let text =
+                    std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength);
+                assert!(
+                    message.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0,
+                    "{}",
+                    String::from_utf8_lossy(text),
+                );
+            }
+        }
+    }
+}
+
 /// A whole-wave section crosses the halves only in a group of exactly one
 /// console wave: with a partial upper half, or none, it still stops.
 #[test]

@@ -64,7 +64,7 @@ pub(crate) struct Parts<'a> {
 /// it: lower it again from [`crate::structure::structure_console`] with
 /// [`Parts::console_cf`]. Every lane of a console wave then runs every
 /// block, branches are the console's (taken wave-wide) and EXEC guards the
-/// vector instructions. Two kinds of program ask for it:
+/// vector instructions. Programs ask for it when:
 ///
 /// * a wave64 program whose two 32-lane halves must exchange values on a
 ///   host without 64-lane waves (a group of one console wave): the wave-wide
@@ -78,7 +78,9 @@ pub(crate) struct Parts<'a> {
 ///   a loop (or skipped a branch) is not there to be read, and never sees
 ///   the scalars set inside. One host wave is the console wave here, so
 ///   nothing is exchanged. If the console flow cannot lower such a program
-///   it keeps the per-lane form ([`Parts::per_lane_only`]).
+///   it keeps the per-lane form ([`Parts::per_lane_only`]);
+/// * a single native Wave64 with a whole-wave section reads a mask whose
+///   bits extend outside the current per-lane block.
 pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange lanes (console flow)";
 
 enum Stop {
@@ -1398,8 +1400,12 @@ impl<'a> Lower<'a> {
                 Some(&b) if b == self.cur_ir => self.cur,
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
-            let bit = self.boolean(m, at)?;
-            let xy = self.console_ballot(at, bit);
+            if !self.balloting.insert(lo) {
+                return Err("a lane mask whose lanes depend on its own value");
+            }
+            let bit = self.boolean(m, at);
+            self.balloting.remove(&lo);
+            let xy = self.console_ballot(at, bit?);
             self.ballots.insert(lo, xy);
             return Ok(if high { xy.1 } else { xy.0 });
         }
@@ -1407,6 +1413,21 @@ impl<'a> Lower<'a> {
             return Err("a lane mask read whole in a wave64 program split in halves");
         }
         if !self.x.st.active.contains(&lo) {
+            // A ballot over the lanes reaching this per-lane block would
+            // lose the rest of the saved mask. The existing console flow
+            // keeps all lanes of this single full wave at every block.
+            if self.mask_data == MaskData::Console
+                && self.x.native.wave64
+                && self.x.target.runs(64)
+                && self.s.threads.is_some_and(|t| t.iter().product::<u32>() == 64)
+                && !self.x.per_lane_only
+                && !self.sections.is_empty()
+                && !self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                    i.name().contains("permute") && i.name() != "ds_bpermute_b32"
+                })
+            {
+                return Err(CONSOLE_FLOW);
+            }
             return Err("a lane mask holding lanes elsewhere read as data");
         }
         let (x, y) = match self.ballots.get(&lo) {
