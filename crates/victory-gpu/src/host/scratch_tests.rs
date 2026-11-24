@@ -81,14 +81,16 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-fn pipeline(host: &Host) -> (ID3D12RootSignature, ID3D12PipelineState) {
+mod window_tests;
+
+fn pipeline(host: &Host, source: &str) -> (ID3D12RootSignature, ID3D12PipelineState) {
     let mut blob: Option<ID3DBlob> = None;
     // SAFETY: compiler inputs and outputs are live; the root signature and
     // shader bytecode are borrowed through PSO creation.
     unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("shared-scratch-read"),
             None,
             None,
@@ -147,7 +149,7 @@ fn shared_scratch_matches_shadow() {
     let title_address = title_data as usize;
     let shadow = crate::shadow::find(title_address as u64, BYTES).unwrap();
     let (output, output_data) = host.shared_buffer(BYTES).unwrap();
-    let (root, pso) = pipeline(host);
+    let (root, pso) = pipeline(host, SOURCE);
     let direct_list = host.new_list().unwrap();
     let baseline_list = host.new_list().unwrap();
     assert!(host.unified_buffer(UNIFIED_ALIGNMENT).is_some());
