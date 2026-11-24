@@ -181,31 +181,47 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    let changed = if title == old {
-                        // No CPU changes in the sampled title piece. The
-                        // GPU's bytes are already the merged result.
-                        title.copy_from_slice(host);
-                        true
-                    } else {
-                        // Keep the title's bytes where the GPU made no change.
-                        // The shadow also takes the merged result.
-                        let mut changed = false;
-                        for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                            if *h != *o && *t != *h {
-                                *t = *h;
-                                changed = true;
+                if host != old {
+                    let address = start + at;
+                    let page = address / PAGE;
+                    let synchronized = if crate::host::read_into(address as *const u8, title) {
+                        let changed = if title == old {
+                            // No CPU changes in the sampled title piece. The
+                            // GPU's bytes are already the merged result.
+                            title.copy_from_slice(host);
+                            true
+                        } else {
+                            // Keep the title's bytes where the GPU made no change.
+                            // The shadow also takes the merged result.
+                            let mut changed = false;
+                            for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                                if *h != *o && *t != *h {
+                                    *t = *h;
+                                    changed = true;
+                                }
+                                *h = *t;
                             }
-                            *h = *t;
+                            changed
+                        };
+                        if changed {
+                            crate::watch::writing(address, n);
+                            let stored =
+                                crate::host::write_mapped(address as *mut u8, title.as_ptr(), n);
+                            written += stored;
+                            stored == n
+                        } else {
+                            true
                         }
-                        changed
+                    } else {
+                        false
                     };
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                    if synchronized {
+                        synced.push(page);
+                    } else {
+                        // Refresh from title memory next time this page is read.
+                        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                        copied[page - start / PAGE] = 0;
                     }
-                    synced.push((start + at) / PAGE);
                 }
                 at += n;
             }

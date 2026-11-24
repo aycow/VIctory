@@ -1802,28 +1802,60 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 }
 
 /// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+/// wrote). Returns the bytes in completed writes.
+pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) -> usize {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let write = |at: usize, n: usize| {
+    // SAFETY: this returns the current process's pseudo-handle.
+    let process = unsafe { GetCurrentProcess() };
+    let mut written = 0;
+    for_mapped_write_regions(dst as usize, len, |at, n| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
-    };
-    if len == 0 || write(dst as usize, len) {
-        return;
-    }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
-            });
+        let ok = unsafe { WriteProcessMemory(process, at as _, from.cast(), n, &mut done) != 0 };
+        if ok && done == n {
+            written += n;
         }
     });
+    written
 }
+
+/// Walks stable protection spans once. A write can clear PAGE_GUARD even
+/// when it fails, so check before the first write and never retry a failed
+/// span. The protection may still change after VirtualQuery.
+fn for_mapped_write_regions(start: usize, len: usize, mut write: impl FnMut(usize, usize)) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let Some(end) = start.checked_add(len) else {
+        return;
+    };
+    let mut at = start;
+    while at < end {
+        let mut region = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: the kernel queries the address and fills our local output.
+        let queried = unsafe { VirtualQuery(at as _, &mut region, std::mem::size_of_val(&region)) };
+        if queried == 0 {
+            break;
+        }
+        let next = (region.BaseAddress as usize)
+            .saturating_add(region.RegionSize)
+            .min(end);
+        if next <= at {
+            break;
+        }
+        if region.State == MEM_COMMIT && region.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0 {
+            write(at, next - at);
+        }
+        at = next;
+    }
+}
+
+#[cfg(test)]
+#[path = "copyback_protection_tests.rs"]
+mod copyback_protection_tests;
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
