@@ -1110,6 +1110,133 @@ mod tests {
     }
 
     #[test]
+    fn mapped_view_hint_skips_only_cross_shadow_allocation_queries() {
+        use crate::host::refresh_grouped_across;
+        use crate::watch::{kernel_allocation_calls, mapped_view_starts, title_memory_remapped};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+
+        struct View(MEMORY_MAPPED_VIEW_ADDRESS);
+        impl View {
+            fn new() -> Self {
+                // SAFETY: creates an anonymous section and maps our own view.
+                let view = unsafe {
+                    let section = CreateFileMappingW(
+                        INVALID_HANDLE_VALUE,
+                        std::ptr::null(),
+                        PAGE_READWRITE,
+                        0,
+                        (2 * PAGE) as u32,
+                        std::ptr::null(),
+                    );
+                    assert!(!section.is_null());
+                    let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE);
+                    CloseHandle(section);
+                    view
+                };
+                assert!(!view.Value.is_null());
+                title_memory_remapped(view.Value as usize, 2 * PAGE);
+                Self(view)
+            }
+        }
+        impl Drop for View {
+            fn drop(&mut self) {
+                // SAFETY: this fixture owns the live view.
+                assert_ne!(unsafe { UnmapViewOfFile(self.0) }, 0);
+                title_memory_remapped(self.0.Value as usize, 2 * PAGE);
+            }
+        }
+
+        let private_at = |base: usize| {
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            // SAFETY: requests fresh memory, or the address of a released test view.
+            let memory = Reservation(unsafe {
+                VirtualAlloc(
+                    base as *const _,
+                    PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            });
+            assert!(!memory.0.is_null());
+            crate::watch::title_memory_allocation_changed(memory.0 as usize, PAGE);
+            memory
+        };
+        let (a, b, private) = (View::new(), View::new(), private_at(0));
+        let addresses = [a.0.Value as usize, b.0.Value as usize, private.0 as usize];
+        let Some(first) = shadow_at(addresses[0], PAGE) else {
+            return;
+        };
+        let shadows = [
+            first,
+            shadow_at(addresses[1], PAGE).unwrap(),
+            shadow_at(addresses[2], PAGE).unwrap(),
+        ];
+        let per: Vec<_> = shadows
+            .into_iter()
+            .zip(addresses)
+            .map(|(shadow, start)| (Arc::new(shadow), vec![(start, start + PAGE)]))
+            .collect();
+        let set = |at: usize, value: u8| {
+            crate::watch::writing(at, 1);
+            // SAFETY: all addresses come from the fixture's live mapping or reservation.
+            unsafe { (at as *mut u8).write(value) };
+        };
+        let values = || {
+            per.iter()
+                .map(|(shadow, _)| native_byte(shadow, 0))
+                .collect::<Vec<_>>()
+        };
+        let queries = |starts: fn(usize, usize) -> Vec<usize>| {
+            let start = kernel_allocation_calls();
+            refresh_grouped_across(&per, starts);
+            kernel_allocation_calls() - start
+        };
+
+        // The first refresh observes the mapped starts and installs their guards.
+        for (at, value) in addresses.into_iter().zip([11, 22, 33]) {
+            set(at, value);
+        }
+        let baseline = queries(|_, _| Vec::new());
+        assert_eq!(values(), [11, 22, 33]);
+        let page_a = addresses[0] / PAGE;
+        let page_b = addresses[1] / PAGE;
+        assert_eq!(mapped_view_starts(page_a, page_a + 1), [page_a]);
+        assert_eq!(mapped_view_starts(page_b, page_b + 1), [page_b]);
+        for (at, value) in addresses.into_iter().zip([41, 42, 43]) {
+            set(at, value);
+        }
+        let hinted = queries(mapped_view_starts);
+        assert_eq!(values(), [41, 42, 43]);
+        if baseline != 0 {
+            assert_eq!((baseline, hinted), (3, 1));
+        }
+
+        let saved = mapped_view_starts(page_a.min(page_b), page_a.max(page_b));
+        let base = addresses[0];
+        drop(a);
+        let replacement = private_at(base);
+        assert_eq!(replacement.0 as usize, base);
+        assert!(mapped_view_starts(page_a, page_a).is_empty());
+        set(base, 51);
+        let remapped = queries(mapped_view_starts);
+        assert_eq!(values(), [51, 42, 43]);
+        if baseline != 0 {
+            assert_eq!(remapped, 2, "replacement still uses the ordinary allocation query");
+        }
+
+        // A snapshot taken before the remap may still decline grouping.
+        // Even then the normal shadow refresh must see new private bytes.
+        set(base, 61);
+        refresh_grouped_across(&per, |_, _| saved);
+        assert_eq!(values(), [61, 42, 43]);
+        println!("reservation queries baseline={baseline} hinted={hinted} after_remap={remapped}");
+    }
+
+    #[test]
     fn partial_commit_refreshes_the_view_inside_a_reserved_page() {
         use windows_sys::Win32::System::Memory::PAGE_NOACCESS;
 

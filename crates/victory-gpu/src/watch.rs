@@ -165,6 +165,8 @@ pub(crate) fn allocation(address: usize) -> Option<Allocation> {
     }))?;
     let revision = MAPPING_REVISION.load(Ordering::Acquire);
     let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    #[cfg(test)]
+    KERNEL_ALLOCATION_CALLS.with(|calls| calls.set(calls.get() + 1));
     // SAFETY: MemoryRegionInfo writes this sized structure for our process.
     unsafe {
         if query(
@@ -266,7 +268,13 @@ impl Journal {
 
 #[cfg(test)]
 thread_local! {
+    static KERNEL_ALLOCATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static KERNEL_WATCH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn kernel_allocation_calls() -> usize {
+    KERNEL_ALLOCATION_CALLS.with(std::cell::Cell::get)
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -434,6 +442,14 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The observed section-view starts within a span of console page indices.
+/// This snapshot is only a hint to decline private cross-shadow grouping.
+/// It carries no reservation extent or commitment information.
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) fn mapped_view_starts(first: usize, last: usize) -> Vec<usize> {
+    guards().views.range(first..=last).copied().collect()
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since

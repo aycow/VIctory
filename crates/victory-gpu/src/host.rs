@@ -1381,8 +1381,6 @@ pub(crate) fn test_submission_copy_bytes() -> u64 {
 /// pages; the rest goes through each copy's own grouping
 /// (`Shadow::update_ready`).
 fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)]) -> usize {
-    use crate::watch::PAGE;
-    const SPAN_GAP: usize = 1 << 20;
     #[cfg(feature = "diagnostics")]
     {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1390,13 +1388,33 @@ fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usi
         if off {
             return per.iter().map(|(s, r)| s.update_ready(r)).sum();
         }
+        static MAPPED_HINT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *MAPPED_HINT.get_or_init(|| {
+            std::env::var_os("VICTORY_HINT_MAPPED_SRV_SPANS").is_some_and(|value| value == "1")
+        }) {
+            return refresh_grouped_across(per, crate::watch::mapped_view_starts);
+        }
     }
+    refresh_grouped_across(per, |_, _| Vec::new())
+}
+
+/// `mapped_view_starts` returns sorted page indices used only to decline grouping.
+pub(crate) fn refresh_grouped_across(
+    per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+    mapped_view_starts: impl FnOnce(usize, usize) -> Vec<usize>,
+) -> usize {
+    use crate::watch::PAGE;
+    const SPAN_GAP: usize = 1 << 20;
     let mut flat: Vec<(usize, usize, usize)> = per
         .iter()
         .enumerate()
         .flat_map(|(i, (_, r))| r.iter().map(move |&(a, e)| (a, e, i)))
         .collect();
     flat.sort_unstable();
+    let hints = flat.first().zip(flat.last()).map_or_else(Vec::new, |(first, last)| {
+        mapped_view_starts(first.0 / PAGE, last.0 / PAGE)
+    });
+    let mut mapped = hints.into_iter().peekable();
     let mut rest: Vec<Vec<(usize, usize)>> = vec![Vec::new(); per.len()];
     let mut copied = 0;
     let mut at = 0;
@@ -1405,7 +1423,18 @@ fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usi
     let mut last: Option<crate::watch::Allocation> = None;
     while at < flat.len() {
         let (lo, mut hi, first) = flat[at];
-        let page = lo / PAGE * PAGE;
+        let start_page = lo / PAGE;
+        while mapped.peek().is_some_and(|&page| page < start_page) {
+            mapped.next();
+        }
+        if mapped.peek() == Some(&start_page) {
+            // Even a stale hint only changes the grouping choice. The
+            // usual per-shadow refresh still checks and copies these bytes.
+            rest[first].push((lo, hi));
+            at += 1;
+            continue;
+        }
+        let page = start_page * PAGE;
         if !last.is_some_and(|a| a.is_live() && a.start <= page && page < a.end) {
             last = crate::watch::allocation(page);
         }
