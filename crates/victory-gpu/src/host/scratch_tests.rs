@@ -204,7 +204,7 @@ fn shared_scratch_matches_shadow() {
             for (i, &got) in result.iter().enumerate() {
                 assert_eq!(
                     got,
-                    values(i * stride as usize & (WORDS - 1)) ^ MASK,
+                    values((i * stride as usize) & (WORDS - 1)) ^ MASK,
                     "word {i}"
                 );
             }

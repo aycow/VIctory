@@ -509,6 +509,7 @@ void main() {
             )
         };
         let root: ID3D12RootSignature =
+            // SAFETY: the bytecode and the device are live during the call.
             unsafe { host.device.CreateRootSignature(0, bytes) }.expect("create root signature");
         // SAFETY: the PSO description borrows the live bytecode and root signature.
         let pso: ID3D12PipelineState = unsafe {
