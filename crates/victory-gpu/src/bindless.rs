@@ -369,7 +369,6 @@ void main(uint3 id : SV_DispatchThreadID) {
 "#;
 
     fn compile() -> (ID3D12RootSignature, ID3D12PipelineState) {
-        let host = crate::host::host().unwrap();
         let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
         // SAFETY: the source and names outlive the call.
         unsafe {
@@ -393,6 +392,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         let bytes = unsafe {
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
         };
+        compute_pipeline(bytes)
+    }
+
+    fn compute_pipeline(bytes: &[u8]) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let host = crate::host::host().unwrap();
         // SAFETY: a compiled shader with its root signature inside.
         unsafe {
             let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
@@ -611,6 +615,222 @@ void main(uint3 id : SV_DispatchThreadID) {
             for (i, &v) in words.iter().enumerate() {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");
             }
+        }
+    }
+
+    const GENERATED_VISIBILITY: &str = r#"
+#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=2, b0), UAV(u0)"
+cbuffer Control : register(b0) { uint phase; uint selector; }
+RWByteAddressBuffer work : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    if (phase == 0) {
+        work.Store(0, 3 + 3 * selector);
+    } else {
+        uint index = work.Load(0);
+        ByteAddressBuffer instance = ResourceDescriptorHeap[NonUniformResourceIndex(index)];
+        uint position = instance.Load(0);
+        uint visible = position >= 16 && position <= 64;
+        work.Store2(4, uint2(position, visible));
+        work.Store3(12, uint3(visible, 1, 1));
+    }
+}
+"#;
+
+    /// A GPU-produced descriptor index drives visibility and indirect dispatch
+    /// arguments. A valid raw null descriptor isolates missing materialization.
+    #[test]
+    #[ignore = "requires a D3D12 SM 6.6 device and VICTORY_PC_DXC"]
+    fn gpu_selected_instance_view_drives_visibility() {
+        use crate::object::release;
+
+        let dxc = std::env::var_os("VICTORY_PC_DXC").expect("DXC path for SM 6.6 fixture");
+        let full_gbv = std::env::var_os("VICTORY_TEST_BINDLESS_GBV").is_some();
+        if full_gbv {
+            assert!(std::env::var_os("VICTORY_D3D12_GBV").is_none());
+            let mut debug: Option<ID3D12Debug1> = None;
+            // SAFETY: enable validation before the test creates the host device.
+            unsafe {
+                D3D12GetDebugInterface(&mut debug).unwrap();
+                let debug = debug.unwrap();
+                debug.EnableDebugLayer();
+                debug.SetEnableGPUBasedValidation(true);
+            }
+        }
+        let host = crate::host::host().expect("D3D12 device for the visibility fixture");
+        let validation = visibility_validation(host, full_gbv);
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("visibility.hlsl");
+        let binary = dir.path().join("visibility.dxil");
+        std::fs::write(&source, GENERATED_VISIBILITY).unwrap();
+        let result = std::process::Command::new(dxc)
+            .args(["-T", "cs_6_6", "-E", "main", "-Fo"])
+            .arg(&binary)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let bytes = std::fs::read(binary).unwrap();
+        let (root, pso) = compute_pipeline(&bytes);
+
+        let null = std::ptr::null();
+        let title = resource(1, 256, 1, 0, 1);
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |index: u64| title_heap.start + 32 * index;
+        let srv: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0];
+        crate::descriptor::create_srv(null, title, &srv, slot(3));
+        crate::descriptor::create_srv(null, title, &srv, slot(6));
+        let heap_host = title_heap.host().unwrap();
+        // Leave both title records and refresh requests intact. The control
+        // substitutes a valid raw null view in only the selected native slot.
+        heap_host.raw_view_at(6, None, 0, 4, false);
+
+        let (work, mapped) = host.shared_buffer(24).unwrap();
+        let (title_bytes, _) = crate::resource::buffer_bytes(title).unwrap();
+        for (selector, position, expected) in [
+            (0u32, 41u32, [3, 41, 1, 1, 1, 1]),
+            (1, 53, [6, 0, 0, 0, 1, 1]),
+            (0, 59, [3, 59, 1, 1, 1, 1]),
+        ] {
+            let list = host.new_list().unwrap();
+            // SAFETY: all objects live through the fence and work is a UAV buffer.
+            unsafe {
+                list.list
+                    .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list
+                    .SetComputeRootUnorderedAccessView(1, work.GetGPUVirtualAddress());
+                list.list.SetPipelineState(&pso);
+                list.list
+                    .SetComputeRoot32BitConstants(0, 2, [0, selector].as_ptr().cast(), 0);
+                list.list.Dispatch(1, 1, 1);
+                list.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER::default()),
+                    },
+                    ..Default::default()
+                }]);
+                list.list.SetComputeRoot32BitConstant(0, 1, 0);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.defer_heap(&heap_host.viewed);
+            list.close();
+            // SAFETY: the title buffer lives and the list has not run yet.
+            unsafe { title_bytes.cast::<u32>().write(position) };
+            host.execute(&[&list]);
+            // SAFETY: the GPU completed and the six output dwords are mapped.
+            let actual = unsafe { mapped.cast::<[u32; 6]>().read() };
+            eprintln!("visibility [slot, position, mask, dispatch x/y/z] = {actual:?}");
+            assert_eq!(actual, expected);
+        }
+        release(heap);
+        release(title);
+        validation.finish();
+    }
+
+    struct VisibilityValidation(Option<(ID3D12InfoQueue1, u32)>);
+
+    static VISIBILITY_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+    impl VisibilityValidation {
+        fn finish(self) {
+            let messages = VISIBILITY_ERRORS.load(Relaxed);
+            assert_eq!(
+                messages, 0,
+                "D3D12 errors while running bindless visibility"
+            );
+        }
+    }
+
+    impl Drop for VisibilityValidation {
+        fn drop(&mut self) {
+            if let Some((queue, cookie)) = &self.0 {
+                // SAFETY: this test owns the callback registration.
+                unsafe { queue.UnregisterMessageCallback(*cookie) }.unwrap();
+            }
+        }
+    }
+
+    fn visibility_validation(host: &crate::host::Host, full: bool) -> VisibilityValidation {
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows::core::{Interface, PCSTR};
+
+        unsafe extern "system" fn message(
+            _: D3D12_MESSAGE_CATEGORY,
+            severity: D3D12_MESSAGE_SEVERITY,
+            id: D3D12_MESSAGE_ID,
+            text: PCSTR,
+            _: *mut std::ffi::c_void,
+        ) {
+            if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                VISIBILITY_ERRORS.fetch_add(1, Relaxed);
+                // SAFETY: message text stays valid during the callback.
+                let text = unsafe { std::ffi::CStr::from_ptr(text.0.cast()) }.to_string_lossy();
+                eprintln!("D3D12 error {}: {text}", id.0);
+            }
+        }
+
+        // SAFETY: read-only device and adapter queries, or callback registration.
+        unsafe {
+            let factory =
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter = factory
+                .EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
+                .unwrap()
+                .GetDesc1()
+                .unwrap();
+            let name = String::from_utf16_lossy(&adapter.Description);
+            eprintln!(
+                "bindless visibility on {}, full GBV={full}",
+                name.trim_end_matches('\0')
+            );
+            if !full {
+                return VisibilityValidation(None);
+            }
+            let config = host
+                .device
+                .cast::<ID3D12DeviceConfiguration>()
+                .unwrap()
+                .GetDesc();
+            assert_ne!(
+                config.Flags.0 & D3D12_DEVICE_FLAG_GPU_BASED_VALIDATION_ENABLED.0,
+                0
+            );
+            assert_eq!(
+                config.GpuBasedValidationFlags
+                    & D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING.0 as u32,
+                0
+            );
+            let queue = host.device.cast::<ID3D12InfoQueue1>().unwrap();
+            let mut cookie = 0;
+            queue
+                .RegisterMessageCallback(
+                    Some(message),
+                    D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                    std::ptr::null_mut(),
+                    &mut cookie,
+                )
+                .unwrap();
+            VisibilityValidation(Some((queue, cookie)))
         }
     }
 }
