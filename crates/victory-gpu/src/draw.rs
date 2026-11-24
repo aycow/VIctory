@@ -1215,3 +1215,6 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod buffer_view_tests;
