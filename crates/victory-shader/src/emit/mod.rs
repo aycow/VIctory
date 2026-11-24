@@ -77,6 +77,8 @@
 
 mod bitcode;
 mod container;
+#[cfg(test)]
+mod culling_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
