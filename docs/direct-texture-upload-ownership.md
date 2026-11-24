@@ -60,8 +60,8 @@ its native texture and staging. The first submitted heap user with a
 current compatible SRV can deliver it. The slot's title view generation
 and retained native resource must match. Discarding or resetting an earlier
 recording leaves the request available. Rebinding to a different native
-texture retires the stale request, and a submitted GPU producer retains
-priority over a pending CPU upload. The queue fence retires delivered
+texture retires the stale request, and a submitted copy or resolve marked
+authoritative by #230 takes priority over a pending CPU upload. The queue fence retires delivered
 requests and releases their submission pins through the existing wait.
 
 Run these four tests on the candidate using the setup above. Leave the
@@ -104,7 +104,7 @@ record-time discovery and assumes callers synchronize title descriptor
 writes with submission. It covers SRVs of one current native texture per
 resource, including multiple live slots. New raw-only bindings without a
 recording to discover them, compatible aliases between distinct native
-objects, placed UAVs, and multiple CPU snapshots for a single texture
+objects, shader UAV writes, and multiple CPU snapshots for a single texture
 within one native list remain separate cases. This matrix uses original
 synthetic HLSL and texture bytes. CPU overhead and in-game impact have no
 measurements here.
