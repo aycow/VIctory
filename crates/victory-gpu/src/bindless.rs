@@ -636,10 +636,17 @@ void main() {
         work.Store3(12, uint3(visible, 1, 1));
     }
 }
+
+RWByteAddressBuffer result : register(u1);
+[RootSignature("UAV(u1)")]
+[numthreads(1, 1, 1)]
+void consume() {
+    result.Store(0, 0xa1b2c3d4);
+}
 "#;
 
-    /// A GPU-produced descriptor index drives visibility and indirect dispatch
-    /// arguments. A valid raw null descriptor isolates missing materialization.
+    /// A GPU-produced descriptor index drives visibility and a bounded
+    /// native indirect dispatch. A raw null view isolates missing materialization.
     #[test]
     #[ignore = "requires a D3D12 SM 6.6 device and VICTORY_PC_DXC"]
     fn gpu_selected_instance_view_drives_visibility() {
@@ -663,21 +670,46 @@ void main() {
 
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("visibility.hlsl");
-        let binary = dir.path().join("visibility.dxil");
         std::fs::write(&source, GENERATED_VISIBILITY).unwrap();
-        let result = std::process::Command::new(dxc)
-            .args(["-T", "cs_6_6", "-E", "main", "-Fo"])
-            .arg(&binary)
-            .arg(&source)
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        let bytes = std::fs::read(binary).unwrap();
-        let (root, pso) = compute_pipeline(&bytes);
+        let compile = |entry: &str| {
+            let binary = dir.path().join(format!("{entry}.dxil"));
+            let result = std::process::Command::new(&dxc)
+                .args(["-T", "cs_6_6", "-E", entry, "-Fo"])
+                .arg(&binary)
+                .arg(&source)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{entry}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            compute_pipeline(&std::fs::read(binary).unwrap())
+        };
+        let (root, pso) = compile("main");
+        let (consumer_root, consumer_pso) = compile("consume");
+        let dispatch = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let signature_desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: size_of::<D3D12_DISPATCH_ARGUMENTS>() as u32,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &dispatch,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a single dispatch argument, without root argument changes.
+        unsafe {
+            host.device
+                .CreateCommandSignature(
+                    &signature_desc,
+                    None::<&ID3D12RootSignature>,
+                    &mut signature,
+                )
+                .unwrap();
+        }
+        let signature = signature.unwrap();
 
         let null = std::ptr::null();
         let title = resource(1, 256, 1, 0, 1);
@@ -704,11 +736,14 @@ void main() {
         heap_host.raw_view_at(6, None, 0, 4, false);
 
         let (work, mapped) = host.shared_buffer(24).unwrap();
+        let (result, result_mapped) = host.shared_buffer(4).unwrap();
         let (title_bytes, _) = crate::resource::buffer_bytes(title).unwrap();
-        for (selector, position, expected) in [
-            (0u32, 41u32, [3, 41, 1, 1, 1, 1]),
-            (1, 53, [6, 0, 0, 0, 1, 1]),
-            (0, 59, [3, 59, 1, 1, 1, 1]),
+        const UNTOUCHED: u32 = 0x6d400e00;
+        const CONSUMED: u32 = 0xa1b2c3d4;
+        for (selector, position, expected_args, expected_result) in [
+            (0u32, 41u32, [3, 41, 1, 1, 1, 1], CONSUMED),
+            (1, 53, [6, 0, 0, 0, 1, 1], UNTOUCHED),
+            (0, 59, [3, 59, 1, 1, 1, 1], CONSUMED),
         ] {
             let list = host.new_list().unwrap();
             // SAFETY: all objects live through the fence and work is a UAV buffer.
@@ -731,16 +766,35 @@ void main() {
                 }]);
                 list.list.SetComputeRoot32BitConstant(0, 1, 0);
                 list.list.Dispatch(1, 1, 1);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &work,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
+                list.list.SetComputeRootSignature(&consumer_root);
+                list.list.SetPipelineState(&consumer_pso);
+                list.list
+                    .SetComputeRootUnorderedAccessView(0, result.GetGPUVirtualAddress());
+                list.list
+                    .ExecuteIndirect(&signature, 1, &work, 12, None::<&ID3D12Resource>, 0);
             }
             list.defer_heap(&heap_host.viewed);
             list.close();
-            // SAFETY: the title buffer lives and the list has not run yet.
-            unsafe { title_bytes.cast::<u32>().write(position) };
+            // SAFETY: both mappings live and the list has not run yet.
+            unsafe {
+                title_bytes.cast::<u32>().write(position);
+                result_mapped.cast::<u32>().write(UNTOUCHED);
+            }
             host.execute(&[&list]);
-            // SAFETY: the GPU completed and the six output dwords are mapped.
-            let actual = unsafe { mapped.cast::<[u32; 6]>().read() };
-            eprintln!("visibility [slot, position, mask, dispatch x/y/z] = {actual:?}");
-            assert_eq!(actual, expected);
+            // SAFETY: the GPU completed and both outputs are mapped.
+            let (actual, actual_result) = unsafe {
+                (mapped.cast::<[u32; 6]>().read(), result_mapped.cast::<u32>().read())
+            };
+            eprintln!(
+                "visibility [slot, position, mask, dispatch x/y/z] = {actual:?}, result = {actual_result:#010x}"
+            );
+            assert_eq!(actual, expected_args);
+            assert_eq!(actual_result, expected_result);
         }
         release(heap);
         release(title);
