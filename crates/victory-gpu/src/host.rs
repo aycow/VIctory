@@ -176,15 +176,21 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let mut device: Option<ID3D12Device> = None;
+        #[cfg(all(test, feature = "diagnostics"))]
+        if std::env::var_os("VICTORY_MATERIAL_TEST_ADAPTER").is_some() {
+            device = Some(explicit_material_test_device());
+        }
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
-            let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            tracing::info!("host device on the software adapter (WARP)");
-        } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        if device.is_none() {
+            if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+                let adapter = warp_adapter()?;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                tracing::info!("host device on the software adapter (WARP)");
+            } else {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -229,6 +235,50 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn explicit_material_test_device() -> ID3D12Device {
+    use windows::core::PCSTR;
+
+    let sdk = std::env::var("VICTORY_MATERIAL_TEST_AGILITY").expect("Agility x64 DLL directory");
+    let sdk = std::ffi::CString::new(format!("{}\\", sdk.trim_end_matches(['/', '\\']))).unwrap();
+    let vendor = std::env::var("VICTORY_MATERIAL_TEST_ADAPTER").unwrap();
+    // SAFETY: the configuration, selected adapter, and output pointers are live.
+    unsafe {
+        let mut configuration: Option<ID3D12SDKConfiguration1> = None;
+        D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut configuration).unwrap();
+        let factory: ID3D12DeviceFactory = configuration
+            .unwrap()
+            .CreateDeviceFactory(620, PCSTR(sdk.as_ptr().cast()))
+            .unwrap();
+        let debug: ID3D12Debug1 = factory
+            .GetConfigurationInterface(&CLSID_D3D12Debug)
+            .unwrap();
+        debug.EnableDebugLayer();
+        debug.SetEnableGPUBasedValidation(true);
+        let dxgi: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let adapter: IDXGIAdapter1 = if vendor == "warp" {
+            dxgi.EnumWarpAdapter().unwrap()
+        } else {
+            let vendor = match vendor.as_str() {
+                "amd" => 0x1002,
+                "nvidia" => 0x10de,
+                _ => panic!("unsupported test adapter {vendor}"),
+            };
+            (0..)
+                .map_while(|i| dxgi.EnumAdapters1(i).ok())
+                .find(|a| a.GetDesc1().is_ok_and(|d| d.VendorId == vendor))
+                .unwrap()
+        };
+        let desc = adapter.GetDesc1().unwrap();
+        assert_eq!(vendor == "warp", desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+        let name = String::from_utf16_lossy(&desc.Description);
+        eprintln!("material input fixture on {}", name.trim_end_matches('\0'));
+        let mut device = None;
+        factory.CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+        device.unwrap()
     }
 }
 
