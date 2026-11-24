@@ -2314,6 +2314,8 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diagnostics")]
+    mod texture_record_tests;
     use super::*;
     use crate::descriptor::{
         HeapDesc, copy_simple, create_cbv, create_heap, create_placed_srv, create_srv, create_uav,
