@@ -31,6 +31,9 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+mod scratch_tests;
+
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
@@ -55,6 +58,7 @@ pub(crate) struct Host {
     presenter: Mutex<Option<Presenter>>,
     /// Optional CPU-visible heap for placed buffers (the arena is probed lazily).
     unified: OnceLock<Option<UnifiedArena>>,
+    scratch_arena_active: OnceLock<bool>,
 }
 
 /// A bump-allocated CPU-visible D3D12 heap. Allocations never overlap.
@@ -182,6 +186,23 @@ impl UnifiedArena {
     }
 }
 
+fn placed_activation(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    use std::mem::ManuallyDrop;
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Aliasing: ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                pResourceBefore: ManuallyDrop::new(None),
+                // SAFETY: the barrier borrows the live resource.
+                pResourceAfter: ManuallyDrop::new(Some(unsafe {
+                    std::mem::transmute_copy(resource)
+                })),
+            }),
+        },
+    }
+}
+
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
 // free-threaded; the event handle is only waited on under `submitted`.
@@ -300,16 +321,21 @@ fn create() -> windows::core::Result<Host> {
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
+        #[cfg(all(test, feature = "diagnostics"))]
+        let mut device = scratch_tests::test_device()?;
+        #[cfg(not(all(test, feature = "diagnostics")))]
         let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
-            let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            tracing::info!("host device on the software adapter (WARP)");
-        } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        if device.is_none() {
+            if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+                let adapter = warp_adapter()?;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                tracing::info!("host device on the software adapter (WARP)");
+            } else {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -351,6 +377,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             unified: OnceLock::new(),
+            scratch_arena_active: OnceLock::new(),
         })
     }
 }
@@ -497,20 +524,7 @@ void main() {
         .expect("create compute pipeline");
 
         let list = host.new_list().expect("create command list");
-        let activation = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
-                    pResourceBefore: std::mem::ManuallyDrop::new(None),
-                    // SAFETY: this barrier borrows the live resource; ManuallyDrop
-                    // prevents releasing the borrowed COM interface.
-                    pResourceAfter: std::mem::ManuallyDrop::new(Some(unsafe {
-                        std::mem::transmute_copy(&source.resource)
-                    })),
-                }),
-            },
-        };
+        let activation = placed_activation(&source.resource);
         let to_uav = transition(
             &source.resource,
             D3D12_RESOURCE_STATE_COMMON,
@@ -649,6 +663,14 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+fn use_scratch_arena() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_SHARED_SCRATCH").as_deref() == Ok("1")
+    })
+}
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -1377,11 +1399,7 @@ impl HostList {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-            name(&buffer, || "list scratch".into());
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
+            s.chunks.push(host.scratch_chunk(use_scratch_arena())?);
             s.used = 0;
         }
         let (_, data, gpu) = s.chunks[s.current];
@@ -2037,21 +2055,55 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// Allocate one chunk used only through read-only GPU virtual-address
+    /// bindings. A list keeps its chunk and reuses it after the queue fence.
+    fn scratch_chunk(&self, shared: bool) -> Option<(ID3D12Resource, usize, u64)> {
+        if shared
+            && *self.scratch_arena_active.get_or_init(|| {
+                let Some(arena) = self.unified_arena() else {
+                    return false;
+                };
+                let Ok(init) = self.new_list() else {
+                    return false;
+                };
+                // SAFETY: the open list and the placed resource belong to this device.
+                unsafe { init.list.ResourceBarrier(&[placed_activation(&arena.resource)]) };
+                init.close();
+                self.execute(&[&init]);
+                true
+            })
+            && let Some(slice) = self.unified_buffer(SCRATCH_CHUNK)
+        {
+            debug_assert_eq!(slice.offset % UNIFIED_ALIGNMENT, 0);
+            return Some((slice.resource, slice.data as usize, slice.gpu));
+        }
+        let (buffer, data) = self.upload_buffer(SCRATCH_CHUNK)?;
+        name(&buffer, || "list scratch".into());
+        // SAFETY: a live upload buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some((buffer, data as usize, gpu))
+    }
+
     /// A suballocation in a lazily probed CPU-visible buffer shared with the GPU.
     /// Unsupported adapters or exhausted capacity return None; title allocations
     /// do not use this arena yet.
     pub(crate) fn unified_buffer(&self, size: u64) -> Option<UnifiedBuffer> {
-        let arena = self.unified.get_or_init(|| match UnifiedArena::new(&self.device) {
-            Ok(arena) => {
-                tracing::info!(bytes = UNIFIED_ARENA_SIZE, "CPU/GPU shared buffer arena available");
-                Some(arena)
-            }
-            Err(error) => {
-                tracing::info!(error = %error, "CPU/GPU shared buffer arena unavailable");
-                None
-            }
-        });
-        arena.as_ref()?.buffer(size)
+        self.unified_arena()?.buffer(size)
+    }
+
+    fn unified_arena(&self) -> Option<&UnifiedArena> {
+        self.unified
+            .get_or_init(|| match UnifiedArena::new(&self.device) {
+                Ok(arena) => {
+                    tracing::info!(bytes = UNIFIED_ARENA_SIZE, "CPU/GPU shared buffer arena available");
+                    Some(arena)
+                }
+                Err(error) => {
+                    tracing::info!(error = %error, "CPU/GPU shared buffer arena unavailable");
+                    None
+                }
+            })
+            .as_ref()
     }
 
     /// A buffer in system memory that the CPU maps (write-back, so reading
