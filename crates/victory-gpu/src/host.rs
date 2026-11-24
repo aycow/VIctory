@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::timeline::{Timeline, Touches};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_EVENT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -732,8 +732,10 @@ struct Event(HANDLE);
 
 impl Drop for Event {
     fn drop(&mut self) {
-        // SAFETY: our own handle, no longer waited on.
-        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+        if !self.0.is_invalid() {
+            // SAFETY: our own handle, no longer waited on.
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+        }
     }
 }
 
@@ -741,6 +743,26 @@ thread_local! {
     /// Null if it could not be made: the fence wait then blocks by itself.
     // SAFETY: plain event creation.
     static EVENT: Event = Event(unsafe { CreateEventW(None, false, false, None) }.unwrap_or_default());
+}
+
+fn confirm_fence_completion(
+    fence: &ID3D12Fence,
+    value: u64,
+    waited: windows::core::Result<WAIT_EVENT>,
+) {
+    // SAFETY: a plain query on the live fence.
+    let mut completed = unsafe { fence.GetCompletedValue() };
+    if matches!(waited, Ok(WAIT_OBJECT_0)) && completed >= value {
+        return;
+    }
+    tracing::warn!(?waited, completed, value, "host fence wait did not confirm completion; polling");
+    // A removed device reports u64::MAX. The completion path handles
+    // device removal with the pending submissions and their DRED data.
+    while completed < value {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        // SAFETY: a plain query on the live fence.
+        completed = unsafe { fence.GetCompletedValue() };
+    }
 }
 
 impl Host {
@@ -1123,16 +1145,16 @@ impl Host {
             }
             let started = std::time::Instant::now();
             let waited = EVENT.with(|e| {
-                self.fence
-                    .SetEventOnCompletion(value, e.0)
-                    .map(|()| WaitForSingleObject(e.0, INFINITE))
+                self.fence.SetEventOnCompletion(value, e.0).map(|()| {
+                    if e.0.is_invalid() {
+                        // With a null event, SetEventOnCompletion already waited.
+                        WAIT_OBJECT_0
+                    } else {
+                        WaitForSingleObject(e.0, INFINITE)
+                    }
+                })
             });
-            if let Err(e) = waited {
-                tracing::warn!(error = %e, "host fence wait failed; polling");
-                while self.fence.GetCompletedValue() < value {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
+            confirm_fence_completion(&self.fence, value, waited);
             if counted {
                 SUBMISSION_US[1].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
@@ -2997,6 +3019,63 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 #[cfg(test)]
 mod submissions {
     use crate::queue::Written;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires a named D3D12 adapter and Agility SDK 1.620.x"]
+    fn failed_or_early_wait_requires_native_fence_completion() {
+        use super::*;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use windows::Win32::Foundation::WAIT_FAILED;
+
+        let (device, name) = crate::descriptor::host::reuse_tests::device(true);
+        let host = test_install_device(device);
+        let ready = Event(
+            // SAFETY: private auto-reset event, initially signalled.
+            unsafe { CreateEventW(None, false, true, None) }.unwrap(),
+        );
+        // SAFETY: a null handle fails immediately. The other handle belongs to
+        // this fixture and is signalled independently of the native fence.
+        let (failed, early) = unsafe {
+            (
+                WaitForSingleObject(HANDLE::default(), 0),
+                WaitForSingleObject(ready.0, 0),
+            )
+        };
+        assert_eq!(failed, WAIT_FAILED);
+        assert_eq!(early, WAIT_OBJECT_0);
+
+        for status in [failed, early] {
+            let gate = host.test_queue_gate();
+            // SAFETY: this private fence is signalled on the live queue
+            // after the gate, so it cannot complete while the gate is held.
+            let fence: ID3D12Fence = unsafe {
+                let fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                host.queue.Signal(&fence, 1).unwrap();
+                fence
+            };
+            let (entered, entering) = mpsc::sync_channel(1);
+            let (returned, returning) = mpsc::sync_channel(1);
+            std::thread::scope(|scope| {
+                let fence = &fence;
+                scope.spawn(move || {
+                    entered.send(()).unwrap();
+                    confirm_fence_completion(fence, 1, Ok(status));
+                    // SAFETY: a plain query on the live fence.
+                    returned.send(unsafe { fence.GetCompletedValue() }).unwrap();
+                });
+                let entered = entering.recv_timeout(Duration::from_secs(5));
+                let premature = entered.is_ok()
+                    && returning.recv_timeout(Duration::from_millis(200)).is_ok();
+                drop(gate);
+                entered.expect("wait fallback entered");
+                assert!(!premature, "wait status {status:?} bypassed the native fence");
+                assert_eq!(returning.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+            });
+        }
+        println!("{name}: failed and early event waits both held for the native fence");
+    }
 
     #[test]
     fn a_list_reset_while_it_runs_records_into_fresh_memory() {
