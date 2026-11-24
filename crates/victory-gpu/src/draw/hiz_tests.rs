@@ -738,7 +738,31 @@ fn cpu_placed_depth_drives_hiz_culling_and_mesh() {
     descriptor::create_placed_srv(null, &resource_words, &srv, heap.at(0));
     let placed = resource::texture_at(address, &resource_words).unwrap();
     let (hiz_w, hiz_h) = ((WIDTH / 2) as u32, (HEIGHT / 2) as u32);
-    let hiz = title_texture(hiz_w, hiz_h);
+    let placed_output = std::env::var("VICTORY_HIZ_TEST_PLACED_OUTPUT").ok();
+    assert!(matches!(
+        placed_output.as_deref(),
+        None | Some("stale" | "updated")
+    ));
+    let placed_hiz = placed_output.as_ref().map(|_| {
+        let mut words = resource_words;
+        words[4] = hiz_w;
+        words[6] = hiz_h;
+        words[12] = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32;
+        // SAFETY: complete description words as above.
+        let desc = unsafe { words.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        let memory = TitleMemory::new(resource::texture_layout(&desc).unwrap().size as usize);
+        let address = memory.sampled.Value as u64;
+        let mut uav = [0u32; 16];
+        uav[0] = DXGI_FORMAT_R32_FLOAT.0 as u32;
+        uav[1] = D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32;
+        uav[10] = address as u32;
+        uav[11] = (address >> 32) as u32;
+        let texture = resource::texture_at(address, &words).unwrap();
+        (memory, words, uav, texture)
+    });
+    let hiz = placed_hiz
+        .as_ref()
+        .map_or_else(|| title_texture(hiz_w, hiz_h), |hiz| hiz.3);
     descriptor::create_uav(null, hiz, null, std::ptr::null(), heap.at(1));
     descriptor::create_srv(null, hiz, std::ptr::null(), heap.at(2));
     let build = Compute::new(&host.device, "build_hiz");
@@ -755,6 +779,7 @@ fn cpu_placed_depth_drives_hiz_culling_and_mesh() {
         None,
     );
 
+    let mut seeded_hiz = None;
     for visible in [true, false] {
         let reference: Vec<u32> = (0..WIDTH * HEIGHT)
             .map(|i| {
@@ -782,6 +807,11 @@ fn cpu_placed_depth_drives_hiz_culling_and_mesh() {
                 WIDTH * HEIGHT * 4,
             )
             .unwrap();
+        if !visible && let Some((_, words, uav, _)) = &placed_hiz {
+            // The first round seeds the actual native destination. Rebind
+            // only its second-round UAV via the placed descriptor path.
+            descriptor::create_placed_uav(null, words, uav, heap.at(1));
+        }
         let produce = host.new_list().unwrap();
         if visible {
             // SAFETY: first use of the argument buffer created in COMMON.
@@ -829,10 +859,23 @@ fn cpu_placed_depth_drives_hiz_culling_and_mesh() {
                 })
             })
             .collect();
+        if visible {
+            seeded_hiz = Some(expected.clone());
+        }
+        let expect_old = !visible && placed_output.as_deref() == Some("stale");
+        let expected = if expect_old {
+            seeded_hiz.as_ref().unwrap()
+        } else {
+            &expected
+        };
         assert!(
-            pyramid == expected,
+            &pyramid == expected,
             "Hi-Z max reduction mismatch, alias={}",
             !visible
+        );
+        eprintln!(
+            "Hi-Z first depth={}, previous pattern={expect_old}",
+            f32::from_bits(pyramid[0])
         );
 
         let count = host.new_list().unwrap();
@@ -840,10 +883,13 @@ fn cpu_placed_depth_drives_hiz_culling_and_mesh() {
         cull.record(&count, heap.native(), &args, [2, 0], [1, 1]);
         count.close();
         host.execute(&[&count]);
-        let observed = verify_indirect(host, &args, mesh.as_ref(), visible);
-        assert_eq!(observed, [u32::from(visible), 1, 1]);
+        let remains_visible = visible || expect_old;
+        let observed = verify_indirect(host, &args, mesh.as_ref(), remains_visible);
+        assert_eq!(observed, [u32::from(remains_visible), 1, 1]);
         eprintln!("{name}: native indirect arguments {observed:?}");
         validate_queue(&info);
     }
-    assert_eq!(slot::<extern "system" fn(This) -> u32>(hiz, 0x10)(hiz), 0);
+    if placed_hiz.is_none() {
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(hiz, 0x10)(hiz), 0);
+    }
 }
