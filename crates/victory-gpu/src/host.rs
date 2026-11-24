@@ -192,12 +192,20 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
-            let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            tracing::info!("host device on the software adapter (WARP)");
-        } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        #[cfg(all(test, feature = "diagnostics"))]
+        if std::env::var_os("VICTORY_ASYNC_TEST_ADAPTER").is_some() {
+            let (selected, name) = explicit_gbv_test_device();
+            eprintln!("explicit async host adapter: {name}");
+            device = Some(selected);
+        }
+        if device.is_none() {
+            if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+                let adapter = warp_adapter()?;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                tracing::info!("host device on the software adapter (WARP)");
+            } else {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -239,6 +247,63 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+fn explicit_gbv_test_device() -> (ID3D12Device, String) {
+    use windows::core::PCSTR;
+    let sdk = std::env::var("VICTORY_ASYNC_TEST_AGILITY").expect("Agility SDK 1.620.x x64 path");
+    let sdk = std::ffi::CString::new(format!("{}\\", sdk.trim_end_matches(['/', '\\']))).unwrap();
+    let vendor = std::env::var("VICTORY_ASYNC_TEST_ADAPTER").expect("amd, nvidia or warp");
+    // SAFETY: the configuration, adapter enumeration and output pointers are ours.
+    unsafe {
+        let mut configuration: Option<ID3D12SDKConfiguration1> = None;
+        D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut configuration).unwrap();
+        let factory: ID3D12DeviceFactory = configuration
+            .unwrap()
+            .CreateDeviceFactory(620, PCSTR(sdk.as_ptr().cast()))
+            .unwrap();
+        {
+            let debug: ID3D12Debug = factory
+                .GetConfigurationInterface(&CLSID_D3D12Debug)
+                .unwrap();
+            debug.EnableDebugLayer();
+            debug
+                .cast::<ID3D12Debug1>()
+                .unwrap()
+                .SetEnableGPUBasedValidation(true);
+        }
+        let dxgi: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let adapter: IDXGIAdapter1 = if vendor == "warp" {
+            dxgi.EnumWarpAdapter().unwrap()
+        } else {
+            let vendor = match vendor.as_str() {
+                "amd" => 0x1002,
+                "nvidia" => 0x10de,
+                _ => panic!("unknown adapter {vendor}"),
+            };
+            (0..)
+                .map_while(|i| dxgi.EnumAdapters1(i).ok())
+                .find(|a| a.GetDesc1().unwrap().VendorId == vendor)
+                .expect("requested hardware adapter")
+        };
+        let desc = adapter.GetDesc1().unwrap();
+        let end = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
+        let name = String::from_utf16_lossy(&desc.Description[..end]);
+        assert_eq!(
+            vendor == "warp",
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+        );
+        let mut device = None;
+        factory
+            .CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+            .unwrap();
+        (device.unwrap(), name)
     }
 }
 
@@ -2618,6 +2683,78 @@ mod submissions {
     use windows::Win32::Graphics::Direct3D12::{D3D12_FENCE_FLAG_NONE, ID3D12Fence};
 
     use crate::queue::Written;
+
+    /// Set VICTORY_ASYNC_TEST_ADAPTER to amd,
+    /// nvidia or warp, and VICTORY_ASYNC_TEST_AGILITY to the SDK's x64
+    /// DLL directory. Run each adapter in a fresh diagnostic test process.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires a named D3D12 adapter and Agility SDK 1.620.x"]
+    fn pending_shadow_read_and_writer_replay_on_explicit_adapter() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::{Interface, PCSTR};
+
+        static ISSUES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        unsafe extern "system" fn capture(
+            _: D3D12_MESSAGE_CATEGORY,
+            severity: D3D12_MESSAGE_SEVERITY,
+            id: D3D12_MESSAGE_ID,
+            description: PCSTR,
+            _: *mut std::ffi::c_void,
+        ) {
+            if severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                // SAFETY: the debug callback supplies a C string for this call.
+                let text = unsafe { std::ffi::CStr::from_ptr(description.0.cast()) };
+                ISSUES
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}: {}", id.0, text.to_string_lossy()));
+            }
+        }
+
+        assert!(std::env::var_os("VICTORY_ASYNC_TEST_ADAPTER").is_some());
+        let host = super::host().expect("explicit D3D12 test adapter");
+        let queue = host
+            .device
+            .cast::<ID3D12InfoQueue1>()
+            .expect("active debug layer");
+        let configuration = host.device.cast::<ID3D12DeviceConfiguration>().unwrap();
+        // SAFETY: plain device configuration query.
+        let flags = unsafe { configuration.GetDesc() };
+        assert_ne!(
+            flags.Flags.0 & D3D12_DEVICE_FLAG_GPU_BASED_VALIDATION_ENABLED.0,
+            0
+        );
+        assert_eq!(
+            flags.GpuBasedValidationFlags
+                & D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING.0 as u32,
+            0
+        );
+        let mut cookie = 0;
+        // SAFETY: the callback records messages to process-lifetime storage.
+        unsafe {
+            queue
+                .RegisterMessageCallback(
+                    Some(capture),
+                    D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                    std::ptr::null_mut(),
+                    &mut cookie,
+                )
+                .unwrap();
+        }
+
+        a_pending_gpu_read_keeps_its_shadow_bytes();
+        crate::shadow::tests::snapshot_stays_fresh_across_disjoint_in_flight_submissions();
+        host.drain();
+        // SAFETY: the registered callback is ours, and the device is live.
+        unsafe {
+            queue.UnregisterMessageCallback(cookie).unwrap();
+            host.device.GetDeviceRemovedReason().unwrap();
+        }
+        let issues = ISSUES.lock().unwrap();
+        assert!(issues.is_empty(), "{issues:?}");
+        eprintln!("held-reader and disjoint-writer replay passed with active debug layer and full GPU validation, zero warnings/errors");
+    }
 
     /// Serializes tests that temporarily gate the shared host queue so two
     /// gates never overlap.

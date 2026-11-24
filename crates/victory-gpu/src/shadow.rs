@@ -545,11 +545,11 @@ pub(crate) fn near(va: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_stays_fresh_across_disjoint_in_flight_submissions() {
+    pub(crate) fn snapshot_stays_fresh_across_disjoint_in_flight_submissions() {
         let Some(h) = host() else { return };
         let mut title = vec![0u8; 256];
         let start = title.as_ptr() as u64;
