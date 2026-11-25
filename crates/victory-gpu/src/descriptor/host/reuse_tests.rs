@@ -364,7 +364,8 @@ fn shared_table_metadata(fixture: &Fixture) {
         resource: fixture.textures[0].clone(),
         desc: descriptor(),
     }];
-    let old = heap.shared_textures_on(device, 2, &views).unwrap();
+    let (old, old_hit) = heap.shared_textures_on(device, 2, &views).unwrap();
+    assert!(!old_hit);
     let bytes = u64::from(heap.address_slots()) * 16;
     let addresses = resource(
         device, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
@@ -378,12 +379,14 @@ fn shared_table_metadata(fixture: &Fixture) {
         (mapped as *const [u32; 4], addresses.GetGPUVirtualAddress())
     };
     assert!(heap.addresses.set(Some((addresses, data as usize, gpu))).is_ok());
-    let new = heap.shared_textures_on(device, 2, &views).unwrap();
+    let (new, new_hit) = heap.shared_textures_on(device, 2, &views).unwrap();
+    assert!(!new_hit);
     assert_ne!(new.first(), old.first());
     // SAFETY: both slots are inside the retained address buffer.
     let words = unsafe { [data.add(new.first() as usize).read(), data.add(new.first() as usize + 1).read()] };
     assert_eq!(words, [texture_words(&view).unwrap(), [0; 4]]);
-    let replay = heap.shared_textures_on(device, 2, &views).unwrap();
+    let (replay, hit) = heap.shared_textures_on(device, 2, &views).unwrap();
+    assert!(hit);
     assert!(Arc::ptr_eq(&new, &replay));
 }
 
