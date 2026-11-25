@@ -28,7 +28,6 @@ fn tracked_staging(host: &crate::host::Host, width: u32) -> (Arc<Staging>, Input
     let (buffer, data) = host.upload_buffer(size_upload).unwrap();
     let staging = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: size_upload,
         #[cfg(feature = "diagnostics")]
         _capacity: crate::memstat::Charge::new(&crate::memstat::TEXTURE_UPLOAD, size_upload),

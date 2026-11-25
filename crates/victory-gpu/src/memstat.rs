@@ -310,15 +310,19 @@ mod tests {
 
         let list = host.new_list().unwrap();
         list.scratch(256).unwrap();
+        const FIRST: u64 = 64 << 10;
+        assert_eq!(SCRATCH.sample(), (FIRST, FIRST));
+        list.scratch(FIRST).unwrap();
+        const GROWN: u64 = 3 * FIRST;
         list.scratch(5 * MIB).unwrap();
-        assert_eq!(SCRATCH.sample(), (4 * MIB, 4 * MIB));
+        assert_eq!(SCRATCH.sample(), (GROWN, GROWN));
         assert_eq!(UPLOAD.sample(), (5 * MIB, 5 * MIB));
         list.close();
         list.reset();
-        assert_eq!(SCRATCH.sample(), (4 * MIB, 4 * MIB));
+        assert_eq!(SCRATCH.sample(), (GROWN, GROWN));
         assert_eq!(UPLOAD.sample(), (0, 5 * MIB));
         drop(list);
-        assert_eq!(SCRATCH.sample(), (0, 4 * MIB));
+        assert_eq!(SCRATCH.sample(), (0, GROWN));
         crate::shadow::unregister(address as usize, address);
         drop(shadow);
         assert_eq!(SHADOW.sample(), (0, 4 * MIB + view_width));
@@ -326,7 +330,7 @@ mod tests {
         let (system, limit) = commit().unwrap();
         assert!(process.private_usage > 0 && system <= limit);
         eprintln!(
-            "peak shadow 4 MiB + {view_width} B, peak active snapshot 6 MiB (4 MiB final live), idle snapshots 6 MiB, peak scratch 4 MiB, peak deferred upload 5 MiB; process private {}, system commit {system}/{limit}",
+            "peak shadow 4 MiB + {view_width} B, peak active snapshot 6 MiB (4 MiB final live), idle snapshots 6 MiB, peak scratch {GROWN} B, peak deferred upload 5 MiB; process private {}, system commit {system}/{limit}",
             process.private_usage
         );
     }
