@@ -71,6 +71,17 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Takes a reference without resurrecting an object already being destroyed.
+/// The caller keeps its allocation alive while attempting the increment.
+#[cfg(windows)]
+pub(crate) unsafe fn try_add_ref(this: This) -> bool {
+    // SAFETY: the caller keeps the object header allocated for this call.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        if n == 0 { None } else { n.checked_add(1) }
+    }).is_ok()
+}
+
 /// An object's reference count.
 pub(crate) fn refs(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
@@ -294,15 +305,35 @@ const MAX_SLOTS: usize = 160;
 static REPORTED: [[AtomicBool; MAX_SLOTS]; KINDS.len()] =
     [const { [const { AtomicBool::new(false) }; MAX_SLOTS] }; KINDS.len()];
 
+/// The four registers a win64 method call carries its first arguments in,
+/// as hex. A report of an unexpected slot can then tell a call passing an
+/// interface GUID or a module address from one passing flags, a count or an
+/// out pointer, without a local patch to this stub.
+fn argument_text(args: [usize; 4]) -> String {
+    format!(
+        "{:#x} {:#x} {:#x} {:#x}",
+        args[0], args[1], args[2], args[3]
+    )
+}
+
 /// Logged once per slot, with the caller's offset in its module (the title
-/// image for title calls). Wrong for a slot that returns a value instead of
-/// an `HRESULT`.
-extern "system" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
+/// image for title calls) and the four argument registers. Wrong for a slot
+/// that returns a value instead of an `HRESULT`; and a call made with fewer
+/// real arguments shows whatever its registers held (on win64 all four are
+/// registers, so reading them never touches the caller's stack).
+extern "system" fn missing<const KIND: usize, const SLOT: usize>(
+    this: This,
+    second: usize,
+    third: usize,
+    fourth: usize,
+) -> HRESULT {
     if !REPORTED[KIND][SLOT].swap(true, Ordering::Relaxed) {
+        let args = argument_text([this as usize, second, third, fourth]);
         tracing::warn!(
             object = KINDS[KIND],
             slot = format_args!("{:#x}", SLOT * 8),
             caller = caller(),
+            args = %args,
             "method not implemented"
         );
     }
@@ -522,6 +553,14 @@ mod tests {
             assert_eq!(set_private_data(this, &id, 1, b"a".as_ptr()), S_OK);
         }
         assert_eq!(release_boxed::<OwnedObject>(this), 0);
+    }
+
+    #[test]
+    fn unimplemented_calls_report_their_argument_registers() {
+        assert_eq!(
+            argument_text([0x1234_0000, 0x0, 0xdead_beef_cafe, 0xffff_ffff_ffff_fff6]),
+            "0x12340000 0x0 0xdeadbeefcafe 0xfffffffffffffff6"
+        );
     }
 
     #[test]

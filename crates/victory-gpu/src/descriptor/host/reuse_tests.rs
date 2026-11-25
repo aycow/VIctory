@@ -1,17 +1,17 @@
 //! Original 65,536-slot D3D12 allocator and descriptor readback fixture.
-//! Set VICTORY_TABLE_TEST_ADAPTER (amd, nvidia or warp) and
-//! VICTORY_TABLE_TEST_AGILITY (Agility SDK 1.620.x x64 DLL directory), then run:
+//! Set VICTORY_TABLE_TEST_ADAPTER (amd, nvidia or warp), then run:
 //! cargo test --release -p victory-gpu --features diagnostics capped_pool_texture_table_reuse -- --ignored --nocapture
-//! The default run uses GPU-based validation. Set VICTORY_TABLE_TEST_TIMING=1
-//! to measure CPU descriptor preparation with validation disabled.
+//! Set VICTORY_TABLE_TEST_DEBUG=1 for the system D3D12 debug layer or
+//! VICTORY_TABLE_TEST_GBV=1 for GPU-based validation, where supported.
+//! VICTORY_TABLE_TEST_TIMING=1 runs five alternating timing samples.
 
 use super::*;
 use std::mem::ManuallyDrop;
 use std::time::Instant;
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Dxgi::*;
-use windows::core::{Interface, PCSTR, s};
+use windows::core::{Interface, s};
 
 const HLSL: &str = r#"
 #define RS "RootConstants(num32BitConstants=1, b0), UAV(u0), DescriptorTable(SRV(t0))"
@@ -28,27 +28,21 @@ const FIRST: u32 = 0x1458_acef;
 const SECOND: u32 = 0xfec1_4921;
 const SPAN: u32 = 2048;
 
-fn device(validate: bool) -> (ID3D12Device, String) {
-    let sdk = std::env::var("VICTORY_TABLE_TEST_AGILITY").expect("Agility SDK 1.620.x x64 path");
-    let sdk = std::ffi::CString::new(format!("{}\\", sdk.trim_end_matches(['/', '\\']))).unwrap();
+fn device(debug: bool, gbv: bool) -> (ID3D12Device, String) {
     let vendor = std::env::var("VICTORY_TABLE_TEST_ADAPTER").expect("amd, nvidia or warp");
-    // SAFETY: the configuration, adapter enumeration and output pointers are ours.
+    // SAFETY: the debug interface, adapter enumeration and output pointers are ours.
     unsafe {
-        let mut configuration: Option<ID3D12SDKConfiguration1> = None;
-        D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut configuration).unwrap();
-        let factory: ID3D12DeviceFactory = configuration
-            .unwrap()
-            .CreateDeviceFactory(620, PCSTR(sdk.as_ptr().cast()))
-            .unwrap();
-        if validate {
-            let debug: ID3D12Debug = factory
-                .GetConfigurationInterface(&CLSID_D3D12Debug)
-                .unwrap();
+        if debug {
+            let mut debug: Option<ID3D12Debug> = None;
+            D3D12GetDebugInterface(&mut debug).expect("install Windows Graphics Tools for the D3D12 debug layer");
+            let debug = debug.unwrap();
             debug.EnableDebugLayer();
-            debug
-                .cast::<ID3D12Debug1>()
-                .unwrap()
-                .SetEnableGPUBasedValidation(true);
+            if gbv {
+                debug
+                    .cast::<ID3D12Debug1>()
+                    .unwrap()
+                    .SetEnableGPUBasedValidation(true);
+            }
         }
         let dxgi: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
         let adapter: IDXGIAdapter1 = if vendor == "warp" {
@@ -76,9 +70,7 @@ fn device(validate: bool) -> (ID3D12Device, String) {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
         );
         let mut device = None;
-        factory
-            .CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
-            .unwrap();
+        D3D12CreateDevice(&adapter.cast::<IDXGIAdapter>().unwrap(), D3D_FEATURE_LEVEL_11_0, &mut device).unwrap();
         (device.unwrap(), name)
     }
 }
@@ -543,11 +535,13 @@ fn run(fixture: &Fixture, shared: bool, lists: usize, distinct: bool) -> ResultR
 }
 
 #[test]
-#[ignore = "requires a named D3D12 adapter, Windows Graphics Tools and Agility SDK 1.620.x"]
+#[ignore = "requires a named D3D12 adapter"]
 fn capped_pool_texture_table_reuse() {
     let timing = std::env::var_os("VICTORY_TABLE_TEST_TIMING").is_some();
-    let (device, name) = device(!timing);
-    let info = (!timing).then(|| device.cast::<ID3D12InfoQueue>().unwrap());
+    let gbv = !timing && std::env::var_os("VICTORY_TABLE_TEST_GBV").is_some();
+    let debug = gbv || !timing && std::env::var_os("VICTORY_TABLE_TEST_DEBUG").is_some();
+    let (device, name) = device(debug, gbv);
+    let info = debug.then(|| device.cast::<ID3D12InfoQueue>().unwrap());
     let fixture = Fixture::new(device);
     for (label, count, distinct) in [
         ("over-cap", 41, false),
@@ -592,8 +586,10 @@ fn capped_pool_texture_table_reuse() {
             );
         }
     }
-    if let Some(info) = info {
+    if !timing {
         heap_replacement(&fixture);
+    }
+    if let Some(info) = info {
         check_debug_messages(&info);
     }
 }

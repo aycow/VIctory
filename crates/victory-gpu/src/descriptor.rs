@@ -65,6 +65,9 @@ pub(crate) struct Heap {
     written: Option<crate::watch::Tracked>,
 }
 
+pub(crate) use host::fallback_samplers;
+
+/// A title heap's host copy.
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
     // SAFETY: called from descriptor heap methods only.
     unsafe { &*this.cast::<Heap>() }
@@ -103,8 +106,8 @@ impl Heap {
             .as_ref()
     }
 
-    /// Resolve a capped table's populated texture SRVs while their title
-    /// descriptor generations are live. Other tables use normal allocation.
+    /// Resolve a capped table from an owned snapshot of its title views.
+    /// No driver calls or recording work run under the view registry lock.
     #[cfg(windows)]
     pub(crate) fn with_texture_table<R>(
         &self,
@@ -112,6 +115,24 @@ impl Heap {
         count: u32,
         f: impl FnOnce(&[TextureView<'_>]) -> R,
     ) -> Result<R, TableReject> {
+        let records = self.texture_table_records(table, count)?;
+        let mut entries = Vec::with_capacity(records.len());
+        for record in &records {
+            let View::Shader(resource, Some(desc)) = &record.view else { unreachable!() };
+            let (resource, desc) = host::texture_srv(*resource as This, desc)?;
+            entries.push(TextureView {
+                slot: record.slot,
+                record: record.generation,
+                view: &record.view,
+                resource,
+                desc,
+            });
+        }
+        Ok(f(&entries))
+    }
+
+    #[cfg(windows)]
+    fn texture_table_records(&self, table: u64, count: u32) -> Result<Vec<TextureRecord>, TableReject> {
         if self.desc.kind != VIEWS_KIND || count == 0 || count > host::DYNAMIC {
             return Err(TableReject::InvalidSpan);
         }
@@ -121,8 +142,10 @@ impl Heap {
         let last = table.checked_add(u64::from(count - 1) * 32).ok_or(TableReject::InvalidSpan)?;
         self.index(last).ok_or(TableReject::InvalidSpan)?;
 
+        // Resource release can invalidate registry entries, so the pins
+        // must always be dropped after the lock, including on failure.
+        let mut records = Vec::new();
         let registry = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-        let mut entries = Vec::new();
         for slot in 0..count {
             let at = table + u64::from(slot) * 32;
             // SAFETY: the checked span lies in the title descriptor heap.
@@ -134,25 +157,29 @@ impl Heap {
             if tag != VIEW_TAG || *current != generation {
                 return Err(TableReject::UnresolvedRecord);
             }
-            let (resource, desc) = match view {
-                View::Shader(resource, Some(desc)) => (resource, desc),
+            let resource = match view {
+                View::Shader(resource, Some(_)) => *resource as This,
                 View::Constant(..) => return Err(TableReject::CbvRecord),
                 View::Placed(..) => return Err(TableReject::PlacedView),
                 _ => return Err(TableReject::UnsupportedView),
             };
-            let (resource, desc) = host::texture_srv(*resource as This, desc)?;
-            entries.push(TextureView {
+            // SAFETY: destruction invalidates the descriptor under VIEWS
+            // before freeing the resource. Do not retain a zero count.
+            if resource.is_null() || !unsafe { object::try_add_ref(resource) } {
+                return Err(TableReject::Unmaterialized);
+            }
+            records.push(TextureRecord {
                 slot,
-                record: u64::from(generation) << 32 | u64::from(id),
-                view,
+                generation: u64::from(generation) << 32 | u64::from(id),
+                view: view.clone(),
                 resource,
-                desc,
             });
         }
-        if entries.is_empty() {
+        drop(registry);
+        if records.is_empty() {
             return Err(TableReject::Empty);
         }
-        Ok(f(&entries))
+        Ok(records)
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
@@ -345,6 +372,11 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        // Nothing can find the heap by now. The table's lock is taken
+        // inside the heaps' lock (`memory::bind`), never the other way
+        // round, so it is taken here after the heaps' lock is let go.
+        drop(heaps);
+        crate::memory::release(at);
     }
 }
 
@@ -519,6 +551,22 @@ pub(crate) enum TableReject {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) mod demand;
 
+/// One descriptor generation and a temporary reference to its resource.
+#[cfg(windows)]
+struct TextureRecord {
+    slot: u32,
+    generation: u64,
+    view: View,
+    resource: This,
+}
+
+#[cfg(windows)]
+impl Drop for TextureRecord {
+    fn drop(&mut self) {
+        crate::resource::resource_release(self.resource);
+    }
+}
+
 /// A texture SRV resolved from a live title view generation.
 #[cfg(windows)]
 pub(crate) struct TextureView<'a> {
@@ -633,11 +681,19 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
+/// `CreateConstantBufferView` with a null description. Leaving the slot
+/// untouched would keep a stale view active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size)
+        }
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -910,6 +966,35 @@ pub(crate) mod tests {
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
     }
 
+    /// A released view heap takes its title memory page table with it, also
+    /// when no heap is made at its address afterwards (else the table, its
+    /// 16.8 MiB mapping and the copies it names live on).
+    #[test]
+    fn a_released_view_heap_drops_its_page_table() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 1000,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let key = h as usize;
+        assert!(heap(h).host().is_some(), "a host heap");
+        let list = host.new_list().unwrap();
+        assert!(crate::memory::bind(&list, key).is_some(), "a page table");
+        assert!(crate::memory::has_table(key));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+        assert!(!crate::memory::has_table(key), "released with its heap");
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
@@ -956,6 +1041,45 @@ pub(crate) mod tests {
         assert_eq!(release(title_heap), 0);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn texture_table_snapshot_holds_the_resource_after_replacement() {
+        let null = std::ptr::null();
+        let mut title_heap = null;
+        let desc = HeapDesc { kind: VIEWS_KIND, count: 2, flags: SHADER_VISIBLE, nodes: 0 };
+        let placed = Placement { address: 0, size: 0 };
+        assert_eq!(create(desc, placed, &mut title_heap), S_OK);
+        let heap = heap(title_heap);
+        let start = heap.start;
+
+        let buffer_desc = [1u32, 0, 0, 0, 64, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let properties = [1u32, 0, 0, 0, 0];
+        let iid = guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut resource = null;
+        assert_eq!(crate::resource::create_committed(
+            null, properties.as_ptr().cast(), 0, buffer_desc.as_ptr().cast(),
+            0, null.cast(), &iid, &mut resource,
+        ), S_OK);
+        let original = View::Shader(resource as usize, Some([0; 10]));
+        record(start, original.clone());
+        create_cbv(null, &[0x1000, 1, 256, 0], start + 32);
+        assert!(heap.texture_table_records(start, 2).is_err());
+        assert_eq!(object::refs(resource), 1);
+        record(start + 32, original.clone());
+        let snapshot = heap.texture_table_records(start, 1).unwrap();
+        let release_resource = slot::<extern "system" fn(This) -> u32>(resource, 0x10);
+        assert_eq!(release_resource(resource), 1);
+        // Replacing a title slot while resolving the snapshot takes the
+        // registry lock again and leaves the captured generation intact.
+        create_cbv(null, &[0x1000, 1, 256, 0], start);
+        assert_eq!(snapshot[0].view, original);
+        assert_eq!(view(start + 32), Some(original));
+        assert!(crate::resource::buffer_bytes(resource).is_some());
+        drop(snapshot);
+        assert_eq!(view(start + 32), None);
+        assert_eq!(release(title_heap), 0);
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
@@ -988,6 +1112,23 @@ pub(crate) mod tests {
         assert_eq!(view(s3), view(s1));
         assert_eq!(view(at(0) + 8), None);
         heap[0] = 0;
+    }
+
+    /// A null CBV description overwrites the slot (D3D12 null CBV), so a
+    /// later read does not see the previous view.
+    #[test]
+    fn null_cbv_clears_a_stale_view() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let a = slots.as_ptr() as u64;
+        create_cbv(null, &[0x1000, 1, 256, 0], a);
+        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        create_srv(null, null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), a);
+        assert_eq!(view(a), Some(View::Constant(0, 0)));
     }
 
     /// A released resource's views go stale; the same view of a new
@@ -1057,21 +1198,28 @@ pub(crate) mod tests {
             nodes: 1,
         };
         let mut h = std::ptr::null();
-        assert_eq!(
-            create(
-                desc,
-                Placement {
-                    address,
-                    size: 64 * 32
-                },
-                &mut h
-            ),
-            S_OK
-        );
+        let placement = Placement { address, size: 64 * 32 };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
         assert_eq!(slot::<extern "system" fn(This) -> u64>(h, 0x50)(h), address);
+        // Remove the placed heap from the registry before its memory can
+        // be reused by another heap.
+        release(h);
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+        release(h);
+
+        #[cfg(windows)]
+        {
+            // Reuse the address without relying on the allocator to give it
+            // to another test. The descriptor write must reach the new heap.
+            assert_eq!(create(desc, placement, &mut h), S_OK);
+            create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), address);
+            let reused = heap(h);
+            let queued = reused.pending.lock().unwrap().as_slice() == [0];
+            release(h);
+            assert!(queued, "the descriptor write reached the heap at the reused address");
+        }
     }
 }
