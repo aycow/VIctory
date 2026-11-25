@@ -64,6 +64,8 @@ pub(crate) struct HostHeap {
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct TextureTableKey {
     count: u32,
+    /// A table made before the optional address buffer existed has no entries there.
+    addresses: bool,
     /// Occupied offsets, title view generations and native resource identities.
     views: Vec<(u32, u64, usize)>,
 }
@@ -529,6 +531,7 @@ impl HostHeap {
 
         let key = TextureTableKey {
             count,
+            addresses: self.addresses.get().is_some_and(Option::is_some),
             views: views.iter().map(|v| (v.slot, v.record, v.resource.as_raw() as usize)).collect(),
         };
         let mut tables = self.slots.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -540,19 +543,25 @@ impl HostHeap {
         let mut populated = views.iter().peekable();
         for slot in 0..count {
             let index = first + slot;
-            if populated.peek().is_some_and(|v| v.slot == slot) {
+            let view = if populated.peek().is_some_and(|v| v.slot == slot) {
                 let view = populated.next().unwrap();
                 // SAFETY: the resolved resource is live and this slot belongs to the new allocation.
                 unsafe {
                     device.CreateShaderResourceView(&view.resource, Some(&view.desc), self.cpu(index));
                 }
+                Some(view.view)
             } else {
                 null_view_on(device, self.cpu(index));
-            }
-            // Previous occupants can include buffer views. Clear their old
-            // owners and shader-visible stride, even for holes in this table.
+                None
+            };
+            // Earlier occupants' buffer metadata must not outlive the
+            // descriptors, including in the holes of a fresh table.
             self.keep(index, None);
             self.set_stride(index, None);
+            self.set_mark(index, None);
+            if key.addresses {
+                self.note_address(index, view);
+            }
         }
         let table = Arc::new(SharedTextureTable {
             key: key.clone(),

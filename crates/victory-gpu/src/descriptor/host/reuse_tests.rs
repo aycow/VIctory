@@ -347,6 +347,46 @@ fn occupancy(heap: &HostHeap) -> usize {
         .count()
 }
 
+fn shared_table_metadata(fixture: &Fixture) {
+    let device = &fixture.device;
+    let heap = capped_heap(device);
+    let mut title_texture = [0; 14];
+    (title_texture[0], title_texture[4], title_texture[6], title_texture[7], title_texture[9]) =
+        (3, 128, 64, 1 | 1 << 16, 1);
+    let mut title_view = [0; 16];
+    title_view[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+    title_view[5] = 1;
+    let view = View::Placed(false, title_texture, title_view);
+    let views = [TextureView {
+        slot: 0,
+        record: 1 << 32,
+        view: &view,
+        resource: fixture.textures[0].clone(),
+        desc: descriptor(),
+    }];
+    let old = heap.shared_textures_on(device, 2, &views).unwrap();
+    let bytes = u64::from(heap.address_slots()) * 16;
+    let addresses = resource(
+        device, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ,
+        &buf(bytes, D3D12_RESOURCE_FLAG_NONE),
+    );
+    let mut mapped = std::ptr::null_mut();
+    // SAFETY: a live upload buffer with one four-dword entry per slot.
+    let (data, gpu) = unsafe {
+        addresses.Map(0, None, Some(&mut mapped)).unwrap();
+        std::ptr::write_bytes(mapped.cast::<u8>(), 0xab, bytes as usize);
+        (mapped as *const [u32; 4], addresses.GetGPUVirtualAddress())
+    };
+    assert!(heap.addresses.set(Some((addresses, data as usize, gpu))).is_ok());
+    let new = heap.shared_textures_on(device, 2, &views).unwrap();
+    assert_ne!(new.first(), old.first());
+    // SAFETY: both slots are inside the retained address buffer.
+    let words = unsafe { [data.add(new.first() as usize).read(), data.add(new.first() as usize + 1).read()] };
+    assert_eq!(words, [texture_words(&view).unwrap(), [0; 4]]);
+    let replay = heap.shared_textures_on(device, 2, &views).unwrap();
+    assert!(Arc::ptr_eq(&new, &replay));
+}
+
 fn heap_replacement(fixture: &Fixture) {
     let view = View::Shader(0, None);
     let views = [TextureView {
@@ -588,6 +628,7 @@ fn capped_pool_texture_table_reuse() {
     }
     if !timing {
         heap_replacement(&fixture);
+        shared_table_metadata(&fixture);
     }
     if let Some(info) = info {
         check_debug_messages(&info);
