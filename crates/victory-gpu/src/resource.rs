@@ -1102,11 +1102,16 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 
 /// A materialized texture whose backing cannot be evicted or reused.
 #[cfg(windows)]
-pub(crate) fn fixed_table_texture(this: This) -> Option<std::sync::Arc<HostTexture>> {
+pub(crate) fn fixed_table_texture(this: This) -> Result<std::sync::Arc<HostTexture>, crate::descriptor::TableReject> {
+    use crate::descriptor::TableReject;
     if this.is_null() {
-        return None;
+        return Err(TableReject::Unmaterialized);
     }
-    made(resource(this)).filter(|copy| copy.key.is_none() && copy.placement.is_none())
+    let copy = made(resource(this)).ok_or(TableReject::Unmaterialized)?;
+    if copy.key.is_some() || copy.placement.is_some() {
+        return Err(TableReject::ReplaceableBacking);
+    }
+    Ok(copy)
 }
 
 /// The host description of a title texture: the same, without the

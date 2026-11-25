@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, Weak};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{TextureView, VIEW_TAG, View, view_at, views_current};
+use super::{TableReject, TextureView, VIEW_TAG, View, view_at, views_current};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -74,6 +74,10 @@ struct DynamicSlots {
     /// Cursor and occupancy held by recorded lists.
     next: Mutex<(u32, Vec<bool>)>,
     shared: Mutex<HashMap<TextureTableKey, Weak<SharedTextureTable>>>,
+    #[cfg(feature = "diagnostics")]
+    demand_live: AtomicUsize,
+    #[cfg(feature = "diagnostics")]
+    demand_peak: AtomicUsize,
 }
 
 impl DynamicSlots {
@@ -83,6 +87,10 @@ impl DynamicSlots {
             first,
             next: Mutex::new((0, vec![false; count as usize])),
             shared: Mutex::default(),
+            #[cfg(feature = "diagnostics")]
+            demand_live: AtomicUsize::new(0),
+            #[cfg(feature = "diagnostics")]
+            demand_peak: AtomicUsize::new(0),
         }
     }
 
@@ -93,6 +101,10 @@ impl DynamicSlots {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + count).min(guard.1.len() as u32) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            #[cfg(feature = "diagnostics")]
+            if super::demand::enabled() {
+                self.demand_live.fetch_sub(slots.iter().filter(|&&taken| taken).count(), Ordering::Relaxed);
+            }
             slots.fill(false);
         }
     }
@@ -404,6 +416,11 @@ impl HostHeap {
             return None;
         };
         taken[first..first + n].fill(true);
+        #[cfg(feature = "diagnostics")]
+        if super::demand::enabled() {
+            let live = self.slots.demand_live.fetch_add(n, Ordering::Relaxed) + n;
+            self.slots.demand_peak.fetch_max(live, Ordering::Relaxed);
+        }
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
@@ -411,6 +428,15 @@ impl HostHeap {
     /// The generation of this native heap, even if title heap addresses repeat.
     pub(crate) fn identity(&self) -> usize {
         self.slots.id
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn demand_pressure(&self) -> (u32, usize, usize) {
+        (
+            self.dynamic,
+            self.slots.demand_live.load(Ordering::Relaxed),
+            self.slots.demand_peak.load(Ordering::Relaxed),
+        )
     }
 
     /// An allocation given back only to the pool that owns it.
@@ -471,7 +497,7 @@ impl HostHeap {
         &self,
         count: u32,
         views: &[TextureView<'_>],
-    ) -> Option<Arc<SharedTextureTable>> {
+    ) -> Option<(Arc<SharedTextureTable>, bool)> {
         self.shared_textures_on(&host()?.device, count, views)
     }
 
@@ -480,7 +506,7 @@ impl HostHeap {
         device: &ID3D12Device,
         count: u32,
         views: &[TextureView<'_>],
-    ) -> Option<Arc<SharedTextureTable>> {
+    ) -> Option<(Arc<SharedTextureTable>, bool)> {
         use windows::core::Interface;
 
         let key = TextureTableKey {
@@ -489,7 +515,7 @@ impl HostHeap {
         };
         let mut tables = self.slots.shared.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(table) = tables.get(&key).and_then(Weak::upgrade) {
-            return Some(table);
+            return Some((table, true));
         }
         let range = self.reserve_dynamic(count)?;
         let first = range.first;
@@ -517,7 +543,7 @@ impl HostHeap {
             _resources: views.iter().map(|v| v.resource.clone()).collect(),
         });
         tables.insert(key, Arc::downgrade(&table));
-        Some(table)
+        Some((table, false))
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -1502,15 +1528,16 @@ pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<
 pub(super) fn texture_srv(
     resource: crate::object::This,
     words: &[u32; 10],
-) -> Option<(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
-    let copy = crate::resource::fixed_table_texture(resource)?;
+) -> Result<(ID3D12Resource, D3D12_SHADER_RESOURCE_VIEW_DESC), TableReject> {
     let mut desc = srv_desc(words);
-    if desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER
-        || !fits(&copy.texture, &copy.castable, Some(&mut desc.Format), false)
-    {
-        return None;
+    if desc.ViewDimension == D3D12_SRV_DIMENSION_BUFFER {
+        return Err(TableReject::BufferSrv);
     }
-    Some((copy.texture.clone(), desc))
+    let copy = crate::resource::fixed_table_texture(resource)?;
+    if !fits(&copy.texture, &copy.castable, Some(&mut desc.Format), false) {
+        return Err(TableReject::UnsupportedFormat);
+    }
+    Ok((copy.texture.clone(), desc))
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -1949,7 +1976,9 @@ mod tests {
         assert!(host.mirror(0, title_heap.start, true).is_some());
         assert!(host.kept(0), "made for the draw");
         let texture = crate::resource::texture_at(address, &words).expect("its resource");
+        assert!(matches!(crate::resource::fixed_table_texture(texture), Err(TableReject::ReplaceableBacking)));
         assert!(crate::resource::give_up_now(texture));
+        assert!(matches!(crate::resource::fixed_table_texture(texture), Err(TableReject::Unmaterialized)));
         assert!(!host.kept(0), "the slot holds it no more");
         assert!(host.made(0), "its record stays noted");
         assert!(host.mirror(0, title_heap.start, false).is_some());

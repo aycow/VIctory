@@ -362,17 +362,19 @@ fn heap_replacement(fixture: &Fixture) {
     }];
     let original = capped_heap(&fixture.device);
     let original_pool = Arc::downgrade(&original.slots);
-    let original_table = original
+    let (original_table, hit) = original
         .shared_textures_on(&fixture.device, SPAN, &views)
         .unwrap();
+    assert!(!hit);
     let list_local = original.reserve_dynamic(SPAN).unwrap();
     let original_id = original.identity();
     drop(original);
 
     let replacement = capped_heap(&fixture.device);
-    let replacement_table = replacement
+    let (replacement_table, hit) = replacement
         .shared_textures_on(&fixture.device, SPAN, &views)
         .unwrap();
+    assert!(!hit);
     assert_ne!(original_id, replacement.identity());
     assert_eq!(original_table.first(), replacement_table.first());
     assert!(!Arc::ptr_eq(&original_table, &replacement_table));
@@ -448,7 +450,8 @@ fn run(fixture: &Fixture, shared: bool, lists: usize, distinct: bool) -> ResultR
             }];
             let started = Instant::now();
             let slot = if shared {
-                heap.shared_textures_on(device, SPAN, &views).map(|lease| {
+                heap.shared_textures_on(device, SPAN, &views).map(|(lease, hit)| {
+                    assert_eq!(hit, leases.iter().any(|prior| Arc::ptr_eq(prior, &lease)));
                     let first = lease.first();
                     leases.push(lease);
                     first
@@ -512,12 +515,20 @@ fn run(fixture: &Fixture, shared: bool, lists: usize, distinct: bool) -> ResultR
         drop((init_allocator, end_allocator, recorded));
     }
     let occupied = occupancy(&heap);
+    #[cfg(feature = "diagnostics")]
+    if crate::descriptor::demand::enabled() {
+        assert_eq!(heap.demand_pressure(), (MIN_DYNAMIC, occupied, occupied));
+    }
     if shared {
         let keep = leases.pop().unwrap();
         drop(leases);
         assert_eq!(occupancy(&heap), SPAN as usize);
         drop(keep);
         assert_eq!(occupancy(&heap), 0);
+        #[cfg(feature = "diagnostics")]
+        if crate::descriptor::demand::enabled() {
+            assert_eq!(heap.demand_pressure(), (MIN_DYNAMIC, 0, occupied));
+        }
         assert!(heap.slots.shared.lock().unwrap().is_empty());
     }
     ResultRow {
