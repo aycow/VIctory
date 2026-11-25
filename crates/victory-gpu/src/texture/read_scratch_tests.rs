@@ -28,7 +28,6 @@ fn tracked_staging(host: &crate::host::Host, width: u32) -> (Arc<Staging>, Input
     let (buffer, data) = host.upload_buffer(size_upload).unwrap();
     let staging = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: size_upload,
         data,
         footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
