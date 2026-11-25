@@ -525,6 +525,7 @@ extern "system" fn present(
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
+        crate::descriptor::demand::presented(frame);
         crate::capture::presented(frame);
         if crate::capture::listed(frame) || crate::capture::has_targets() {
             crate::capture::dump_targets(frame);

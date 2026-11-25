@@ -1226,24 +1226,62 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            if entries.iter().all(|u| u.kind == ResourceType::Srv)
-                && let Some(shared) = heap
-                    .with_texture_table(table, n, |views| {
-                        let shared = host.shared_textures(n, views)?;
+            let srv_only = entries.iter().all(|u| u.kind == ResourceType::Srv);
+            #[cfg(feature = "diagnostics")]
+            let mut demand = crate::descriptor::demand::Request::new(n, &entries);
+            if srv_only {
+                let resolved = heap.with_texture_table(table, n, |views| {
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(request) = &mut demand {
+                        request.eligible();
+                        if !crate::descriptor::demand::sharing() {
+                            return None;
+                        }
+                    }
+                    let shared = host.shared_textures(n, views);
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(request) = &mut demand {
+                        request.share_unavailable = shared.is_none();
+                    }
+                    if shared.is_some() {
                         for u in &entries {
                             let offset = u.table_offset_dwords / 8;
                             if let Ok(i) = views.binary_search_by_key(&offset, |view| view.slot) {
                                 readable(list, u, views[i].view, true);
                             }
                         }
-                        Some(shared)
-                    })
-                    .flatten()
-            {
-                made.push((slot, shared.first() * 32));
-                let identity = std::sync::Arc::as_ptr(&shared) as usize;
-                self.shared_tables.entry(identity).or_insert(shared);
-                continue;
+                    }
+                    shared
+                });
+                match resolved {
+                    Ok(Some((shared, hit))) => {
+                        made.push((slot, shared.first() * 32));
+                        let identity = std::sync::Arc::as_ptr(&shared) as usize;
+                        #[cfg(not(feature = "diagnostics"))]
+                        let _ = hit;
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(request) = demand.take() {
+                            use crate::descriptor::demand::Outcome;
+                            let outcome = if !hit {
+                                Outcome::SharedNew
+                            } else if self.shared_tables.contains_key(&identity) {
+                                Outcome::SharedSameList
+                            } else {
+                                Outcome::SharedOtherList
+                            };
+                            request.finish(outcome, host);
+                        }
+                        self.shared_tables.entry(identity).or_insert(shared);
+                        continue;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    Err(reason) => {
+                        if let Some(request) = &mut demand {
+                            request.rejected(reason);
+                        }
+                    }
+                    _ => {}
+                }
             }
             // The table and what its entries hold (record words).
             let key = {
@@ -1257,6 +1295,10 @@ impl State {
                 (host.identity(), table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
+                #[cfg(feature = "diagnostics")]
+                if let Some(request) = demand {
+                    request.finish(crate::descriptor::demand::Outcome::LocalReuse, host);
+                }
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -1267,6 +1309,10 @@ impl State {
                 continue;
             }
             let Some(range) = host.reserve_dynamic(n) else {
+                #[cfg(feature = "diagnostics")]
+                if let Some(request) = demand {
+                    request.finish(crate::descriptor::demand::Outcome::NoRange, host);
+                }
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
@@ -1275,6 +1321,10 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(request) = demand {
+                request.finish(crate::descriptor::demand::Outcome::LocalNew, host);
+            }
             let first = range.first;
             self.fresh_tables.insert(key, first);
             self.dynamic.push(range);

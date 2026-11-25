@@ -111,14 +111,15 @@ impl Heap {
         table: u64,
         count: u32,
         f: impl FnOnce(&[TextureView<'_>]) -> R,
-    ) -> Option<R> {
+    ) -> Result<R, TableReject> {
         if self.desc.kind != VIEWS_KIND || count == 0 || count > host::DYNAMIC {
-            return None;
+            return Err(TableReject::InvalidSpan);
         }
-        if !(table.checked_sub(self.start)?).is_multiple_of(32) {
-            return None;
+        if !table.checked_sub(self.start).ok_or(TableReject::InvalidSpan)?.is_multiple_of(32) {
+            return Err(TableReject::InvalidSpan);
         }
-        self.index(table.checked_add(u64::from(count - 1) * 32)?)?;
+        let last = table.checked_add(u64::from(count - 1) * 32).ok_or(TableReject::InvalidSpan)?;
+        self.index(last).ok_or(TableReject::InvalidSpan)?;
 
         let registry = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
         let mut entries = Vec::new();
@@ -129,11 +130,16 @@ impl Heap {
             if [tag, id, generation] == [0, 0, 0] {
                 continue;
             }
-            let (view, current) = registry.list.get(id as usize)?;
+            let (view, current) = registry.list.get(id as usize).ok_or(TableReject::UnresolvedRecord)?;
             if tag != VIEW_TAG || *current != generation {
-                return None;
+                return Err(TableReject::UnresolvedRecord);
             }
-            let View::Shader(resource, Some(desc)) = view else { return None };
+            let (resource, desc) = match view {
+                View::Shader(resource, Some(desc)) => (resource, desc),
+                View::Constant(..) => return Err(TableReject::CbvRecord),
+                View::Placed(..) => return Err(TableReject::PlacedView),
+                _ => return Err(TableReject::UnsupportedView),
+            };
             let (resource, desc) = host::texture_srv(*resource as This, desc)?;
             entries.push(TextureView {
                 slot,
@@ -143,7 +149,10 @@ impl Heap {
                 desc,
             });
         }
-        (!entries.is_empty()).then(|| f(&entries))
+        if entries.is_empty() {
+            return Err(TableReject::Empty);
+        }
+        Ok(f(&entries))
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
@@ -490,6 +499,25 @@ static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     free: Vec::new(),
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+/// Why a rebuilt table cannot use the fixed texture cache.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TableReject {
+    InvalidSpan,
+    Empty,
+    UnresolvedRecord,
+    CbvRecord,
+    PlacedView,
+    BufferSrv,
+    UnsupportedView,
+    Unmaterialized,
+    ReplaceableBacking,
+    UnsupportedFormat,
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod demand;
 
 /// A texture SRV resolved from a live title view generation.
 #[cfg(windows)]
@@ -921,10 +949,10 @@ pub(crate) mod tests {
         fn reject(_: &[TextureView<'_>]) {
             panic!("ineligible table was passed to the cache");
         }
-        assert_eq!(heap.with_texture_table(start, 4, reject), None);
-        assert_eq!(heap.with_texture_table(start + 1, 1, reject), None);
-        assert_eq!(heap.with_texture_table(start + 96, 2, reject), None);
-        assert_eq!(heap.with_texture_table(start + 64, 2, reject), None);
+        assert_eq!(heap.with_texture_table(start, 4, reject), Err(TableReject::CbvRecord));
+        assert_eq!(heap.with_texture_table(start + 1, 1, reject), Err(TableReject::InvalidSpan));
+        assert_eq!(heap.with_texture_table(start + 96, 2, reject), Err(TableReject::InvalidSpan));
+        assert_eq!(heap.with_texture_table(start + 64, 2, reject), Err(TableReject::Empty));
         assert_eq!(release(title_heap), 0);
     }
 
